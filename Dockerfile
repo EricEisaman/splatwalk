@@ -32,7 +32,7 @@ WORKDIR /app
 # **Learning Point**: Add new WASM crate Cargo.toml files here for Docker build caching.
 # This allows Docker to cache dependencies separately from source code changes.
 COPY Cargo.toml ./
-COPY g2m/Cargo.toml ./g2m/
+COPY wasm-splatwalk/Cargo.toml ./wasm-splatwalk/
 
 # Add wasm32 target (must be done before building for wasm32-unknown-unknown)
 RUN rustup target add wasm32-unknown-unknown
@@ -41,8 +41,8 @@ RUN rustup target add wasm32-unknown-unknown
 # **Learning Point**: These dummy files allow Docker to cache compiled dependencies
 # separately from source code. When you change source, only source needs rebuilding.
 # Add new crates here when creating new WASM modules.
-RUN mkdir -p g2m/src && \
-    echo "fn main() {}" > g2m/src/lib.rs || true
+RUN mkdir -p wasm-splatwalk/src && \
+    echo "fn main() {}" > wasm-splatwalk/src/lib.rs || true
 
 
 # Build dependencies only (for caching)
@@ -51,7 +51,7 @@ RUN cargo build --target wasm32-unknown-unknown --release --workspace || true
 # Copy actual source code
 # **Learning Point**: After dependencies are cached, copy the real source code.
 # Docker will only rebuild from this point if source files change.
-COPY g2m ./g2m
+COPY wasm-splatwalk ./wasm-splatwalk
 COPY scripts ./scripts
 
 # Make build scripts executable
@@ -105,7 +105,6 @@ COPY --from=rust-builder /app/pkg ./pkg
 # Copy frontend source
 COPY src ./src
 COPY index.html ./
-COPY pages ./pages
 COPY vite.config.ts ./
 COPY tsconfig.json ./
 COPY public ./public

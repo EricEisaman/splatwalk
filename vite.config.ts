@@ -20,7 +20,7 @@ function devServerRouting(): Plugin {
         const isAssetFile = /\.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|wasm|json|webp|mjs)$/i.test(url);
         if (url.endsWith('.html') || (!isAssetFile && !url.startsWith('/@'))) {
           // Rewrite /splatwalk to /index.html (or handle root)
-          // Since we moved g2m.html to index.html, we might not need this anymore if we just use root.
+          // Since we moved from g2m.html to index.html, we use root.
           // But keep for safety if users use old link? No, we are rebranding.
           // Let's just remove the rewrite or update it if we want /app
           if (url === '/app' || url.startsWith('/app?')) {

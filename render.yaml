@@ -33,7 +33,6 @@ services:
         - nginx-main.conf
         - docker-entrypoint.sh
         - scripts/**
-        - pages/**
         - index.html
       ignoredPaths:
         - README.md

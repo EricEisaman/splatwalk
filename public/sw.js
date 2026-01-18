@@ -1,10 +1,10 @@
 const CACHE_NAME = 'g2m-cache-v1';
 const ASSETS_TO_CACHE = [
-  '/pages/g2m.html',
+  '/index.html',
   '/src/styles.css',
   '/rustacean.webp',
-  '/pkg/wasm_g2m/wasm_g2m.js',
-  '/pkg/wasm_g2m/wasm_g2m_bg.wasm'
+  '/pkg/wasm_splatwalk/wasm_splatwalk.js',
+  '/pkg/wasm_splatwalk/wasm_splatwalk_bg.wasm'
 ];
 
 self.addEventListener('install', (event) => {
