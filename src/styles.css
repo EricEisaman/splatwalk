@@ -521,7 +521,7 @@ input[type=range]::-webkit-slider-runnable-track {
 /* Buttons for Rotation */
 .icon-btn-group {
   display: flex;
-  gap: 10px;
+  gap: 7px;
 }
 
 .icon-button {
