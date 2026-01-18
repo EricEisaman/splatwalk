@@ -4,10 +4,7 @@ import {
     ArcRotateCamera,
     Vector3,
     HemisphericLight,
-    MeshBuilder,
-    StandardMaterial,
     Color3,
-    Mesh,
     SceneLoader,
     AbstractMesh,
 } from '@babylonjs/core';
@@ -68,13 +65,6 @@ export class Viewer {
         light.intensity = 0.7;
     }
 
-    private createDummyMesh(): void {
-        const sphere = MeshBuilder.CreateSphere('sphere', { diameter: 2 }, this.scene);
-        sphere.position.y = 1;
-        const material = new StandardMaterial('sphereMat', this.scene);
-        material.diffuseColor = new Color3(0.4, 0.4, 0.8);
-        sphere.material = material;
-    }
 
     private splatMesh: AbstractMesh | null = null;
     private rotation: { x: number, y: number, z: number } = { x: 0, y: 0, z: 0 };

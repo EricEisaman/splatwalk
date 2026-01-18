@@ -101,15 +101,50 @@
 
                             <div class="control-row" style="margin-top: 15px;">
                                 <label>Mode:</label>
-                                <div class="radio-cards">
+                                <div class="radio-cards" id="reconModeGroup">
                                     <label>
-                                        <input type="radio" name="reconMode" value="1" checked>
+                                        <input type="radio" name="reconMode" value="1">
                                         <div class="radio-card-content">Single Plane</div>
                                     </label>
                                     <label>
-                                        <input type="radio" name="reconMode" value="0">
-                                        <div class="radio-card-content">Poisson (Full)</div>
+                                        <input type="radio" name="reconMode" value="2" checked>
+                                        <div class="radio-card-content">Voxels (NavMesh)</div>
                                     </label>
+                                </div>
+                            </div>
+
+                            <!-- Advanced Settings Toggle -->
+                            <div id="advancedToggle" class="advanced-toggle">
+                                <span>Advanced Settings</span>
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                    stroke-width="2">
+                                    <polyline points="6 9 12 15 18 9"></polyline>
+                                </svg>
+                            </div>
+
+                            <!-- Advanced Settings Panel (Hidden by default) -->
+                            <div id="advancedSettings" class="advanced-settings-panel" style="display: none;">
+                                <div class="control-row">
+                                    <label title="Target number of voxel cells">Voxel Target:</label>
+                                    <input type="number" id="paramVoxelTarget" value="4000" step="500" min="500"
+                                        max="20000">
+                                </div>
+                                <div class="control-row">
+                                    <label title="Minimum opacity to include a splat">Min Alpha:</label>
+                                    <input type="number" id="paramMinAlpha" value="0.05" step="0.01" min="0" max="1">
+                                </div>
+                                <div class="control-row">
+                                    <label title="Maximum scale to prune floaters">Max Scale:</label>
+                                    <input type="number" id="paramMaxScale" value="5.0" step="0.5" min="0.1" max="20">
+                                </div>
+                                <div class="control-row">
+                                    <label title="Min alignment with ground normal">Normal Align:</label>
+                                    <input type="number" id="paramNormalAlign" value="0.05" step="0.05" min="0" max="1">
+                                </div>
+                                <div class="control-row">
+                                    <label title="RANSAC distance threshold">RANSAC Thresh:</label>
+                                    <input type="number" id="paramRansacThresh" value="0.1" step="0.05" min="0.01"
+                                        max="1">
                                 </div>
                             </div>
 
