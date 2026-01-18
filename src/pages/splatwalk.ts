@@ -122,6 +122,17 @@ async function main() {
         });
     }
 
+    // Advanced Settings Toggle logic
+    const advancedToggle = document.getElementById('advancedToggle');
+    const advancedSettings = document.getElementById('advancedSettings');
+    if (advancedToggle && advancedSettings) {
+        advancedToggle.addEventListener('click', () => {
+            const isHidden = advancedSettings.style.display === 'none';
+            advancedSettings.style.display = isHidden ? 'flex' : 'none';
+            advancedToggle.classList.toggle('open', isHidden);
+        });
+    }
+
     try {
         console.log("Initializing SplatWalk...");
 
@@ -204,8 +215,8 @@ async function main() {
 
                         const bytes = new Uint8Array(buffer);
 
-                        // Get Mode
-                        let mode = 1; // Default: Single Plane
+                        // Get Settings
+                        let mode = 2; // Default to Voxels now
                         const modeRadios = document.getElementsByName('reconMode');
                         for (let i = 0; i < modeRadios.length; i++) {
                             if ((modeRadios[i] as HTMLInputElement).checked) {
@@ -214,10 +225,19 @@ async function main() {
                             }
                         }
 
-                        console.log(`Reconstruction Mode: ${mode}`);
+                        const settings = {
+                            mode: mode,
+                            voxel_target: parseFloat((document.getElementById('paramVoxelTarget') as HTMLInputElement).value) || 4000,
+                            min_alpha: parseFloat((document.getElementById('paramMinAlpha') as HTMLInputElement).value) || 0.05,
+                            max_scale: parseFloat((document.getElementById('paramMaxScale') as HTMLInputElement).value) || 5.0,
+                            normal_align: parseFloat((document.getElementById('paramNormalAlign') as HTMLInputElement).value) || 0.05,
+                            ransac_thresh: parseFloat((document.getElementById('paramRansacThresh') as HTMLInputElement).value) || 0.1
+                        };
+
+                        console.log(`Reconstruction Settings:`, settings);
                         const start = performance.now();
 
-                        const result = splatwalk.convertSplatToMesh(bytes, mode);
+                        const result = splatwalk.convertSplatToMesh(bytes, settings);
                         // Future: apply rotation to result if needed
                         // For now we just rely on visual alignment, but ideally we transform the vertices too?
                         // The user request "Sync Rotation to Generated Mesh" implies we should.

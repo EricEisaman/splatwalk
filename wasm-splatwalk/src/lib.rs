@@ -25,14 +25,27 @@ pub struct MeshResult {
     face_count: usize,
 }
 
+#[derive(serde::Deserialize)]
+pub struct MeshSettings {
+    pub mode: u8,
+    pub voxel_target: Option<f64>,
+    pub min_alpha: Option<f64>,
+    pub max_scale: Option<f64>,
+    pub normal_align: Option<f64>,
+    pub ransac_thresh: Option<f64>,
+}
+
 #[wasm_bindgen]
-pub fn convert_splat_to_mesh(data: &[u8], mode: u8) -> Result<JsValue, JsValue> {
-    log(&format!("Received {} bytes for conversion (Mode: {})", data.len(), mode));
+pub fn convert_splat_to_mesh(data: &[u8], settings: JsValue) -> Result<JsValue, JsValue> {
+    let settings: MeshSettings = serde_wasm_bindgen::from_value(settings)?;
+    let mode = settings.mode;
+    
+    log(&format!("Received {} bytes (Mode: {})", data.len(), mode));
     
     let splats = splat::parse_ply(data).map_err(|e| JsValue::from_str(&e))?;
     log(&format!("Parsed {} splats", splats.len()));
     
-    let mesh = mesh::reconstruct_mesh(&splats, mode);
+    let mesh = mesh::reconstruct_mesh(&splats, &settings);
     let vertices = mesh.vertices;
     let indices = mesh.indices;
     let vertex_count = vertices.len() / 3;
