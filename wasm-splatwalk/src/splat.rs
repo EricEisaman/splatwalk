@@ -13,6 +13,10 @@ pub struct Splat {
     pub rot_1: f32,
     pub rot_2: f32,
     pub rot_3: f32,
+    pub scale_0: f32,
+    pub scale_1: f32,
+    pub scale_2: f32,
+    pub opacity: f32,
 }
 
 impl PropertyAccess for Splat {
@@ -20,6 +24,8 @@ impl PropertyAccess for Splat {
         Splat {
             x: 0.0, y: 0.0, z: 0.0,
             rot_0: 1.0, rot_1: 0.0, rot_2: 0.0, rot_3: 0.0,
+            scale_0: 0.1, scale_1: 0.1, scale_2: 0.1,
+            opacity: 1.0,
         }
     }
 
@@ -32,6 +38,12 @@ impl PropertyAccess for Splat {
             ("rot_1", Property::Float(v)) => self.rot_1 = v,
             ("rot_2", Property::Float(v)) => self.rot_2 = v,
             ("rot_3", Property::Float(v)) => self.rot_3 = v,
+            ("scale_0", Property::Float(v)) => self.scale_0 = v,
+            ("scale_1", Property::Float(v)) => self.scale_1 = v,
+            ("scale_2", Property::Float(v)) => self.scale_2 = v,
+            ("opacity", Property::Float(v)) | 
+            ("alpha", Property::Float(v)) | 
+            ("scalar_opacity", Property::Float(v)) => self.opacity = v,
             _ => {} 
         }
     }
@@ -40,6 +52,8 @@ impl PropertyAccess for Splat {
 pub struct PointNormal {
     pub point: Point3<f64>,
     pub normal: Vector3<f64>,
+    pub scale: Vector3<f64>,
+    pub opacity: f64,
 }
 
 pub fn parse_ply(data: &[u8]) -> Result<Vec<PointNormal>, String> {
@@ -56,8 +70,9 @@ pub fn parse_ply(data: &[u8]) -> Result<Vec<PointNormal>, String> {
 
                 for i in 0..num_points {
                     let g = packed.unpack(i);
-                    
                     let pos = Point3::new(g.position[0] as f64, g.position[1] as f64, g.position[2] as f64);
+                    let scale = Vector3::new(g.scale[0] as f64, g.scale[1] as f64, g.scale[2] as f64);
+                    let opacity = g.alpha as f64;
                     
                     // rotation is [w, x, y, z]
                     let r0 = g.rotation[0] as f64; // w
@@ -66,17 +81,13 @@ pub fn parse_ply(data: &[u8]) -> Result<Vec<PointNormal>, String> {
                     let r3 = g.rotation[3] as f64; // z
                     
                     // Rotate Z-axis (0, 0, 1) by this quaternion
-                    // nx = 2(xz + yw)
-                    // ny = 2(yz - xw)
-                    // nz = 1 - 2(x^2 + y^2)
-                    
                     let nx = 2.0 * (r1 * r3 + r2 * r0);
                     let ny = 2.0 * (r2 * r3 - r1 * r0);
                     let nz = 1.0 - 2.0 * (r1 * r1 + r2 * r2);
                     
                     let normal = Vector3::new(nx, ny, nz);
                     
-                    points.push(PointNormal { point: pos, normal });
+                    points.push(PointNormal { point: pos, normal, scale, opacity });
                 }
                 
                 return Ok(points);
@@ -111,15 +122,17 @@ pub fn parse_ply(data: &[u8]) -> Result<Vec<PointNormal>, String> {
 
     for splat in splats {
         let p = Point3::new(splat.x as f64, splat.y as f64, splat.z as f64);
+        let scale = Vector3::new(splat.scale_0 as f64, splat.scale_1 as f64, splat.scale_2 as f64);
+        let opacity = splat.opacity as f64;
         
-        // Convert quaternion to normal (Z-axis rotated by quaternion)
-        // Note: We might need to handle normalization carefully
         let q = UnitQuaternion::new_normalize(Quaternion::new(splat.rot_0, splat.rot_1, splat.rot_2, splat.rot_3));
         let normal = q.transform_vector(&Vector3::z_axis());
 
         points.push(PointNormal {
             point: p,
             normal: Vector3::new(normal.x as f64, normal.y as f64, normal.z as f64),
+            scale,
+            opacity,
         });
     }
 

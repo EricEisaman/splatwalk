@@ -7,6 +7,15 @@ export interface MeshResult {
     face_count: number;
 }
 
+export interface MeshSettings {
+    mode: number;
+    voxel_target?: number;
+    min_alpha?: number;
+    max_scale?: number;
+    normal_align?: number;
+    ransac_thresh?: number;
+}
+
 export class SplatWalkBridge {
     private static instance: SplatWalkBridge;
     private isInitialized = false;
@@ -34,13 +43,13 @@ export class SplatWalkBridge {
         }
     }
 
-    public convertSplatToMesh(data: Uint8Array, mode: number = 1): MeshResult {
+    public convertSplatToMesh(data: Uint8Array, settings: MeshSettings): MeshResult {
         if (!this.isInitialized) {
             throw new Error("SplatWalk WASM not initialized");
         }
 
         try {
-            const result = convert_splat_to_mesh(data, mode);
+            const result = convert_splat_to_mesh(data, settings);
             return result as MeshResult;
         } catch (e) {
             console.error("Conversion failed in WASM:", e);
