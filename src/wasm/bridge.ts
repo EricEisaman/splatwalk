@@ -1,4 +1,4 @@
-import init, { init_splatwalk, convert_splat_to_mesh } from '../../pkg/wasm_splatwalk/wasm_splatwalk';
+import init, { init_splatwalk, convert_splat_to_mesh } from '../../pkg/wasm_splatwalk/wasm_splatwalk.js';
 
 export interface MeshResult {
     vertices: Float32Array;
