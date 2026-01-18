@@ -324,8 +324,9 @@ fn reconstruct_voxel_navmesh(points: &[PointNormal], settings: &crate::MeshSetti
                     idx
                 } else {
                     let idx = (vertices.len() / 3) as u32;
+                    // Babylon.js uses left-handed coords - negate Y for correct vertical orientation
                     vertices.push(pos.x);
-                    vertices.push(pos.y);
+                    vertices.push(-pos.y);  // Flip Y for left-handed system
                     vertices.push(pos.z);
                     vertex_index_map.insert(grid_idx, idx);
                     idx
@@ -337,14 +338,14 @@ fn reconstruct_voxel_navmesh(points: &[PointNormal], settings: &crate::MeshSetti
             let i11 = get_or_create_vertex(v11, p11);
             let i01 = get_or_create_vertex(v01, p01);
             
-            // Emit two triangles for this quad
+            // Emit two triangles for this quad (clockwise winding for left-handed Babylon.js)
             indices.push(i00);
-            indices.push(i10);
             indices.push(i11);
+            indices.push(i10);
             
             indices.push(i00);
-            indices.push(i11);
             indices.push(i01);
+            indices.push(i11);
             
             faces_generated += 2;
         }
