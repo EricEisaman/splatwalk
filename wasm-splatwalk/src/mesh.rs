@@ -1,4 +1,4 @@
-use wasm_bindgen::prelude::*;
+// use wasm_bindgen::prelude::*;
 use crate::splat::PointNormal;
 use poisson_reconstruction::{PoissonReconstruction, Real};
 use nalgebra::{Point3, Vector3};
@@ -34,24 +34,19 @@ impl Plane {
     }
 }
 
-pub fn reconstruct_mesh(points: &[PointNormal], mode: u8) -> ReconstructedMesh {
+pub fn reconstruct_mesh(points: &[PointNormal], settings: &crate::MeshSettings) -> ReconstructedMesh {
+    let mode = settings.mode;
     web_sys::console::log_1(&format!("Reconstructing mesh (Mode: {})...", mode).into());
 
-    let mut p_coords = Vec::new();
-    let mut p_normals = Vec::new();
+    let p_coords: Vec<Point3<Real>> = points.iter()
+        .filter(|p| !(p.point.x.is_nan() || p.point.y.is_nan() || p.point.z.is_nan()))
+        .map(|p| Point3::new(p.point.x as Real, p.point.y as Real, p.point.z as Real))
+        .collect();
+    let p_normals: Vec<Vector3<Real>> = points.iter()
+        .filter(|p| !(p.point.x.is_nan() || p.point.y.is_nan() || p.point.z.is_nan()))
+        .map(|p| Vector3::new(p.normal.x as Real, p.normal.y as Real, p.normal.z as Real))
+        .collect();
 
-    // Downsample for RANSAC speed (and Poisson stability)
-    let target_count = if mode == 0 { 500 } else { 5000 }; 
-    let stride = if points.len() > target_count { points.len() / target_count } else { 1 };
-    
-    for (i, p) in points.iter().enumerate() {
-        if i % stride == 0 {
-             if p.point.x.is_nan() || p.point.y.is_nan() || p.point.z.is_nan() { continue; }
-             p_coords.push(Point3::new(p.point.x as Real, p.point.y as Real, p.point.z as Real));
-             p_normals.push(Vector3::new(p.normal.x as Real, p.normal.y as Real, p.normal.z as Real));
-        }
-    }
-    
     if p_coords.is_empty() {
         return ReconstructedMesh { vertices: vec![], indices: vec![] };
     }
@@ -59,10 +54,198 @@ pub fn reconstruct_mesh(points: &[PointNormal], mode: u8) -> ReconstructedMesh {
     if mode == 1 {
         // Single Plane Detection (RANSAC)
         return reconstruct_plane_ransac(&p_coords);
+    } else if mode == 2 {
+        // Mode 2: Voxel NavMesh (Advanced)
+        return reconstruct_voxel_navmesh(points, settings);
     } else {
         // Mode 0: Default Poisson
          return reconstruct_poisson(&p_coords, &p_normals);
     }
+}
+
+fn reconstruct_voxel_navmesh(points: &[PointNormal], settings: &crate::MeshSettings) -> ReconstructedMesh {
+    // Extract settings with defaults
+    let voxel_target = settings.voxel_target.unwrap_or(4000.0);
+    let min_alpha = settings.min_alpha.unwrap_or(0.05);
+    let max_scale = settings.max_scale.unwrap_or(5.0);
+    let normal_align = settings.normal_align.unwrap_or(0.05);
+    let ransac_thresh = settings.ransac_thresh.unwrap_or(0.1);
+
+    web_sys::console::log_1(&format!("NavMesh Params: Target={}, Alpha={}, Scale={}, Align={}, RANSAC={}", 
+        voxel_target, min_alpha, max_scale, normal_align, ransac_thresh).into());
+
+    if points.is_empty() {
+        return ReconstructedMesh { vertices: vec![], indices: vec![] };
+    }
+
+    // 1. Robust Filter
+    let filtered_points: Vec<&PointNormal> = points.iter()
+        .filter(|p| {
+            p.opacity > min_alpha && 
+            p.scale.x < max_scale && p.scale.y < max_scale && p.scale.z < max_scale
+        })
+        .collect();
+
+    web_sys::console::log_1(&format!("Points after floater filter: {}/{}", filtered_points.len(), points.len()).into());
+
+    if filtered_points.is_empty() {
+        return ReconstructedMesh { vertices: vec![], indices: vec![] };
+    }
+
+    // 2. Find Dominant Plane via RANSAC
+    let p_coords: Vec<Point3<Real>> = filtered_points.iter()
+        .map(|p| Point3::new(p.point.x as Real, p.point.y as Real, p.point.z as Real))
+        .collect();
+    
+    let iterations = 1000;
+    let mut best_plane: Option<Plane> = None;
+    let mut max_inliers = 0;
+    let mut rng = rand::thread_rng();
+    let n = p_coords.len();
+
+    if n > 3 {
+        for _ in 0..iterations {
+            let idx1 = rng.gen_range(0..n);
+            let idx2 = rng.gen_range(0..n);
+            let idx3 = rng.gen_range(0..n);
+            if idx1 == idx2 || idx2 == idx3 || idx1 == idx3 { continue; }
+            if let Some(plane) = Plane::from_points(&p_coords[idx1], &p_coords[idx2], &p_coords[idx3]) {
+                let mut inliers = 0;
+                for p in &p_coords {
+                    if plane.distance(p) < ransac_thresh { inliers += 1; }
+                }
+                if inliers > max_inliers {
+                    max_inliers = inliers;
+                    best_plane = Some(plane);
+                }
+            }
+        }
+    }
+
+    web_sys::console::log_1(&format!("RANSAC max inliers: {}/{}", max_inliers, n).into());
+
+    let up = if let Some(ref plane) = best_plane {
+        let normal = if plane.normal.y < 0.0 { -plane.normal } else { plane.normal };
+        web_sys::console::log_1(&format!("Aligned Ground Normal: {:?}", normal).into());
+        normal
+    } else {
+        web_sys::console::log_1(&"RANSAC failed, falling back to +Y".into());
+        Vector3::new(0.0, 1.0, 0.0)
+    };
+
+    // 3. Create Basis
+    let mut tangent = if up.x.abs() < 0.9 { Vector3::new(1.0, 0.0, 0.0) } else { Vector3::new(0.0, 1.0, 0.0) };
+    tangent = (tangent - up * up.dot(&tangent)).normalize();
+    let bitangent = up.cross(&tangent);
+
+    // 4. Bounding Box in Projected Space
+    let mut min_u = f64::MAX;
+    let mut max_u = f64::MIN;
+    let mut min_v = f64::MAX;
+    let mut max_v = f64::MIN;
+
+    for p in &filtered_points {
+        let u = p.point.coords.dot(&Vector3::new(tangent.x as f64, tangent.y as f64, tangent.z as f64));
+        let v = p.point.coords.dot(&Vector3::new(bitangent.x as f64, bitangent.y as f64, bitangent.z as f64));
+        if u < min_u { min_u = u; }
+        if u > max_u { max_u = u; }
+        if v < min_v { min_v = v; }
+        if v > max_v { max_v = v; }
+    }
+
+    // 5. Grid Config
+    let width = max_u - min_u;
+    let depth = max_v - min_v;
+    let mut cell_size = (width * depth / voxel_target).sqrt();
+    cell_size = cell_size.clamp(0.01, 2.0);
+
+    let rows = (depth / cell_size).ceil() as usize;
+    let cols = (width / cell_size).ceil() as usize;
+    let mut grid_accum = vec![(0.0, 0.0); rows * cols];
+
+    // 6. Aligned Density Splatting
+    let up_64 = Vector3::new(up.x as f64, up.y as f64, up.z as f64);
+    let mut max_w_seen = 0.0;
+
+    for p in &filtered_points {
+        let normal_weight = p.normal.dot(&up_64).abs().powi(2);
+        if normal_weight < normal_align { continue; }
+
+        let u = p.point.coords.dot(&Vector3::new(tangent.x as f64, tangent.y as f64, tangent.z as f64));
+        let v = p.point.coords.dot(&Vector3::new(bitangent.x as f64, bitangent.y as f64, bitangent.z as f64));
+        let h = p.point.coords.dot(&up_64);
+
+        let col_center = (u - min_u) / cell_size;
+        let row_center = (v - min_v) / cell_size;
+        
+        let scale_avg = (p.scale.x + p.scale.y + p.scale.z) / 3.0;
+        let radius = (scale_avg / cell_size).ceil() as isize;
+        let radius = radius.clamp(0, 2); 
+
+        let weight = p.opacity * normal_weight;
+        
+        for dr in -radius..=radius {
+            for dc in -radius..=radius {
+                let c = (col_center.floor() as isize) + dc;
+                let r = (row_center.floor() as isize) + dr;
+                if c >= 0 && c < cols as isize && r >= 0 && r < rows as isize {
+                    let idx = (r as usize) * cols + (c as usize);
+                    let dist_sq = (dc as f64).powi(2) + (dr as f64).powi(2);
+                    let falloff = (-dist_sq / 2.0).exp();
+                    let w = weight * falloff;
+                    let (sum_h, total_w) = grid_accum[idx];
+                    grid_accum[idx] = (sum_h + h * w, total_w + w);
+                    if grid_accum[idx].1 > max_w_seen { max_w_seen = grid_accum[idx].1; }
+                }
+            }
+        }
+    }
+
+    web_sys::console::log_1(&format!("Max weight in grid: {:.4}", max_w_seen).into());
+
+    // 7. Generate Mesh
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    let mut vertex_map: std::collections::HashMap<(usize, usize), u32> = std::collections::HashMap::new();
+
+    let up_f = Vector3::new(up.x as f32, up.y as f32, up.z as f32);
+    let tangent_f = Vector3::new(tangent.x as f32, tangent.y as f32, tangent.z as f32);
+    let bitangent_f = Vector3::new(bitangent.x as f32, bitangent.y as f32, bitangent.z as f32);
+
+    for r in 0..rows {
+        for c in 0..cols {
+            let (sum_h, total_w) = grid_accum[r * cols + c];
+            if total_w < 0.001 { continue; } 
+            let avg_h = (sum_h / total_w) as f32;
+            
+            let corners = [(c, r), (c + 1, r), (c + 1, r + 1), (c, r + 1)];
+            let mut cell_indices = [0u32; 4];
+            for (i, (cc, rr)) in corners.iter().enumerate() {
+                if let Some(&idx) = vertex_map.get(&(*cc, *rr)) {
+                    cell_indices[i] = idx;
+                } else {
+                    let idx = (vertices.len() / 3) as u32;
+                    let uu = (min_u + (*cc as f64) * cell_size) as f32;
+                    let vv = (min_v + (*rr as f64) * cell_size) as f32;
+                    let p_3d = uu * tangent_f + vv * bitangent_f + avg_h * up_f;
+                    vertices.push(p_3d.x);
+                    vertices.push(p_3d.y);
+                    vertices.push(p_3d.z);
+                    vertex_map.insert((*cc, *rr), idx);
+                    cell_indices[i] = idx;
+                }
+            }
+            indices.push(cell_indices[0]);
+            indices.push(cell_indices[1]);
+            indices.push(cell_indices[2]);
+            indices.push(cell_indices[0]);
+            indices.push(cell_indices[2]);
+            indices.push(cell_indices[3]);
+        }
+    }
+
+    web_sys::console::log_1(&format!("Final Mesh: {} vertices, {} indices", vertices.len()/3, indices.len()).into());
+    ReconstructedMesh { vertices, indices }
 }
 
 fn reconstruct_plane_ransac(points: &[Point3<Real>]) -> ReconstructedMesh {
@@ -157,7 +340,7 @@ fn generate_plane_mesh(plane: &Plane, points: &[Point3<Real>], threshold: Real) 
     // Wait, Plane equation: Ax + By + Cz + D = 0 => N . P + D = 0 => P . N = -D
     // We need an origin point on the plane.
     // origin = -D * normal
-    let origin = -plane.d * normal;
+    // let _origin = -plane.d * normal;
     
     let corners_uv = [
         (min_u, min_v),
