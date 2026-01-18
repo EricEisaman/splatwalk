@@ -1,0 +1,151 @@
+server {
+    listen $PORT;
+    server_name _;
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # Apply rate limiting (zones defined in main nginx.conf)
+    # 10 requests per second with burst of 20
+    limit_req zone=general burst=20 nodelay;
+    limit_req_status 429;
+
+    # Keep-alive optimizations (inherits from main config, but can override)
+    keepalive_timeout 65;
+    keepalive_requests 100;
+
+    # WASM MIME type (critical for WebAssembly)
+    # Must come BEFORE /pkg/ location to ensure WASM files get correct MIME type
+    location ~ \.wasm$ {
+        add_header Content-Type application/wasm;
+        add_header Cache-Control "public, max-age=31536000, immutable";
+        # CORS headers for WASM if needed
+        add_header Access-Control-Allow-Origin *;
+    }
+
+    # Serve pkg/ directory JavaScript files with correct MIME type for ES modules
+    # This ensures wasm-bindgen generated modules load correctly with all exports available
+    # Only matches .js files to avoid conflicting with WASM files
+    location ~ ^/pkg/.*\.js$ {
+        # Explicitly set JavaScript MIME type for ES modules
+        # text/javascript is the standard for ES modules, application/javascript also works
+        add_header Content-Type "text/javascript; charset=utf-8";
+        add_header Cache-Control "public, max-age=31536000, immutable";
+        # CORS headers for module loading
+        add_header Access-Control-Allow-Origin *;
+        try_files $uri =404;
+    }
+    
+    # Serve other files in pkg/ directory (like .d.ts, .wasm.d.ts)
+    location /pkg/ {
+        add_header Cache-Control "public, max-age=31536000, immutable";
+        add_header Access-Control-Allow-Origin *;
+        try_files $uri =404;
+    }
+
+    # Serve favicon.ico directly (universal browser support)
+    # Browsers automatically request /favicon.ico regardless of <link> tags
+    # ICO format ensures compatibility across all browsers including Edge
+    # Root is inherited from server level, file served from /usr/share/nginx/html/favicon.ico
+    location = /favicon.ico {
+        # Explicitly serve file from root (inherited from server block)
+        # Nginx automatically serves matching files from root directory
+        add_header Content-Type image/x-icon;
+        add_header Cache-Control "public, max-age=31536000, immutable";
+        access_log off;
+        log_not_found off;
+    }
+
+    # WebP images (favicon, etc.)
+    location ~ \.webp$ {
+        add_header Content-Type image/webp;
+        add_header Cache-Control "public, max-age=31536000, immutable";
+        access_log off;
+    }
+
+    # Serve specific HTML pages for endpoints
+    # Vite builds pages in dist/pages/ subdirectory, so we need to map URLs to file paths
+    location = /astar {
+        try_files /pages/astar.html =404;
+    }
+    
+    location = /preprocess-smolvlm-500m {
+        try_files /pages/preprocess-smolvlm-500m.html =404;
+    }
+    
+    location = /preprocess-smolvlm-256m {
+        try_files /pages/preprocess-smolvlm-256m.html =404;
+    }
+    
+    location = /image-captioning {
+        try_files /pages/image-captioning.html =404;
+    }
+    
+    location = /function-calling {
+        try_files /pages/function-calling.html =404;
+    }
+    
+    location = /fractal-chat {
+        try_files /pages/fractal-chat.html =404;
+    }
+    
+    location = /hello-wasm {
+        try_files /pages/hello-wasm.html =404;
+    }
+    
+    location = /babylon-wfc {
+        try_files /pages/babylon-wfc.html =404;
+    }
+    
+    location = /babylon-chunks {
+        try_files /pages/babylon-chunks.html =404;
+    }
+    
+    location = /multilingual-chat {
+        try_files /pages/multilingual-chat.html =404;
+    }
+    
+    # Root path serves landing page
+    location = / {
+        try_files /index.html =404;
+    }
+    
+    # All other routes fall back to index.html for client-side routing
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # Cache static assets with long expiration
+    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$ {
+        add_header Cache-Control "public, max-age=31536000, immutable";
+        access_log off;
+    }
+
+    # Security headers
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    
+    # Content Security Policy (adjust as needed for your app)
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https: blob:; font-src 'self' data:; connect-src 'self' https: data:; worker-src 'self' blob:; child-src 'self' blob:; frame-ancestors 'self';" always;
+    
+    # HSTS (only if using HTTPS - Render.com provides HTTPS)
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
+
+    # Health check endpoint (for Render.com)
+    # Note: Health checks inherit server-level rate limiting (10r/s)
+    # This is acceptable as health checks are infrequent
+    location /health {
+        access_log off;
+        return 200 "healthy\n";
+        add_header Content-Type text/plain;
+    }
+
+    # Deny access to hidden files
+    location ~ /\. {
+        deny all;
+        access_log off;
+        log_not_found off;
+    }
+}
+

@@ -1,0 +1,1 @@
+/Users/eeisaman/Documents/SIGMA\ PRODUCTIONS/g2m/target/wasm32-unknown-unknown/release/wasm_g2m.wasm: /Users/eeisaman/Documents/SIGMA\ PRODUCTIONS/g2m/wasm-g2m/src/lib.rs /Users/eeisaman/Documents/SIGMA\ PRODUCTIONS/g2m/wasm-g2m/src/mesh.rs /Users/eeisaman/Documents/SIGMA\ PRODUCTIONS/g2m/wasm-g2m/src/splat.rs

@@ -1,0 +1,15 @@
+{
+  "name": "G2M - Gaussian to Mesh",
+  "short_name": "G2M",
+  "icons": [
+    {
+      "src": "/rustacean.webp",
+      "sizes": "512x512",
+      "type": "image/webp"
+    }
+  ],
+  "start_url": "/pages/g2m.html",
+  "display": "standalone",
+  "background_color": "#111111",
+  "theme_color": "#000000"
+}
