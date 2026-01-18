@@ -1,0 +1,15 @@
+{
+  "name": "SplatWalk",
+  "short_name": "SplatWalk",
+  "icons": [
+    {
+      "src": "/rustacean.webp",
+      "sizes": "512x512",
+      "type": "image/webp"
+    }
+  ],
+  "start_url": "/index.html",
+  "display": "standalone",
+  "background_color": "#111111",
+  "theme_color": "#000000"
+}

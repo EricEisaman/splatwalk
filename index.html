@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#000000">
+    <title>SplatWalk</title>
+    <link rel="manifest" href="/manifest.json">
+    <link rel="icon" type="image/x-icon" href="/favicon.ico">
+    <link rel="icon" type="image/webp" href="/rustacean.webp">
+    <link rel="apple-touch-icon" href="/rustacean.webp">
+    <link rel="stylesheet" href="/src/styles.css">
+</head>
+
+<body>
+    <div id="fullscreen">
+        <div class="preprocess-container">
+            <!-- Home link -->
+            <a href="/" class="home-link" title="Home">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                    stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path>
+                    <polyline points="9 22 9 12 15 12 15 22"></polyline>
+                </svg>
+            </a>
+
+            <h1>SplatWalk</h1>
+
+            <!-- Error display -->
+            <div id="error" class="error-message"></div>
+
+            <!-- About section -->
+            <div class="preprocess-section">
+                <h2>About SplatWalk</h2>
+                <p>
+                    <strong>SplatWalk</strong> converts Gaussian Splat files (.ply, .spz) into optimized 3D Meshes
+                    (.glb)
+                    using advanced <strong>RANSAC Ground Plane Detection</strong> and <strong>Poisson
+                        Reconstruction</strong>.
+                    Powered by Rust WASM and BabylonJS.
+                </p>
+            </div>
+
+            <!-- Canvas for BabylonJS rendering -->
+            <div class="preprocess-section">
+                <h2>3D Workbench</h2>
+                <div class="viewer-description">
+                    <p>Drag and drop <strong>.ply</strong> or <strong>.spz</strong> files here to begin.</p>
+                </div>
+
+                <!-- Workbench Container (Fullscreen Target) -->
+                <div id="workbenchContainer" class="workbench-container">
+
+                    <!-- Controls Toolbar -->
+                    <div class="workbench-controls-layer">
+                        <!-- Left: Settings Toggle -->
+                        <div class="controls-left">
+                            <button id="settingsToggle" class="icon-button glass-btn" title="Toggle Settings">
+                                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                    stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <circle cx="12" cy="12" r="3"></circle>
+                                    <path
+                                        d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z">
+                                    </path>
+                                </svg>
+                            </button>
+                        </div>
+
+                        <!-- Right: Fullscreen -->
+                        <div class="controls-right">
+                            <button id="fullscreenBtn" class="icon-button glass-btn" title="Fullscreen">
+                                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                    stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <path
+                                        d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3">
+                                    </path>
+                                </svg>
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Left Side Flyout Settings Panel -->
+                    <div id="controlsContainer" class="settings-panel">
+                        <div class="panel-header">
+                            <span>Settings</span>
+                        </div>
+
+                        <!-- Section 1: Setup & Orientation -->
+                        <div id="setupSection" class="controls-section">
+                            <div class="section-title">Setup & Orientation</div>
+
+                            <div class="control-row">
+                                <label>Rotate Splat:</label>
+                                <div class="icon-btn-group">
+                                    <button class="icon-button" id="rotX">X+90°</button>
+                                    <button class="icon-button" id="rotY">Y+90°</button>
+                                    <button class="icon-button" id="rotZ">Z+90°</button>
+                                </div>
+                            </div>
+
+                            <div class="control-row" style="margin-top: 15px;">
+                                <label>Mode:</label>
+                                <div class="radio-cards">
+                                    <label>
+                                        <input type="radio" name="reconMode" value="1" checked>
+                                        <div class="radio-card-content">Single Plane</div>
+                                    </label>
+                                    <label>
+                                        <input type="radio" name="reconMode" value="0">
+                                        <div class="radio-card-content">Poisson (Full)</div>
+                                    </label>
+                                </div>
+                            </div>
+
+                            <button id="processBtn" class="cyber-button" style="margin-top: 20px;">
+                                GENERATE MESH
+                            </button>
+                        </div>
+
+                        <!-- Section 2: Results (Hidden initially) -->
+                        <div id="resultSection" class="controls-section" style="display: none;">
+                            <div class="section-title">Result Controls</div>
+
+                            <div class="control-row">
+                                <label>Show Mesh:</label>
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="showMesh" checked>
+                                    <span class="slider"></span>
+                                </label>
+                            </div>
+
+                            <div class="control-row">
+                                <label>Opacity:</label>
+                                <input type="range" id="meshOpacity" min="0" max="1" step="0.1" value="0.5">
+                            </div>
+
+                            <div id="downloadContainer" style="margin-top: 15px;">
+                                <button id="downloadBtn" class="cyber-button">DOWNLOAD .GLB</button>
+                            </div>
+                        </div>
+
+                    </div>
+
+                    <canvas id="renderCanvas" class="main-canvas"></canvas>
+                </div>
+            </div>
+
+            <!-- System Logs -->
+            <div id="systemLogs" class="system-logs-container">
+                <h3>System Logs</h3>
+                <div id="systemLogsContent" class="system-logs-content"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('/sw.js')
+                    .then(reg => console.log('Service Worker registered', reg))
+                    .catch(err => console.error('Service Worker registration failed', err));
+            });
+        }
+    </script>
+    <script type="module" src="./src/pages/splatwalk.ts"></script>
+</body>
+
+</html>

@@ -1,0 +1,14 @@
+/Users/eeisaman/Documents/SIGMA PRODUCTIONS/g2m/target/release/deps/libserde-08c223d26bdda7ec.rmeta: /Users/eeisaman/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/eeisaman/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/eeisaman/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/eeisaman/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/eeisaman/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/eeisaman/Documents/SIGMA\ PRODUCTIONS/g2m/target/release/build/serde-6b8e4b626a77a42b/out/private.rs
+
+/Users/eeisaman/Documents/SIGMA PRODUCTIONS/g2m/target/release/deps/libserde-08c223d26bdda7ec.rlib: /Users/eeisaman/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/eeisaman/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/eeisaman/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/eeisaman/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/eeisaman/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/eeisaman/Documents/SIGMA\ PRODUCTIONS/g2m/target/release/build/serde-6b8e4b626a77a42b/out/private.rs
+
+/Users/eeisaman/Documents/SIGMA PRODUCTIONS/g2m/target/release/deps/serde-08c223d26bdda7ec.d: /Users/eeisaman/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/eeisaman/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/eeisaman/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/eeisaman/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/eeisaman/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/eeisaman/Documents/SIGMA\ PRODUCTIONS/g2m/target/release/build/serde-6b8e4b626a77a42b/out/private.rs
+
+/Users/eeisaman/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs:
+/Users/eeisaman/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs:
+/Users/eeisaman/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs:
+/Users/eeisaman/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs:
+/Users/eeisaman/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs:
+/Users/eeisaman/Documents/SIGMA\ PRODUCTIONS/g2m/target/release/build/serde-6b8e4b626a77a42b/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/eeisaman/Documents/SIGMA PRODUCTIONS/g2m/target/release/build/serde-6b8e4b626a77a42b/out
