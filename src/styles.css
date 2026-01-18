@@ -49,6 +49,7 @@ h1 {
   letter-spacing: 2px;
   background: linear-gradient(90deg, var(--neon-blue), var(--neon-pink));
   -webkit-background-clip: text;
+  background-clip: text;
   -webkit-text-fill-color: transparent;
   filter: drop-shadow(0 0 5px rgba(0, 240, 255, 0.5));
 }
@@ -216,8 +217,7 @@ canvas#renderCanvas.highlight {
   padding: 15px;
   margin-bottom: 20px;
   font-weight: bold;
-  display: block;
-  /* Ensure visibility when populated */
+  display: none;
   animation: shake 0.5s;
 }
 
@@ -491,6 +491,7 @@ input:checked+.slider:before {
 input[type=range] {
   width: 100%;
   -webkit-appearance: none;
+  appearance: none;
   background: transparent;
 }
 
