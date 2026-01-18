@@ -335,8 +335,8 @@ canvas#renderCanvas.highlight {
   left: 0;
   bottom: 0;
   /* Full height overlay */
-  width: 300px;
-  /* Reduced specific width */
+  width: 335px;
+  /* Flyout panel width */
   max-width: 90vw;
   /* Small screen safeguard */
 
