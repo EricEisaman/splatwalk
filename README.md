@@ -2,7 +2,7 @@
 
 ![SplatWalk Logo](public/splatwalk.png)
 
-**SplatWalk** is a convenient one-stop shop for generating optimized **.glb meshes** from **.spz** or **.ply** Gaussian splats.
+**SplatWalk** is a convenient one-stop shop for generating optimized **.glb ground meshes** from **.spz** or **.ply** Gaussian splats.
 
 The primary goal of the application is to provide high-quality mesh reconstruction suited for **downstream navigation applications**, allowing for rapid environment generation from 3D capture data.
 
