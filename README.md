@@ -1,6 +1,6 @@
 # SplatWalk
 
-
+![SplatWalk Logo](public/splatwalk.png)
 
 **SplatWalk** is a convenient one-stop shop for generating optimized **.glb meshes** from **.spz** or **.ply** Gaussian splats.
 
