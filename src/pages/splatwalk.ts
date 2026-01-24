@@ -4,7 +4,10 @@ import { splatwalk } from '../wasm/bridge';
 import { Mesh, VertexData, StandardMaterial, Color3 } from '@babylonjs/core';
 import { extractGeometry } from '../navigation/navigation';
 /// <reference types="vite/client" />
-import NavWorker from '../navigation/navmesh.worker?worker';
+const NavWorker = new Worker(new URL(
+    './navigation/navmesh.worker.ts',
+    import.meta.url
+));
 
 async function main() {
     const canvas = document.getElementById('renderCanvas') as HTMLCanvasElement;
@@ -439,7 +442,7 @@ async function main() {
                                     console.log("[INFO] NavMesh Parameters:", params);
 
                                     console.log("[WAIT] Spawning NavMesh Worker...");
-                                    const worker = new NavWorker();
+                                    const worker = NavWorker;
                                     worker.postMessage({
                                         type: 'generate',
                                         payload: {
