@@ -2,10 +2,10 @@ import { Viewer } from '../scene/Viewer';
 import { DropZone } from '../components/DropZone';
 import { splatwalk } from '../wasm/bridge';
 import { Mesh, VertexData, StandardMaterial, Color3 } from '@babylonjs/core';
-import { extractGeometry } from '../navigation/navigation';
+import { extractGeometry } from './navigation/navigation';
 /// <reference types="vite/client" />
 const NavWorker = new Worker(new URL(
-    './navigation/navmesh.worker.ts',
+    '../navigation/navmesh.worker.ts',
     import.meta.url
 ));
 
