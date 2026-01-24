@@ -33,6 +33,9 @@ pub struct MeshSettings {
     pub max_scale: Option<f64>,
     pub normal_align: Option<f64>,
     pub ransac_thresh: Option<f64>,
+    pub region_min: Option<Vec<f64>>,
+    pub region_max: Option<Vec<f64>>,
+    pub rotation: Option<Vec<f64>>,
 }
 
 #[wasm_bindgen]
