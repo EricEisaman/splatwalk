@@ -655,6 +655,7 @@ export default defineConfig({
       },
       output: {
         format: 'es',
+        manualChunks: undefined,
       },
       external: (id) => {
         // Mark pkg/ directory imports as external - they should be loaded at runtime, not bundled
