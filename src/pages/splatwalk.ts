@@ -2,6 +2,9 @@ import { Viewer } from '../scene/Viewer';
 import { DropZone } from '../components/DropZone';
 import { splatwalk } from '../wasm/bridge';
 import { Mesh, VertexData, StandardMaterial, Color3 } from '@babylonjs/core';
+import { extractGeometry } from '../navigation/navigation';
+/// <reference types="vite/client" />
+import NavWorker from '../navigation/navmesh.worker?worker';
 
 async function main() {
     const canvas = document.getElementById('renderCanvas') as HTMLCanvasElement;
@@ -24,6 +27,14 @@ async function main() {
 
             if (msg.startsWith("[INFO]")) {
                 content = msg.substring(6).trim();
+            } else if (msg.startsWith("[WAIT]")) {
+                tag = "WAIT";
+                typeClass = "log-tag-wait";
+                content = msg.substring(6).trim();
+            } else if (msg.startsWith("[WORKER]")) {
+                tag = "WORKER";
+                typeClass = "log-tag-worker";
+                content = msg.substring(8).trim();
             } else if (msg.toLowerCase().includes("error") || msg.toLowerCase().includes("failed")) {
                 tag = "ERROR";
                 typeClass = "log-tag-error";
@@ -40,7 +51,19 @@ async function main() {
             // Create span for message
             const msgSpan = document.createElement('span');
             msgSpan.className = 'log-message';
-            msgSpan.textContent = content;
+
+            // Handle multi-line results from worker diagnostics
+            if (content.includes('\n')) {
+                const lines = content.split('\n');
+                lines.forEach((line, i) => {
+                    const lineSpan = document.createElement('div');
+                    lineSpan.textContent = line;
+                    lineSpan.style.paddingLeft = i > 0 ? '45px' : '0'; // Indent sub-lines
+                    msgSpan.appendChild(lineSpan);
+                });
+            } else {
+                msgSpan.textContent = content;
+            }
 
             entry.appendChild(tagSpan);
             entry.appendChild(msgSpan);
@@ -134,7 +157,7 @@ async function main() {
     }
 
     try {
-        console.log("Initializing SplatWalk...");
+        console.log("[INFO] Initializing SplatWalk...");
 
         // Init WASM
         await splatwalk.init();
@@ -151,7 +174,7 @@ async function main() {
         // Init DropZone
         // Init DropZone
         const dropZone = new DropZone('renderCanvas', async (file: File) => {
-            console.log(`File dropped: ${file.name} (${file.size} bytes)`);
+            console.log(`[INFO] File dropped: ${file.name} (${file.size} bytes)`);
 
             if (!file.name.endsWith('.ply') && !file.name.endsWith('.spz')) {
                 logError("Only .ply and .spz files are supported.");
@@ -165,11 +188,11 @@ async function main() {
             // Open settings on drop (this adds .active class)
             toggleSettings(true);
 
-            console.log("Processing file...");
+            console.log("[WAIT] Processing file...");
 
             // 1. Visualize input splat
             await viewer.loadGaussianSplat(file);
-            console.log("Input splat visualized. Ready for setup.");
+            console.log("[INFO] Input splat visualized. Ready for setup.");
 
             // 2. Attach Rotation Listeners
             const attachRotListener = (id: string, axis: 'x' | 'y' | 'z') => {
@@ -194,18 +217,18 @@ async function main() {
                 oldProcessBtn.parentNode?.replaceChild(newProcessBtn, oldProcessBtn);
 
                 newProcessBtn.addEventListener('click', async () => {
-                    console.log("Starting generation...");
+                    console.log("[WAIT] Starting generation...");
                     try {
                         let buffer: ArrayBuffer;
 
                         // Handle .spz decompression
                         if (file.name.toLowerCase().endsWith('.spz')) {
-                            console.log("Detected .spz file. Decompressing...");
+                            console.log("[INFO] Detected .spz file. Decompressing...");
                             if ('DecompressionStream' in window) {
                                 const ds = new DecompressionStream('gzip');
                                 const decompressedStream = file.stream().pipeThrough(ds);
                                 buffer = await new Response(decompressedStream).arrayBuffer();
-                                console.log(`Decompressed .spz to ${buffer.byteLength} bytes.`);
+                                console.log(`[INFO] Decompressed .spz to ${buffer.byteLength} bytes.`);
                             } else {
                                 throw new Error("Browser does not support DecompressionStream. Cannot read .spz files.");
                             }
@@ -234,7 +257,7 @@ async function main() {
                             ransac_thresh: parseFloat((document.getElementById('paramRansacThresh') as HTMLInputElement).value) || 0.1
                         };
 
-                        console.log(`Reconstruction Settings:`, settings);
+                        console.log(`[INFO] Reconstruction Settings:`, settings);
                         const start = performance.now();
 
                         const result = splatwalk.convertSplatToMesh(bytes, settings);
@@ -244,8 +267,19 @@ async function main() {
                         // I'll add that TODO or implementation here if I can, but let's get the buttons working first.
 
                         const end = performance.now();
-                        console.log(`Conversion complete in ${(end - start).toFixed(2)}ms`);
-                        console.log(`Mesh: ${result.vertex_count} vertices, ${result.face_count} faces`);
+                        console.log(`[INFO] Conversion complete in ${(end - start).toFixed(2)}ms`);
+                        console.log(`[INFO] Mesh: ${result.vertex_count} vertices, ${result.face_count} faces`);
+
+                        // WASM Output Audit
+                        let outNan = 0, outInf = 0;
+                        for (let i = 0; i < result.vertices.length; i++) {
+                            const v = result.vertices[i];
+                            if (isNaN(v)) outNan++;
+                            else if (!isFinite(v)) outInf++;
+                        }
+                        if (outNan > 0 || outInf > 0) {
+                            console.warn(`[INFO] WASM produced artifacts: ${outNan} NaNs, ${outInf} Infinities. Sanitization will handle these.`);
+                        }
 
                         if (result.vertex_count === 0) {
                             logError("Resulting mesh has 0 vertices. Conversion failed to produce geometry.");
@@ -266,7 +300,7 @@ async function main() {
                         if (result.indices && result.indices.length > 0) {
                             vertexData.indices = result.indices;
                         } else {
-                            console.warn("No indices returned. Rendering points not fully supported by standard Mesh without indices.");
+                            console.warn("[WARN] No indices returned. Rendering points not fully supported by standard Mesh without indices.");
                         }
 
                         vertexData.applyToMesh(customMesh);
@@ -296,7 +330,7 @@ async function main() {
                         customMesh.material = mat;
 
                         viewer.focusOnMesh(customMesh);
-                        console.log("Mesh created in scene.");
+                        console.log("[INFO] Mesh created in scene.");
 
                         // Update global refs for UI
                         currentMesh = customMesh;
@@ -319,14 +353,113 @@ async function main() {
                             downloadBtn.parentNode?.replaceChild(newBtn, downloadBtn);
 
                             newBtn.addEventListener('click', async () => {
-                                console.log("Downloading GLB...");
+                                console.log("[WAIT] Downloading GLB...");
                                 const name = file.name.replace(/\.(ply|spz)$/i, "");
                                 try {
                                     await viewer.exportGLB(name);
-                                    console.log("Download started.");
+                                    console.log("[INFO] Download started.");
                                 } catch (e) {
                                     logError(`Export failed: ${e}`);
                                 }
+                            });
+                        }
+
+                        // --- NavMesh Generation Logic ---
+                        const generateNavBtn = document.getElementById('generateNavBtn') as HTMLButtonElement;
+                        const downloadNavBtn = document.getElementById('downloadNavBtn') as HTMLButtonElement;
+                        const simulationSection = document.getElementById('simulationSection') as HTMLDivElement;
+                        const addNpcBtn = document.getElementById('addNpcBtn') as HTMLButtonElement;
+
+                        let generatedNavData: Uint8Array | null = null;
+
+                        if (generateNavBtn) {
+                            generateNavBtn.addEventListener('click', async () => {
+                                console.log("[WAIT] Extracting geometry for NavMesh...");
+                                try {
+                                    const geometry = extractGeometry(customMesh);
+                                    console.log(`[INFO] Extracted ${geometry.positions.length / 3} vertices and ${geometry.indices.length / 3} faces.`);
+
+                                    const params = {
+                                        cs: parseFloat((document.getElementById('paramNavCS') as HTMLInputElement).value),
+                                        ch: parseFloat((document.getElementById('paramNavCH') as HTMLInputElement).value),
+                                        walkableHeight: parseFloat((document.getElementById('paramNavHeight') as HTMLInputElement).value),
+                                        walkableRadius: parseFloat((document.getElementById('paramNavRadius') as HTMLInputElement).value),
+                                        walkableClimb: parseFloat((document.getElementById('paramNavClimb') as HTMLInputElement).value),
+                                        walkableSlopeAngle: parseFloat((document.getElementById('paramNavSlope') as HTMLInputElement).value),
+                                        // Defaults
+                                        maxEdgeLen: 12,
+                                        maxSimplificationError: 1.3,
+                                        minRegionArea: 8,
+                                        mergeRegionArea: 20,
+                                        maxVertsPerPoly: 6,
+                                        detailSampleDist: 6,
+                                        detailSampleMaxError: 1
+                                    };
+
+                                    console.log("[INFO] NavMesh Parameters:", params);
+
+                                    console.log("[WAIT] Spawning NavMesh Worker...");
+                                    const worker = new NavWorker();
+                                    worker.postMessage({
+                                        type: 'generate',
+                                        payload: {
+                                            positions: geometry.positions,
+                                            indices: geometry.indices,
+                                            params
+                                        }
+                                    });
+
+                                    worker.onmessage = async (e: MessageEvent) => {
+                                        const { type, payload } = e.data;
+                                        if (type === 'done') {
+                                            const { navMeshData, debugPositions, debugIndices } = payload;
+                                            generatedNavData = navMeshData;
+
+                                            console.log("[SUCCESS] NavMesh generated successfully!");
+
+                                            // Visualize
+                                            console.log("[WAIT] Rendering NavMesh visual overlay...");
+                                            await viewer.displayNavMesh(debugPositions, debugIndices);
+
+                                            // Show download button
+                                            if (downloadNavBtn) downloadNavBtn.style.display = 'block';
+
+                                            // Init Simulation
+                                            console.log("[WAIT] Initializing NPC Crowd Simulation...");
+                                            await viewer.initCrowd(navMeshData);
+                                            if (simulationSection) simulationSection.style.display = 'block';
+                                            console.log("[SUCCESS] Simulation ready.");
+
+                                            worker.terminate();
+                                        } else if (type === 'error') {
+                                            logError(`NavMesh worker error: ${payload}`);
+                                            worker.terminate();
+                                        }
+                                    };
+
+                                } catch (e) {
+                                    logError(`NavMesh generation failed: ${e}`);
+                                }
+                            });
+                        }
+
+                        if (downloadNavBtn) {
+                            downloadNavBtn.addEventListener('click', () => {
+                                if (!generatedNavData) return;
+                                const blob = new Blob([generatedNavData as any], { type: 'application/octet-stream' });
+                                const url = URL.createObjectURL(blob);
+                                const a = document.createElement('a');
+                                a.href = url;
+                                a.download = `${file.name.replace(/\.(ply|spz)$/i, "")}.nav`;
+                                a.click();
+                                URL.revokeObjectURL(url);
+                                console.log("[Main] NavMesh binary download started.");
+                            });
+                        }
+
+                        if (addNpcBtn) {
+                            addNpcBtn.addEventListener('click', () => {
+                                viewer.addNPC();
                             });
                         }
 

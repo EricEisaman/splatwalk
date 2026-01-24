@@ -7,9 +7,14 @@ import {
     Color3,
     SceneLoader,
     AbstractMesh,
+    Mesh,
+    VertexData,
+    StandardMaterial,
+    PointerEventTypes,
 } from '@babylonjs/core';
 import '@babylonjs/loaders'; // Import loaders (OBJ, GLTF, STL)
 import { GLTF2Export } from '@babylonjs/serializers/glTF';
+import { Crowd, NavMesh as RecastNavMesh, init as initRecast, importNavMesh, CrowdAgent } from 'recast-navigation';
 
 export class Viewer {
     private engine: Engine;
@@ -163,6 +168,124 @@ export class Viewer {
         this.camera.radius = radius * 3.0; // Zoom out to fit
         this.camera.alpha = Math.PI / 4;
         this.camera.beta = Math.PI / 3;
+    }
+
+    private crowd: Crowd | null = null;
+    private recastNavMesh: RecastNavMesh | null = null;
+    private npcAgents: CrowdAgent[] = [];
+    private userAgent: CrowdAgent | null = null;
+    private userMesh: AbstractMesh | null = null;
+    private npcMeshes: AbstractMesh[] = [];
+
+    public async displayNavMesh(positions: Float32Array, indices: Uint32Array): Promise<void> {
+        const name = "navmesh_debug";
+        const old = this.scene.getMeshByName(name);
+        if (old) old.dispose();
+
+        const mesh = new Mesh(name, this.scene);
+        const vertexData = new VertexData();
+        vertexData.positions = positions;
+        vertexData.indices = indices;
+        vertexData.applyToMesh(mesh);
+
+        const mat = new StandardMaterial("navmesh_mat", this.scene);
+        mat.diffuseColor = new Color3(0, 1, 0);
+        mat.alpha = 0.3;
+        mat.backFaceCulling = false;
+        mesh.material = mat;
+        mesh.isPickable = true;
+
+        console.log("[Viewer] Navmesh visualized");
+    }
+
+    public async initCrowd(navMeshData: Uint8Array): Promise<void> {
+        await initRecast();
+
+        if (this.recastNavMesh) this.recastNavMesh.destroy();
+        if (this.crowd) this.crowd.destroy();
+
+        const { navMesh } = importNavMesh(navMeshData);
+        this.recastNavMesh = navMesh;
+
+        this.crowd = new Crowd(this.recastNavMesh, {
+            maxAgents: 100,
+            maxAgentRadius: 1.0
+        });
+
+        // Setup user agent
+        this.userAgent = this.crowd.addAgent(new Vector3(0, 0, 0), {
+            radius: 0.5,
+            height: 2.0,
+            maxAcceleration: 20.0,
+            maxSpeed: 5.0,
+        });
+
+        if (this.userMesh) this.userMesh.dispose();
+        this.userMesh = Mesh.CreateBox("user_agent", 0.5, this.scene);
+        const userMat = new StandardMaterial("user_mat", this.scene);
+        userMat.diffuseColor = new Color3(0, 0, 1);
+        this.userMesh.material = userMat;
+
+        // Register pointer click for movement
+        this.scene.onPointerObservable.add((pointerInfo) => {
+            if (pointerInfo.type === PointerEventTypes.POINTERTAP) {
+                const pickResult = pointerInfo.pickInfo;
+                if (pickResult?.hit && pickResult.pickedPoint && this.userAgent) {
+                    this.userAgent.requestMoveTarget(pickResult.pickedPoint);
+                }
+            }
+        });
+
+        // Update loop for crowd
+        this.scene.onBeforeRenderObservable.add(() => {
+            if (this.crowd) {
+                const delta = this.engine.getDeltaTime() / 1000;
+                this.crowd.update(delta);
+
+                // Sync user mesh
+                if (this.userMesh && this.userAgent) {
+                    const pos = this.userAgent.position();
+                    this.userMesh.position.set(pos.x, pos.y, pos.z);
+                }
+
+                // Sync NPC meshes
+                for (let i = 0; i < this.npcMeshes.length; i++) {
+                    const agent = this.npcAgents[i];
+                    if (agent) {
+                        const pos = agent.position();
+                        this.npcMeshes[i].position.set(pos.x, pos.y, pos.z);
+                    }
+                }
+            }
+        });
+
+        console.log("[Viewer] Crowd simulation initialized");
+    }
+
+    public addNPC(): void {
+        if (!this.crowd || !this.recastNavMesh) {
+            console.warn("Crowd not initialized");
+            return;
+        }
+
+        // Add agent at camera target
+        const pos = this.camera.target.clone();
+        const agent = this.crowd.addAgent(pos, {
+            radius: 0.5,
+            height: 2.0,
+            maxAcceleration: 10.0,
+            maxSpeed: 3.0,
+        });
+
+        const npc = Mesh.CreateSphere(`npc_${agent.agentIndex}`, 16, 0.5, this.scene);
+        const mat = new StandardMaterial(`npc_mat_${agent.agentIndex}`, this.scene);
+        mat.diffuseColor = Color3.Random();
+        npc.material = mat;
+
+        this.npcAgents.push(agent);
+        this.npcMeshes.push(npc);
+
+        console.log(`[Viewer] NPC added at index ${agent.agentIndex}`);
     }
 
     public getScene(): Scene {
