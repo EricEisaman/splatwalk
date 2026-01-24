@@ -94,6 +94,13 @@ export class Viewer {
                 // Usually the first mesh is the root or the splat
                 this.splatMesh = result.meshes[0];
 
+                // SPZ orientation correction (Niantic SPZ is often 180deg flipped on X relative to Babylon/PLY)
+                if (file.name.toLowerCase().endsWith('.spz')) {
+                    console.log("[Viewer] SPZ detected - applying auto-orientation flip (180deg X)");
+                    this.rotateSplat('x');
+                    this.rotateSplat('x'); // 90 + 90 = 180
+                }
+
                 // Auto-focus the camera
                 const worldExtends = this.scene.getWorldExtends();
                 const center = worldExtends.min.add(worldExtends.max).scale(0.5);
