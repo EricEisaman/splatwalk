@@ -1,7 +1,7 @@
 // use wasm_bindgen::prelude::*;
 use crate::splat::PointNormal;
 use poisson_reconstruction::{PoissonReconstruction, Real};
-use nalgebra::{Point3, Vector3};
+use nalgebra::{Point3, Vector3, UnitQuaternion};
 use rand::Rng;
 
 #[derive(Debug)]
@@ -82,15 +82,56 @@ fn reconstruct_voxel_navmesh(points: &[PointNormal], settings: &crate::MeshSetti
         return ReconstructedMesh { vertices: vec![], indices: vec![] };
     }
 
-    // 1. Robust Filter - remove floaters and transparent splats
+    // 1. Robust Filter - remove floaters, transparent splats, and out-of-region points
+    let rot_matrix = if let Some(ref rot) = settings.rotation {
+        if rot.len() == 3 {
+             // Babylon uses Pitch(X), Yaw(Y), Roll(Z). 
+             // In nalgebra, from_euler_angles(x, y, z) applies them in that order.
+             let q = UnitQuaternion::from_euler_angles(rot[0] as Real, rot[1] as Real, rot[2] as Real);
+             Some(q.to_rotation_matrix())
+        } else { None }
+    } else { None };
+
+    if let (Some(min), Some(max)) = (&settings.region_min, &settings.region_max) {
+        web_sys::console::log_1(&format!("Region Filter Active: Min({:.2},{:.2},{:.2}), Max({:.2},{:.2},{:.2})", 
+            min[0], min[1], min[2], max[0], max[1], max[2]).into());
+    }
+
+    let mut discarded_by_region = 0;
     let filtered_points: Vec<&PointNormal> = points.iter()
         .filter(|p| {
+            // Region Filter
+            if let (Some(min), Some(max)) = (&settings.region_min, &settings.region_max) {
+                if min.len() == 3 && max.len() == 3 {
+                    // Transform point if rotation provided for region check
+                    let check_pt = if let Some(ref m) = rot_matrix {
+                        m.transform_point(&Point3::new(p.point.x as Real, p.point.y as Real, p.point.z as Real))
+                    } else {
+                        Point3::new(p.point.x as Real, p.point.y as Real, p.point.z as Real)
+                    };
+
+                    // Match Babylon Y-flip for comparison
+                    // IMPORTANT: We negate Y because our generation export negates Y to fit Babylon's left-hand space.
+                    let babylon_x = check_pt.x as f64;
+                    let babylon_y = -(check_pt.y as f64);
+                    let babylon_z = check_pt.z as f64;
+
+                    if babylon_x < min[0] || babylon_x > max[0] ||
+                       babylon_y < min[1] || babylon_y > max[1] ||
+                       babylon_z < min[2] || babylon_z > max[2] {
+                        discarded_by_region += 1;
+                        return false;
+                    }
+                }
+            }
+
             p.opacity > min_alpha && 
             p.scale.x < max_scale && p.scale.y < max_scale && p.scale.z < max_scale
         })
         .collect();
 
-    web_sys::console::log_1(&format!("Points after floater filter: {}/{}", filtered_points.len(), points.len()).into());
+    web_sys::console::log_1(&format!("Region filter discarded {} points.", discarded_by_region).into());
+    web_sys::console::log_1(&format!("Points after floater/region filter: {}/{}", filtered_points.len(), points.len()).into());
 
     if filtered_points.is_empty() {
         return ReconstructedMesh { vertices: vec![], indices: vec![] };

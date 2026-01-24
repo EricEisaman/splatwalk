@@ -186,11 +186,13 @@ canvas#renderCanvas.highlight {
   background-color: var(--neon-green);
   box-shadow: 0 0 5px var(--neon-green);
 }
+
 .log-tag-wait {
   color: #000;
   background-color: var(--neon-amber);
   box-shadow: 0 0 5px var(--neon-amber);
 }
+
 .log-tag-worker {
   color: #000;
   background-color: var(--neon-violet);
@@ -231,6 +233,13 @@ canvas#renderCanvas.highlight {
   font-weight: bold;
   display: none;
   animation: shake 0.5s;
+  outline: none;
+  scroll-margin-top: 100px;
+}
+
+.error-message:focus {
+  box-shadow: 0 0 25px rgba(255, 0, 153, 0.5);
+  border-width: 2px;
 }
 
 @keyframes shake {

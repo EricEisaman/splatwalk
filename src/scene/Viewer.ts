@@ -11,6 +11,7 @@ import {
     VertexData,
     StandardMaterial,
     PointerEventTypes,
+    GizmoManager,
 } from '@babylonjs/core';
 import '@babylonjs/loaders'; // Import loaders (OBJ, GLTF, STL)
 import { GLTF2Export } from '@babylonjs/serializers/glTF';
@@ -176,6 +177,62 @@ export class Viewer {
     private userAgent: CrowdAgent | null = null;
     private userMesh: AbstractMesh | null = null;
     private npcMeshes: AbstractMesh[] = [];
+    private selectionMesh: Mesh | null = null;
+    private gizmoManager: GizmoManager | null = null;
+
+    public enableRegionSelection(): void {
+        if (this.selectionMesh) return;
+
+        // Create selection box
+        const scene = this.scene;
+        this.selectionMesh = Mesh.CreateBox("selection_region", 1, scene);
+        this.selectionMesh.scaling.set(5, 0.5, 5); // Default size
+
+        // Position at camera target
+        this.selectionMesh.position.copyFrom(this.camera.target);
+
+        const mat = new StandardMaterial("selection_mat", scene);
+        mat.diffuseColor = new Color3(1, 1, 0); // Yellow
+        mat.alpha = 0.2;
+        mat.backFaceCulling = false;
+        this.selectionMesh.material = mat;
+        this.selectionMesh.isPickable = true;
+
+        // Setup Gizmos
+        this.gizmoManager = new GizmoManager(scene);
+        this.gizmoManager.positionGizmoEnabled = true;
+        this.gizmoManager.scaleGizmoEnabled = true;
+        this.gizmoManager.attachableMeshes = [this.selectionMesh];
+        this.gizmoManager.attachToMesh(this.selectionMesh);
+
+        console.log("[Viewer] Region selection enabled");
+    }
+
+    public disableRegionSelection(): void {
+        if (this.gizmoManager) {
+            this.gizmoManager.dispose();
+            this.gizmoManager = null;
+        }
+        if (this.selectionMesh) {
+            this.selectionMesh.dispose();
+            this.selectionMesh = null;
+        }
+        console.log("[Viewer] Region selection disabled");
+    }
+
+    public getRegionBounds(): { min: number[], max: number[] } | null {
+        if (!this.selectionMesh) return null;
+
+        this.selectionMesh.computeWorldMatrix(true);
+        const boundingBox = this.selectionMesh.getBoundingInfo().boundingBox;
+        const min = boundingBox.minimumWorld;
+        const max = boundingBox.maximumWorld;
+
+        return {
+            min: [min.x, min.y, min.z],
+            max: [max.x, max.y, max.z]
+        };
+    }
 
     public async displayNavMesh(positions: Float32Array, indices: Uint32Array): Promise<void> {
         const name = "navmesh_debug";

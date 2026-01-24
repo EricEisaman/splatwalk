@@ -77,6 +77,15 @@ async function main() {
         if (errorDiv) {
             errorDiv.textContent = msg;
             errorDiv.style.display = 'block';
+
+            // Exit fullscreen if active to ensure user sees the header
+            if (document.fullscreenElement) {
+                document.exitFullscreen().catch(() => { });
+            }
+
+            // Scroll to top/error and focus
+            errorDiv.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            errorDiv.focus();
         }
         console.error(msg);
     }
@@ -210,6 +219,25 @@ async function main() {
             attachRotListener('rotY', 'y');
             attachRotListener('rotZ', 'z');
 
+            // 2.5 Region Selection Listeners
+            const defineRegionBtn = document.getElementById('defineRegionBtn');
+            const clearRegionBtn = document.getElementById('clearRegionBtn');
+
+            if (defineRegionBtn && clearRegionBtn) {
+                defineRegionBtn.addEventListener('click', () => {
+                    viewer.enableRegionSelection();
+                    clearRegionBtn.style.display = 'block';
+                    defineRegionBtn.textContent = 'UPDATE REGION';
+                    console.log("[UI] Region selection mode active");
+                });
+
+                clearRegionBtn.addEventListener('click', () => {
+                    viewer.disableRegionSelection();
+                    clearRegionBtn.style.display = 'none';
+                    defineRegionBtn.textContent = 'DEFINE REGION';
+                });
+            }
+
             // 3. Attach Generate Button Listener
             const oldProcessBtn = document.getElementById('processBtn');
             if (oldProcessBtn) {
@@ -248,27 +276,54 @@ async function main() {
                             }
                         }
 
+                        const rot = viewer.getSplatRotation();
                         const settings = {
                             mode: mode,
                             voxel_target: parseFloat((document.getElementById('paramVoxelTarget') as HTMLInputElement).value) || 4000,
                             min_alpha: parseFloat((document.getElementById('paramMinAlpha') as HTMLInputElement).value) || 0.05,
                             max_scale: parseFloat((document.getElementById('paramMaxScale') as HTMLInputElement).value) || 5.0,
                             normal_align: parseFloat((document.getElementById('paramNormalAlign') as HTMLInputElement).value) || 0.05,
-                            ransac_thresh: parseFloat((document.getElementById('paramRansacThresh') as HTMLInputElement).value) || 0.1
+                            ransac_thresh: parseFloat((document.getElementById('paramRansacThresh') as HTMLInputElement).value) || 0.1,
+                            region_min: viewer.getRegionBounds()?.min,
+                            region_max: viewer.getRegionBounds()?.max,
+                            rotation: [rot.x, rot.y, rot.z]
                         };
+
+                        if (settings.region_min && settings.region_max) {
+                            console.log(`[INFO] Applying region constraint: ${JSON.stringify(settings.region_min)} to ${JSON.stringify(settings.region_max)}`);
+                        }
 
                         console.log(`[INFO] Reconstruction Settings:`, settings);
                         const start = performance.now();
 
                         const result = splatwalk.convertSplatToMesh(bytes, settings);
-                        // Future: apply rotation to result if needed
-                        // For now we just rely on visual alignment, but ideally we transform the vertices too?
-                        // The user request "Sync Rotation to Generated Mesh" implies we should.
-                        // I'll add that TODO or implementation here if I can, but let's get the buttons working first.
 
                         const end = performance.now();
                         console.log(`[INFO] Conversion complete in ${(end - start).toFixed(2)}ms`);
                         console.log(`[INFO] Mesh: ${result.vertex_count} vertices, ${result.face_count} faces`);
+
+                        // Region Integrity Audit
+                        if (settings.region_min && settings.region_max) {
+                            console.log(`[WAIT] Auditing mesh region integrity...`);
+                            let outsideCount = 0;
+                            const epsilon = 0.001;
+                            for (let i = 0; i < result.vertices.length; i += 3) {
+                                const x = result.vertices[i];
+                                const y = result.vertices[i + 1];
+                                const z = result.vertices[i + 2];
+
+                                if (x < settings.region_min[0] - epsilon || x > settings.region_max[0] + epsilon ||
+                                    y < settings.region_min[1] - epsilon || y > settings.region_max[1] + epsilon ||
+                                    z < settings.region_min[2] - epsilon || z > settings.region_max[2] + epsilon) {
+                                    outsideCount++;
+                                }
+                            }
+                            if (outsideCount === 0) {
+                                console.log(`[SUCCESS] Region Integrity Verified: All ${result.vertex_count} vertices are within bounds.`);
+                            } else {
+                                console.warn(`[INFO] Region Audit: ${outsideCount} vertices (${((outsideCount / result.vertex_count) * 100).toFixed(1)}%) were outside defined region.`);
+                            }
+                        }
 
                         // WASM Output Audit
                         let outNan = 0, outInf = 0;
@@ -300,30 +355,22 @@ async function main() {
                         if (result.indices && result.indices.length > 0) {
                             vertexData.indices = result.indices;
                         } else {
-                            console.warn("[WARN] No indices returned. Rendering points not fully supported by standard Mesh without indices.");
+                            console.warn("[WARN] No indices returned.");
                         }
 
                         vertexData.applyToMesh(customMesh);
 
-                        // Apply the rotation from the splat to the new mesh so it matches visual alignment
-                        const rot = viewer.getSplatRotation();
-                        // Reset splat rotation or hide it? 
-                        // Usually we hide the splat and show the mesh.
-                        // But wait, the mesh generated by RANSAC might be in the original coordinate space?
-                        // If we rotated the Splat visually, we should rotate the Result visually to match.
+                        // Sync Visual Rotation
                         customMesh.rotation.x = rot.x;
                         customMesh.rotation.y = rot.y;
                         customMesh.rotation.z = rot.z;
 
                         // Create material
                         const mat = new StandardMaterial("mat", scene);
-
                         if (result.indices.length === 0 || result.face_count === 0) {
                             mat.pointsCloud = true;
                             mat.pointSize = 2;
-                            mat.diffuseColor = new Color3(1, 0.5, 0);
                         } else {
-                            // Standard solid mesh
                             mat.backFaceCulling = true;
                             mat.diffuseColor = new Color3(0.5, 0.5, 0.5);
                         }
@@ -332,18 +379,13 @@ async function main() {
                         viewer.focusOnMesh(customMesh);
                         console.log("[INFO] Mesh created in scene.");
 
-                        // Update global refs for UI
                         currentMesh = customMesh;
                         currentMat = mat;
 
-                        // Sync UI state
                         if (showMeshCheckbox) customMesh.setEnabled(showMeshCheckbox.checked);
                         if (meshOpacitySlider) mat.alpha = parseFloat(meshOpacitySlider.value);
 
-                        // Show result controls
                         document.getElementById('resultSection')!.style.display = 'block';
-
-                        // Ensure settings are open
                         toggleSettings(true);
 
                         // Show download button logic...
@@ -412,10 +454,24 @@ async function main() {
                                     worker.onmessage = async (e: MessageEvent) => {
                                         const { type, payload } = e.data;
                                         if (type === 'done') {
-                                            const { navMeshData, debugPositions, debugIndices } = payload;
+                                            const { navMeshData, debugPositions, debugIndices, report } = payload;
                                             generatedNavData = navMeshData;
 
                                             console.log("[SUCCESS] NavMesh generated successfully!");
+
+                                            if (report) {
+                                                if (report.isOverride) {
+                                                    console.warn(`[INFO] AUTO-SCALED: Cell Size adjusted to ${report.activeCS}m for environment resolution.`);
+                                                }
+                                                if (report.wasFlipped) {
+                                                    console.log(`[INFO] Winding Correction: System auto-corrected mesh orientation for Recast compatibility.`);
+                                                }
+                                                if (report.headroomPadding > 0) {
+                                                    console.log(`[INFO] Applied +${report.headroomPadding.toFixed(2)}m vertical padding for headroom.`);
+                                                }
+                                                console.log(`[INFO] Mesh Normal Quality: ${(report.avgUpDot * 100).toFixed(1)}% Up-Facing`);
+                                                console.log(`[INFO] Final Voxel Grid: ${report.gridDim[0]}x${report.gridDim[1]}x${report.gridDim[2]}`);
+                                            }
 
                                             // Visualize
                                             console.log("[WAIT] Rendering NavMesh visual overlay...");

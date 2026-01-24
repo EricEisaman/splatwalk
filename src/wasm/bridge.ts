@@ -14,6 +14,9 @@ export interface MeshSettings {
     max_scale?: number;
     normal_align?: number;
     ransac_thresh?: number;
+    region_min?: number[];
+    region_max?: number[];
+    rotation?: number[];
 }
 
 export class SplatWalkBridge {
