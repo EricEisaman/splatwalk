@@ -7,6 +7,8 @@
   --neon-green: #39ff14;
   --neon-blue: #00f0ff;
   --neon-pink: #ff0099;
+  --neon-amber: #ffaa00;
+  --neon-violet: #bc13fe;
 
   --border: #333333;
 }
@@ -183,6 +185,16 @@ canvas#renderCanvas.highlight {
   color: #000;
   background-color: var(--neon-green);
   box-shadow: 0 0 5px var(--neon-green);
+}
+.log-tag-wait {
+  color: #000;
+  background-color: var(--neon-amber);
+  box-shadow: 0 0 5px var(--neon-amber);
+}
+.log-tag-worker {
+  color: #000;
+  background-color: var(--neon-violet);
+  box-shadow: 0 0 5px var(--neon-violet);
 }
 
 .log-message {

@@ -140,11 +140,11 @@
                                 </div>
                                 <div class="control-row">
                                     <label title="Min alignment with ground normal">Normal Align:</label>
-                                    <input type="number" id="paramNormalAlign" value="0.05" step="0.05" min="0" max="1">
+                                    <input type="number" id="paramNormalAlign" value="0.30" step="0.05" min="0" max="1">
                                 </div>
                                 <div class="control-row">
                                     <label title="RANSAC distance threshold">RANSAC Thresh:</label>
-                                    <input type="number" id="paramRansacThresh" value="0.1" step="0.05" min="0.01"
+                                    <input type="number" id="paramRansacThresh" value="0.16" step="0.01" min="0.01"
                                         max="1">
                                 </div>
                             </div>
@@ -173,6 +173,50 @@
 
                             <div id="downloadContainer" style="margin-top: 15px;">
                                 <button id="downloadBtn" class="cyber-button">DOWNLOAD .GLB</button>
+                            </div>
+
+                            <div class="section-title nav-section-title" style="margin-top: 20px;">Navigation (BETA)
+                            </div>
+
+                            <div class="control-row">
+                                <label title="Voxel cell size">Cell Size:</label>
+                                <input type="number" id="paramNavCS" value="0.2" step="0.05" min="0.01">
+                            </div>
+                            <div class="control-row">
+                                <label title="Voxel cell height">Cell Height:</label>
+                                <input type="number" id="paramNavCH" value="0.2" step="0.05" min="0.01">
+                            </div>
+                            <div class="control-row">
+                                <label title="Agent height">Agent Height:</label>
+                                <input type="number" id="paramNavHeight" value="2.0" step="0.1" min="0.1">
+                            </div>
+                            <div class="control-row">
+                                <label title="Agent radius">Agent Radius:</label>
+                                <input type="number" id="paramNavRadius" value="0.5" step="0.1" min="0.1">
+                            </div>
+                            <div class="control-row">
+                                <label title="Max climb">Max Climb:</label>
+                                <input type="number" id="paramNavClimb" value="0.4" step="0.1" min="0.1">
+                            </div>
+                            <div class="control-row">
+                                <label title="Max slope">Max Slope:</label>
+                                <input type="number" id="paramNavSlope" value="45" step="5" min="0" max="90">
+                            </div>
+
+                            <div class="nav-button-group"
+                                style="margin-top: 15px; display: flex; flex-direction: column; gap: 10px;">
+                                <button id="generateNavBtn" class="cyber-button secondary">GENERATE NAVMESH</button>
+                                <button id="downloadNavBtn" class="cyber-button secondary"
+                                    style="display: none;">DOWNLOAD NAVMESH</button>
+                            </div>
+
+                            <!-- NPC Simulation -->
+                            <div id="simulationSection" style="margin-top: 20px; display: none;">
+                                <div class="section-title">Simulation</div>
+                                <button id="addNpcBtn" class="cyber-button tertiary">ADD NPC</button>
+                                <div style="font-size: 11px; opacity: 0.7; margin-top: 5px;">
+                                    Click on navmesh to move user agent.
+                                </div>
                             </div>
                         </div>
 
