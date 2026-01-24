@@ -28,7 +28,7 @@
             <h1>SplatWalk</h1>
 
             <!-- Error display -->
-            <div id="error" class="error-message"></div>
+            <div id="error" class="error-message" tabindex="-1"></div>
 
             <!-- About section -->
             <div class="preprocess-section">
@@ -109,7 +109,7 @@
                                     </label>
                                     <label>
                                         <input type="radio" name="reconMode" value="2" checked>
-                                        <div class="radio-card-content">Voxels (NavMesh)</div>
+                                        <div class="radio-card-content">Voxels (Ground)</div>
                                     </label>
                                 </div>
                             </div>
@@ -146,6 +146,12 @@
                                     <label title="RANSAC distance threshold">RANSAC Thresh:</label>
                                     <input type="number" id="paramRansacThresh" value="0.16" step="0.01" min="0.01"
                                         max="1">
+                                </div>
+                                <div class="nav-button-group" style="margin-top: 10px; display: flex; gap: 10px;">
+                                    <button id="defineRegionBtn" class="cyber-button secondary"
+                                        style="font-size: 0.8rem; padding: 8px;">DEFINE REGION</button>
+                                    <button id="clearRegionBtn" class="cyber-button tertiary"
+                                        style="font-size: 0.8rem; padding: 8px; display: none;">CLEAR</button>
                                 </div>
                             </div>
 
