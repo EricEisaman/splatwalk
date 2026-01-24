@@ -4,11 +4,8 @@ import { splatwalk } from '../wasm/bridge';
 import { Mesh, VertexData, StandardMaterial, Color3 } from '@babylonjs/core';
 import { extractGeometry } from '../navigation/navigation';
 /// <reference types="vite/client" />
-const NavWorker = new Worker(new URL(
-    '../navigation/navmesh.worker.ts',
-    import.meta.url
-), {
-    type: 'module',  // REQUIRED for ES modules in workers
+const NavWorker = new Worker('/workers/navmesh.worker.ts', {
+    type: 'module',
     name: 'navmesh-worker'
 });
 

@@ -109,6 +109,19 @@ COPY vite.config.ts ./
 COPY tsconfig.json ./
 COPY public ./public
 
+# === WORKER FIX: Copy to public/ for ALL builds (dev + prod) ===
+RUN mkdir -p public/workers && \
+    cp src/navigation/navmesh.worker.ts public/workers/navmesh.worker.ts && \
+    echo "✓ navmesh.worker.ts → public/workers/ (bypasses Vite worker IIFE bug)" || true
+
+# Copy ANY other .worker.ts files too:
+RUN find src -name "*.worker.ts" -exec sh -c ' \
+      dir="public/workers"; \
+      mkdir -p "$dir"; \
+      cp "$1" "$dir/"; \
+      echo "✓ {} → $dir/" \
+    ' sh {} \;
+
 # Build frontend
 # WASM is already built in stage 1, so just run vite build (skip build:wasm)
 RUN npx vite build
