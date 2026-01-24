@@ -22,7 +22,8 @@
     "@babylonjs/serializers": "^7.54.3",
     "@huggingface/tokenizers": "^0.0.6",
     "@xenova/transformers": "^2.17.2",
-    "onnxruntime-web": "^1.19.2"
+    "onnxruntime-web": "^1.19.2",
+    "recast-navigation": "^0.43.0"
   },
   "devDependencies": {
     "@typescript-eslint/eslint-plugin": "^8.50.1",
