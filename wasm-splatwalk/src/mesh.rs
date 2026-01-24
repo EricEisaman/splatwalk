@@ -82,7 +82,9 @@ fn reconstruct_voxel_navmesh(points: &[PointNormal], settings: &crate::MeshSetti
         return ReconstructedMesh { vertices: vec![], indices: vec![] };
     }
 
-    // 1. Robust Filter - remove floaters, transparent splats, and out-of-region points
+    // 1. Transform Points and Apply Robust Filter
+    // We apply the user's requested rotation to all points before processing.
+    // This aligns the splat with the intended "ground" orientation.
     let rot_matrix = if let Some(ref rot) = settings.rotation {
         if rot.len() == 3 {
              // Babylon uses Pitch(X), Yaw(Y), Roll(Z). 
@@ -98,47 +100,59 @@ fn reconstruct_voxel_navmesh(points: &[PointNormal], settings: &crate::MeshSetti
     }
 
     let mut discarded_by_region = 0;
-    let filtered_points: Vec<&PointNormal> = points.iter()
-        .filter(|p| {
-            // Region Filter
-            if let (Some(min), Some(max)) = (&settings.region_min, &settings.region_max) {
-                if min.len() == 3 && max.len() == 3 {
-                    // Transform point if rotation provided for region check
-                    let check_pt = if let Some(ref m) = rot_matrix {
-                        m.transform_point(&Point3::new(p.point.x as Real, p.point.y as Real, p.point.z as Real))
-                    } else {
-                        Point3::new(p.point.x as Real, p.point.y as Real, p.point.z as Real)
-                    };
+    let mut oriented_points: Vec<PointNormal> = Vec::with_capacity(points.len());
 
-                    // Match Babylon Y-flip for comparison
-                    // IMPORTANT: We negate Y because our generation export negates Y to fit Babylon's left-hand space.
-                    let babylon_x = check_pt.x as f64;
-                    let babylon_y = -(check_pt.y as f64);
-                    let babylon_z = check_pt.z as f64;
+    for p in points {
+        // Transform point and normal
+        let mut pt = Point3::new(p.point.x as Real, p.point.y as Real, p.point.z as Real);
+        let mut norm = Vector3::new(p.normal.x as Real, p.normal.y as Real, p.normal.z as Real);
+        
+        if let Some(ref m) = rot_matrix {
+            pt = m.transform_point(&pt);
+            norm = m.transform_vector(&norm);
+        }
 
-                    if babylon_x < min[0] || babylon_x > max[0] ||
-                       babylon_y < min[1] || babylon_y > max[1] ||
-                       babylon_z < min[2] || babylon_z > max[2] {
-                        discarded_by_region += 1;
-                        return false;
-                    }
+        // Region Filter (Applied in oriented space)
+        if let (Some(min), Some(max)) = (&settings.region_min, &settings.region_max) {
+            if min.len() == 3 && max.len() == 3 {
+                // Match Babylon Y-flip for comparison
+                // IMPORTANT: We negate Y because our generation export negates Y to fit Babylon's left-hand space.
+                let babylon_x = pt.x as f64;
+                let babylon_y = -(pt.y as f64);
+                let babylon_z = pt.z as f64;
+
+                if babylon_x < min[0] || babylon_x > max[0] ||
+                   babylon_y < min[1] || babylon_y > max[1] ||
+                   babylon_z < min[2] || babylon_z > max[2] {
+                    discarded_by_region += 1;
+                    continue;
                 }
             }
+        }
 
-            p.opacity > min_alpha && 
-            p.scale.x < max_scale && p.scale.y < max_scale && p.scale.z < max_scale
-        })
-        .collect();
+        // Floater/Transparency filters
+        if p.opacity <= min_alpha || 
+           p.scale.x >= max_scale || p.scale.y >= max_scale || p.scale.z >= max_scale {
+            continue;
+        }
+
+        oriented_points.push(PointNormal {
+            point: Point3::new(pt.x as f64, pt.y as f64, pt.z as f64),
+            normal: Vector3::new(norm.x as f64, norm.y as f64, norm.z as f64),
+            scale: p.scale,
+            opacity: p.opacity,
+        });
+    }
 
     web_sys::console::log_1(&format!("Region filter discarded {} points.", discarded_by_region).into());
-    web_sys::console::log_1(&format!("Points after floater/region filter: {}/{}", filtered_points.len(), points.len()).into());
+    web_sys::console::log_1(&format!("Points after orientation/floater/region filter: {}/{}", oriented_points.len(), points.len()).into());
 
-    if filtered_points.is_empty() {
+    if oriented_points.is_empty() {
         return ReconstructedMesh { vertices: vec![], indices: vec![] };
     }
 
     // 2. Find Dominant Plane via RANSAC
-    let p_coords: Vec<Point3<Real>> = filtered_points.iter()
+    let p_coords: Vec<Point3<Real>> = oriented_points.iter()
         .map(|p| Point3::new(p.point.x as Real, p.point.y as Real, p.point.z as Real))
         .collect();
     
@@ -193,7 +207,7 @@ fn reconstruct_voxel_navmesh(points: &[PointNormal], settings: &crate::MeshSetti
     let mut min_v = f64::MAX;
     let mut max_v = f64::MIN;
 
-    for p in &filtered_points {
+    for p in &oriented_points {
         let u = p.point.coords.dot(&tangent_64);
         let v = p.point.coords.dot(&bitangent_64);
         min_u = min_u.min(u);
@@ -221,7 +235,7 @@ fn reconstruct_voxel_navmesh(points: &[PointNormal], settings: &crate::MeshSetti
     // 6. Splat point heights to VERTICES using bilinear weights
     let mut points_contributed = 0;
     
-    for p in &filtered_points {
+    for p in &oriented_points {
         // Check normal alignment - only ground-facing splats
         let normal_dot = p.normal.dot(&up_64).abs();
         if normal_dot < normal_align { continue; }
