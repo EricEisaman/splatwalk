@@ -360,10 +360,8 @@ async function main() {
 
                         vertexData.applyToMesh(customMesh);
 
-                        // Sync Visual Rotation
-                        customMesh.rotation.x = rot.x;
-                        customMesh.rotation.y = rot.y;
-                        customMesh.rotation.z = rot.z;
+                        // WASM now returns the mesh already oriented to the user-applied rotation
+                        customMesh.rotation.set(0, 0, 0);
 
                         // Create material
                         const mat = new StandardMaterial("mat", scene);

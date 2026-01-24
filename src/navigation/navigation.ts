@@ -1,4 +1,4 @@
-import { Mesh } from '@babylonjs/core';
+import { Mesh, Vector3 } from '@babylonjs/core';
 
 export interface NavGeometry {
     positions: Float32Array;
@@ -22,7 +22,7 @@ export interface NavmeshParameters {
 }
 
 /**
- * Extracts and sanitizes raw geometry from a Babylon.js mesh.
+ * Extracts and sanitizes raw geometry from a Babylon.js mesh in world space.
  */
 export function extractGeometry(mesh: Mesh): NavGeometry {
     const indices = mesh.getIndices();
@@ -32,8 +32,24 @@ export function extractGeometry(mesh: Mesh): NavGeometry {
         throw new Error("Mesh does not have valid geometry data");
     }
 
-    const posArray = positions instanceof Float32Array ? positions : new Float32Array(positions);
+    const worldMatrix = mesh.getWorldMatrix();
+    const posArray = new Float32Array(positions.length);
     const indArray = indices instanceof Uint32Array ? indices : new Uint32Array(indices);
+
+    // Transform to world space
+    const tempPos = { x: 0, y: 0, z: 0 };
+    for (let i = 0; i < positions.length; i += 3) {
+        tempPos.x = positions[i];
+        tempPos.y = positions[i + 1];
+        tempPos.z = positions[i + 2];
+
+        // Apply world matrix transformation
+        const worldPos = Vector3.TransformCoordinatesFromFloatsToRef(tempPos.x, tempPos.y, tempPos.z, worldMatrix, new Vector3());
+
+        posArray[i] = worldPos.x;
+        posArray[i + 1] = worldPos.y;
+        posArray[i + 2] = worldPos.z;
+    }
 
     // Sanitization
     let nanCount = 0;
