@@ -573,6 +573,25 @@ async function main() {
             });
         }
 
+        // Mobile Local File Upload Logic
+        const chooseFileBtn = document.getElementById('chooseFileBtn');
+        const localFileInput = document.getElementById('localFileInput') as HTMLInputElement;
+
+        if (chooseFileBtn && localFileInput) {
+            chooseFileBtn.addEventListener('click', () => {
+                localFileInput.click();
+            });
+
+            localFileInput.addEventListener('change', () => {
+                if (localFileInput.files && localFileInput.files.length > 0) {
+                    const file = localFileInput.files[0];
+                    handleFileLoad(file);
+                    // Clear value to allow re-selecting the same file if needed
+                    localFileInput.value = '';
+                }
+            });
+        }
+
         // Prevent variable unused lint error (dummy usage)
         if (viewer) {
             // keep refs alive
