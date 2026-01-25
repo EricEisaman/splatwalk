@@ -645,6 +645,9 @@ function copyWasmModules(): Plugin {
 export default defineConfig({
   publicDir: 'public', // Explicitly enable public directory copying
   plugins: [devServerRouting(), removeVitePreload(), rewriteWasmImports(), copyPublicAssets(), copyWasmModules()],
+  worker: {
+    format: 'es'  // Force ES modules for all workers (fixes IIFE error)
+  },
   build: {
     copyPublicDir: true, // Explicitly enable copying public directory (may be disabled with rollupOptions.input)
     target: 'esnext',
