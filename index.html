@@ -48,7 +48,8 @@
             <div class="preprocess-section">
                 <h2>3D Workbench</h2>
                 <div class="viewer-description">
-                    <p>Drag and drop <strong>.ply</strong> or <strong>.spz</strong> files on the canvas or select an
+                    <p>Drag and drop <strong>.ply</strong> or <strong>.spz</strong> files on the canvas, use the file
+                        chooser, or select an
                         example file to begin.</p>
                     <div class="example-selector-container">
                         <label for="exampleSelect">SELECT EXAMPLE</label>
@@ -61,6 +62,9 @@
                                 value="https://raw.githubusercontent.com/EricEisaman/assets/main/environment/splats/partly_cleaned_scene.ply">
                                 Outdoor Scene (.ply)</option>
                         </select>
+                        <div class="mobile-upload-divider">OR</div>
+                        <button id="chooseFileBtn" class="cyber-button-pink">CHOOSE LOCAL FILE</button>
+                        <input type="file" id="localFileInput" accept=".ply,.spz" style="display: none;">
                     </div>
                 </div>
 
