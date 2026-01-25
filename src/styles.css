@@ -772,3 +772,36 @@ input[type="radio"] {
   background-color: var(--bg-panel);
   color: var(--text-main);
 }
+.mobile-upload-divider {
+  font-family: 'Fira Code', monospace;
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  font-weight: bold;
+  opacity: 0.6;
+  margin: 0 10px;
+  margin-bottom: 15px;
+}
+
+.cyber-button-pink {
+  background: rgba(255, 0, 153, 0.1);
+  border: 1px solid var(--neon-pink);
+  color: var(--neon-pink);
+  padding: 8px 16px;
+  border-radius: 4px;
+  font-family: 'Inter', sans-serif;
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+  white-space: nowrap;
+  margin-bottom: 15px;
+}
+
+.cyber-button-pink:hover {
+  background: rgba(255, 0, 153, 0.3);
+  box-shadow: 0 0 15px rgba(255, 0, 153, 0.4);
+}
+
+.cyber-button-pink:active {
+  transform: translateY(1px);
+}
