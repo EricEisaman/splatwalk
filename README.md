@@ -2,9 +2,9 @@
 
 ![SplatWalk Logo](public/splatwalk.png)
 
-**SplatWalk** is a convenient one-stop shop for generating optimized **.glb ground meshes** from **.spz** or **.ply** Gaussian splats.
+**SplatWalk** is a convenient one-stop shop for generating optimized **.glb ground meshes** from **.spz** or **.ply** Gaussian splats as well as creating Recast compatible navmesh binaries, all available to download at the press of a button.
 
-The primary goal of the application is to provide high-quality mesh reconstruction suited for **downstream navigation applications**, allowing for rapid environment generation from 3D capture data.
+The primary goal of SplatWalk is to provide high-quality Gaussian Splat utilities empowering engineers and designers in their quest to create useful 3D applications.
 
 ## Key Features
 
@@ -13,6 +13,7 @@ The primary goal of the application is to provide high-quality mesh reconstructi
 - **Ground Plane Detection**: High-performance RANSAC-based ground plane extraction.
 - **Mesh Reconstruction**: Integrated Poisson reconstruction for full geometry.
 - **One-Click Export**: Download production-ready `.glb` files.
+- **One-Click Export**: Download production-ready `Recast compatible navmesh binary` files.
 
 ## Technology Stack
 
