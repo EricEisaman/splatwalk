@@ -180,12 +180,11 @@ async function main() {
             setTimeout(() => viewer.resize(), 50);
         });
 
-        // Init DropZone
-        // Init DropZone
-        const dropZone = new DropZone('renderCanvas', async (file: File) => {
-            console.log(`[INFO] File dropped: ${file.name} (${file.size} bytes)`);
+        // Helper to load and setup a file (drag or dropdown)
+        const handleFileLoad = async (file: File) => {
+            console.log(`[INFO] Loading file: ${file.name} (${file.size} bytes)`);
 
-            if (!file.name.endsWith('.ply') && !file.name.endsWith('.spz')) {
+            if (!file.name.toLowerCase().endsWith('.ply') && !file.name.toLowerCase().endsWith('.spz')) {
                 logError("Only .ply and .spz files are supported.");
                 return;
             }
@@ -194,7 +193,7 @@ async function main() {
             document.getElementById('resultSection')!.style.display = 'none';
             document.getElementById('setupSection')!.style.display = 'block';
 
-            // Open settings on drop (this adds .active class)
+            // Open settings on drop
             toggleSettings(true);
 
             console.log("[WAIT] Processing file...");
@@ -224,17 +223,23 @@ async function main() {
             const clearRegionBtn = document.getElementById('clearRegionBtn');
 
             if (defineRegionBtn && clearRegionBtn) {
-                defineRegionBtn.addEventListener('click', () => {
+                // Remove existing listeners by cloning
+                const newDefineBtn = defineRegionBtn.cloneNode(true) as HTMLButtonElement;
+                defineRegionBtn.parentNode?.replaceChild(newDefineBtn, defineRegionBtn);
+                const newClearBtn = clearRegionBtn.cloneNode(true) as HTMLButtonElement;
+                clearRegionBtn.parentNode?.replaceChild(newClearBtn, clearRegionBtn);
+
+                newDefineBtn.addEventListener('click', () => {
                     viewer.enableRegionSelection();
-                    clearRegionBtn.style.display = 'block';
-                    defineRegionBtn.textContent = 'UPDATE REGION';
+                    newClearBtn.style.display = 'block';
+                    newDefineBtn.textContent = 'UPDATE REGION';
                     console.log("[UI] Region selection mode active");
                 });
 
-                clearRegionBtn.addEventListener('click', () => {
+                newClearBtn.addEventListener('click', () => {
                     viewer.disableRegionSelection();
-                    clearRegionBtn.style.display = 'none';
-                    defineRegionBtn.textContent = 'DEFINE REGION';
+                    newClearBtn.style.display = 'none';
+                    newDefineBtn.textContent = 'DEFINE REGION';
                 });
             }
 
@@ -523,10 +528,53 @@ async function main() {
                     }
                 });
             }
+        };
+
+        // Init DropZone
+        new DropZone('renderCanvas', (file: File) => {
+            handleFileLoad(file);
         });
 
+        // Example Selector Listener
+        const exampleSelect = document.getElementById('exampleSelect') as HTMLSelectElement;
+        if (exampleSelect) {
+            exampleSelect.addEventListener('change', async () => {
+                const url = exampleSelect.value;
+                if (!url) return;
+
+                const selectedOption = exampleSelect.options[exampleSelect.selectedIndex];
+                const fileName = selectedOption.textContent?.split(' (')[0] + ".ply";
+
+                console.log(`[WAIT] Fetching example file: ${fileName}...`);
+
+                try {
+                    const response = await fetch(url);
+                    if (!response.ok) {
+                        throw new Error(`Failed to fetch: ${response.statusText} (${response.status})`);
+                    }
+
+                    const blob = await response.blob();
+
+                    // Basic validation
+                    if (fileName.toLowerCase().endsWith('.ply')) {
+                        const header = await blob.slice(0, 4).text();
+                        if (header !== "ply\n" && header !== "ply\r") {
+                            throw new Error("Fetched data is not a valid PLY file. If this is a Google Drive link, it may be blocked by CORS or showing a virus scan warning.");
+                        }
+                    }
+
+                    const file = new File([blob], fileName, { type: 'application/octet-stream' });
+                    console.log(`[SUCCESS] Example file fetched: ${(file.size / (1024 * 1024)).toFixed(2)} MB.`);
+                    handleFileLoad(file);
+                } catch (err: any) {
+                    logError(`Failed to load example: ${err.message}`);
+                    exampleSelect.value = ""; // Reset dropdown
+                }
+            });
+        }
+
         // Prevent variable unused lint error (dummy usage)
-        if (dropZone && viewer) {
+        if (viewer) {
             // keep refs alive
         }
 

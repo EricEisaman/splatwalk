@@ -48,7 +48,20 @@
             <div class="preprocess-section">
                 <h2>3D Workbench</h2>
                 <div class="viewer-description">
-                    <p>Drag and drop <strong>.ply</strong> or <strong>.spz</strong> files here to begin.</p>
+                    <p>Drag and drop <strong>.ply</strong> or <strong>.spz</strong> files on the canvas or select an
+                        example file to begin.</p>
+                    <div class="example-selector-container">
+                        <label for="exampleSelect">SELECT EXAMPLE</label>
+                        <select id="exampleSelect" class="cyber-select">
+                            <option value="" disabled selected>Choose a scene...</option>
+                            <option
+                                value="https://raw.githubusercontent.com/EricEisaman/assets/main/environment/splats/bedroom.ply">
+                                Bedroom (.ply)</option>
+                            <option
+                                value="https://raw.githubusercontent.com/EricEisaman/assets/main/environment/splats/partly_cleaned_scene.ply">
+                                Outdoor Scene (.ply)</option>
+                        </select>
+                    </div>
                 </div>
 
                 <!-- Workbench Container (Fullscreen Target) -->
