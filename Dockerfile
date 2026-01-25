@@ -113,6 +113,13 @@ COPY public ./public
 # WASM is already built in stage 1, so just run vite build (skip build:wasm)
 RUN npx vite build
 
+# After vite build, verify workers exist
+RUN echo "Verifying workers in dist/..." && \
+    find dist -name "*.worker.js" -exec sh -c 'echo "✓ {} ($(stat -c%s {}))"' \; || \
+    { echo "ERROR: No worker.js files found!"; ls -la dist/; exit 1; } && \
+    echo "✓ Workers verified"
+
+
 # Manually copy public directory to dist/ as fallback
 # Vite's default public directory copying may not work with rollupOptions.input
 # This ensures icons and other public assets are always present
