@@ -1,8 +1,50 @@
+<script lang="ts">
+import { DEFAULT_FAST_NAV_RECOVERY, type FastNavRecoveryConfig, type StrayTrimOptions, type PruneFloatersOptions } from '@/navigation/fastNav';
+
+/** A selectable example splat scene shown in the "Example scenes" menu. */
+export interface ExampleScene {
+  readonly title: string;
+  readonly url: string;
+}
+
+/** Built-in example scenes; override via the `exampleScenes` prop. */
+export const DEFAULT_EXAMPLE_SCENES: readonly ExampleScene[] = [
+  { title: 'Bedroom', url: 'https://raw.githubusercontent.com/EricEisaman/assets/main/environment/splats/bedroom.ply' },
+  { title: 'Tropical Compound', url: 'https://raw.githubusercontent.com/EricEisaman/assets/main/environment/splats/tropical_compound.ply' },
+  { title: 'Industrial Warehouse', url: 'https://raw.githubusercontent.com/EricEisaman/assets/main/environment/splats/industrial_warehouse.ply' },
+];
+
+// Re-exported so integrators can extend the built-in recovery ladder.
+export { DEFAULT_FAST_NAV_RECOVERY };
+export type { FastNavRecoveryConfig, StrayTrimOptions, PruneFloatersOptions };
+</script>
+
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, type ComponentPublicInstance } from 'vue';
 
 import { useBabylonViewer } from '@/composables/useBabylonViewer';
 import { useSplatFastNav, type LogTag } from '@/composables/useSplatFastNav';
+
+const props = withDefaults(
+  defineProps<{
+    /** Override/extend the built-in adaptive FAST NAV recovery ladder. */
+    recovery?: Partial<FastNavRecoveryConfig>;
+    /** Override stray-floater trimming of the detected floor (on by default). */
+    strayTrim?: StrayTrimOptions;
+    /** Override WASM-side floater pruning / statistical outlier removal (on by default). */
+    prune?: PruneFloatersOptions;
+    /** Override the example scenes shown in the "Example scenes" menu. */
+    exampleScenes?: readonly ExampleScene[];
+  }>(),
+  {
+    // Empty object resolves to DEFAULT_FAST_NAV_RECOVERY inside the pipeline,
+    // so adaptive recovery is built-in even when no prop is supplied.
+    recovery: () => ({}),
+    strayTrim: undefined,
+    prune: undefined,
+    exampleScenes: () => DEFAULT_EXAMPLE_SCENES,
+  }
+);
 
 const canvasRef = ref<HTMLCanvasElement | null>(null);
 const fileInputRef = ref<HTMLInputElement | null>(null);
@@ -11,19 +53,22 @@ const isDragging = ref(false);
 const isFullscreen = ref(false);
 
 const babylon = useBabylonViewer(canvasRef);
-const { status, statusMessage, errorMessage, logs, isBusy, loadAndProcess, loadExample, reset } =
-  useSplatFastNav(babylon);
+const { status, statusMessage, errorMessage, logs, isBusy, phase, progress, loadAndProcess, loadExample, reset } =
+  useSplatFastNav(babylon, { recovery: props.recovery, strayTrim: props.strayTrim, prune: props.prune });
 
-interface ExampleScene {
-  readonly title: string;
-  readonly url: string;
-}
-
-const EXAMPLE_SCENES: readonly ExampleScene[] = [
-  { title: 'Bedroom', url: 'https://raw.githubusercontent.com/EricEisaman/assets/main/environment/splats/bedroom.ply' },
-  { title: 'Tropical Compound', url: 'https://raw.githubusercontent.com/EricEisaman/assets/main/environment/splats/tropical_compound.ply' },
-  { title: 'Industrial Warehouse', url: 'https://raw.githubusercontent.com/EricEisaman/assets/main/environment/splats/industrial_warehouse.ply' },
-] as const;
+// Human-readable progress suffix (e.g. "Pruning floaters 42%") when the worker
+// reports a real fraction during the prune pass.
+const progressText = computed(() => {
+  const p = progress.value;
+  if (!p) return null;
+  const labels: Record<string, string> = {
+    parse: 'Parsing splat',
+    prune: 'Pruning floaters',
+    field: 'Building floor field',
+  };
+  const base = labels[p.stage] ?? 'Processing';
+  return p.fraction !== null ? `${base} ${Math.round(p.fraction * 100)}%` : base;
+});
 
 const showSnackbar = computed({
   get: () => errorMessage.value !== null,
@@ -38,10 +83,15 @@ const showDropZone = computed(() => status.value === 'idle' || status.value === 
 
 const steps = computed(() => {
   const loadDone = status.value === 'processing' || status.value === 'done';
-  const navActive = status.value === 'processing';
   const navDone = status.value === 'done';
+  const p = phase.value;
+  const pruneActive = status.value === 'processing' && p === 'prune';
+  const pruneDone = p === 'floor' || p === 'navmesh' || p === 'done';
+  const navActive = status.value === 'processing' && (p === 'floor' || p === 'navmesh');
+  const pruneLabel = pruneActive && progressText.value ? progressText.value : 'Prune outliers';
   return [
     { label: 'Load splat', active: status.value === 'loading', done: loadDone },
+    { label: pruneLabel, active: pruneActive, done: pruneDone || navDone },
     { label: 'FAST NAV', active: navActive, done: navDone },
     { label: 'Top-down view', active: false, done: navDone },
   ];
@@ -177,7 +227,7 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
                   </template>
                   <v-list>
                     <v-list-item
-                      v-for="scene in EXAMPLE_SCENES"
+                      v-for="scene in props.exampleScenes"
                       :key="scene.url"
                       :title="scene.title"
                       prepend-icon="mdi-cube-outline"
@@ -197,8 +247,16 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
             class="align-center justify-center"
           >
             <div class="text-center">
-              <v-progress-circular indeterminate color="primary" size="64" width="5" class="mb-3" />
+              <v-progress-circular
+                :indeterminate="!progress || progress.fraction === null"
+                :model-value="progress && progress.fraction !== null ? progress.fraction * 100 : undefined"
+                color="primary"
+                size="64"
+                width="5"
+                class="mb-3"
+              />
               <div class="text-body-1">{{ statusMessage }}</div>
+              <div v-if="progressText" class="text-caption text-medium-emphasis mt-1">{{ progressText }}</div>
             </div>
           </v-overlay>
         </v-card>

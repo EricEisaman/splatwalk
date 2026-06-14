@@ -7,6 +7,16 @@ import { splatwalk, type MeshSettings, type WalkableGroundFieldResult } from '@/
 /** A single human-readable progress line, optionally tagged with `[INFO]`, `[WAIT]`, `[WARN]`, `[SUCCESS]`. */
 export type FastNavLogger = (message: string) => void;
 
+/**
+ * Coarse phases of {@link runFastNav}, emitted via {@link FastNavOptions.onPhase}
+ * so UIs can show a step indicator. `prune` covers the WASM ingest (parse +
+ * statistical outlier removal) that runs on first touch of the splat bytes.
+ */
+export type FastNavPhase = 'prune' | 'floor' | 'navmesh' | 'done';
+
+/** Callback for {@link runFastNav} phase transitions. */
+export type FastNavPhaseListener = (phase: FastNavPhase) => void;
+
 /** Options for {@link runFastNav}. */
 export interface FastNavOptions {
   /** The Babylon viewer that already has the splat loaded. */
@@ -15,6 +25,39 @@ export interface FastNavOptions {
   readonly bytes: Uint8Array;
   /** Optional progress sink; defaults to the console. */
   readonly onLog?: FastNavLogger;
+  /** Optional phase sink for step indicators (prune -> floor -> navmesh -> done). */
+  readonly onPhase?: FastNavPhaseListener;
+  /**
+   * Optional override for the adaptive floor-field recovery ladder. When omitted,
+   * {@link DEFAULT_FAST_NAV_RECOVERY} is used so recovery is always on by default.
+   */
+  readonly recovery?: Partial<FastNavRecoveryConfig>;
+  /**
+   * Optional override for stray-floater trimming applied to the detected floor
+   * (see {@link trimStrayFloorCells}). On by default; pass `{ enabled: false }` to disable.
+   */
+  readonly strayTrim?: StrayTrimOptions;
+  /**
+   * Optional override for density-aware re-seeding (see {@link estimateDenseFloorSeed}).
+   * On by default; anchors the seed on the dense floor instead of a floater plane.
+   */
+  readonly denseSeed?: DenseSeedOptions;
+  /**
+   * Optional override for WASM-side statistical outlier removal ("prune floaters").
+   * On by default; stray sparse splats are removed before any geometry/region/seed
+   * computation. Pass `{ enabled: false }` to keep every splat.
+   */
+  readonly prune?: PruneFloatersOptions;
+}
+
+/** Override for the WASM-side floater prune (statistical outlier removal). */
+export interface PruneFloatersOptions {
+  /** Whether to prune stray floater splats. Defaults to `true`. */
+  readonly enabled?: boolean;
+  /** Neighbours sampled per splat for outlier removal. Defaults to `16`. */
+  readonly k?: number;
+  /** Removal strength (mean + stdRatio*stddev). Lower = more aggressive. Defaults to `2.0`. */
+  readonly stdRatio?: number;
 }
 
 /** Result of a successful {@link runFastNav}. */
@@ -23,6 +66,120 @@ export interface FastNavResult {
   readonly navMeshData: Uint8Array;
   /** The chosen player spawn point on the navmesh, if any. */
   readonly playerSpawn: Vector3 | null;
+}
+
+/** Why floor-field extraction failed (used to drive adaptive recovery). */
+export type FastNavFloorReason = 'no_component' | 'too_small' | 'empty_mesh';
+
+/** Diagnostic payload attached to a {@link FastNavFloorError}. */
+export interface FastNavFloorDiagnostics {
+  /** Largest usable floor area found, in square meters (if known). */
+  readonly area?: number;
+  /** Number of connected floor components considered. */
+  readonly components?: number;
+  /** Per-state cell counts from the walkable ground field. */
+  readonly stateCounts?: Record<string, number>;
+}
+
+/**
+ * Typed error thrown by {@link buildFastFloorMesh} when the floor field does not
+ * yield a usable room floor. The {@link reason} lets the recovery loop decide
+ * whether to escalate extraction parameters and retry.
+ */
+export class FastNavFloorError extends Error {
+  readonly reason: FastNavFloorReason;
+  readonly area?: number;
+  readonly components?: number;
+  readonly stateCounts?: Record<string, number>;
+
+  constructor(reason: FastNavFloorReason, message: string, diagnostics: FastNavFloorDiagnostics = {}) {
+    super(message);
+    this.name = 'FastNavFloorError';
+    this.reason = reason;
+    this.area = diagnostics.area;
+    this.components = diagnostics.components;
+    this.stateCounts = diagnostics.stateCounts;
+    // Restore the prototype chain so `instanceof` works after transpilation.
+    Object.setPrototypeOf(this, FastNavFloorError.prototype);
+  }
+}
+
+/** A single attempt in the adaptive floor-field recovery ladder. */
+export interface FastNavRecoveryStep {
+  /** Human-readable label surfaced in the logs (e.g. `relaxed`, `coarse`). */
+  readonly label: string;
+  /** Partial {@link MeshSettings} merged over the base fast-field settings for this attempt. */
+  readonly settings: Partial<MeshSettings>;
+  /** Minimum accepted floor area (m^2) for this attempt to count as success. */
+  readonly minRoomFloorArea: number;
+  /** Optional per-step override for stray-floater trimming (see {@link trimStrayFloorCells}). */
+  readonly strayTrim?: StrayTrimOptions;
+}
+
+/** Configurable, ordered floor-field recovery ladder. */
+export interface FastNavRecoveryConfig {
+  /** Attempts tried in order; the first one that yields a usable floor wins. */
+  readonly steps: readonly FastNavRecoveryStep[];
+}
+
+/**
+ * Default, built-in recovery ladder. It first escalates extraction parameters
+ * (coarser cells, lower density threshold, higher variance tolerance, higher
+ * voxel target, lower confidence) and only relaxes the room-area gate on later
+ * steps as a last resort. Integrators can override any/all of this.
+ */
+export const DEFAULT_FAST_NAV_RECOVERY: FastNavRecoveryConfig = {
+  steps: [
+    { label: 'default', settings: {}, minRoomFloorArea: 4.0 },
+    {
+      label: 'relaxed',
+      settings: {
+        sdf_density_threshold: 0.04,
+        max_local_height_variance: 0.2,
+        obstacle_height_epsilon: 0.42,
+        min_floor_confidence: 0.003,
+        hole_fill_radius: 3,
+        voxel_target: 12000,
+      },
+      minRoomFloorArea: 4.0,
+    },
+    {
+      label: 'coarse',
+      settings: {
+        sdf_cell_size: 0.2,
+        sdf_density_threshold: 0.03,
+        max_local_height_variance: 0.28,
+        min_floor_confidence: 0.002,
+        voxel_target: 14000,
+        hole_fill_radius: 3,
+      },
+      minRoomFloorArea: 2.5,
+    },
+    {
+      label: 'coarse-last-resort',
+      settings: {
+        sdf_cell_size: 0.26,
+        sdf_density_threshold: 0.022,
+        max_local_height_variance: 0.36,
+        min_floor_confidence: 0.0015,
+        voxel_target: 16000,
+        hole_fill_radius: 4,
+      },
+      minRoomFloorArea: 1.5,
+    },
+  ],
+};
+
+/**
+ * Resolve a (possibly partial/omitted) recovery config to a concrete one,
+ * falling back to {@link DEFAULT_FAST_NAV_RECOVERY} when no steps are supplied.
+ * This is what makes adaptive recovery on-by-default for every caller.
+ */
+export function resolveRecovery(partial?: Partial<FastNavRecoveryConfig>): FastNavRecoveryConfig {
+  if (!partial || !partial.steps || partial.steps.length === 0) {
+    return DEFAULT_FAST_NAV_RECOVERY;
+  }
+  return { steps: partial.steps };
 }
 
 interface NavReport {
@@ -112,6 +269,9 @@ export function defaultFastMeshSettings(viewer: Viewer): MeshSettings {
     collision_mesh_mode: 'faces',
     min_alpha: 0.05,
     max_scale: 5.0,
+    prune_floaters: true,
+    prune_floaters_k: 16,
+    prune_floaters_std_ratio: 2.0,
     normal_align: 0.3,
     ransac_thresh: 0.16,
     floor_projection_epsilon: 0.16,
@@ -155,12 +315,12 @@ function buildFastFieldSettings(base: MeshSettings, seed: number[] | null): Mesh
   };
 }
 
-function ensureFastCollisionSeed(
+async function ensureFastCollisionSeed(
   viewer: Viewer,
   bytes: Uint8Array,
   base: MeshSettings,
   log: FastNavLogger
-): number[] {
+): Promise<number[]> {
   const regionBounds = viewer.getRegionBounds();
   const carveHeight = base.collision_carve_height ?? 1.6;
 
@@ -172,7 +332,7 @@ function ensureFastCollisionSeed(
       (regionBounds.min[2] + regionBounds.max[2]) * 0.5,
     ];
   } else {
-    const suggested = splatwalk.suggestRegion(bytes, base);
+    const suggested = await splatwalk.suggestRegion(bytes, base);
     seed = [
       (suggested.region_min[0] + suggested.region_max[0]) * 0.5,
       suggested.floor_y + carveHeight * 0.5,
@@ -185,7 +345,306 @@ function ensureFastCollisionSeed(
   return seed;
 }
 
-interface FastFloorMesh {
+/**
+ * Tuning for {@link trimStrayFloorCells}. All optional; sensible defaults make it
+ * a no-op on clean scenes and only trim a small number of peripheral strays.
+ */
+export interface StrayTrimOptions {
+  /** Master switch. Defaults to `true` (built-in, on by default). */
+  readonly enabled?: boolean;
+  /**
+   * Max vertical distance (meters) a cell may sit from the median floor height to
+   * still count as real floor. Cells beyond this are treated as stray floaters.
+   * Defaults to `0.5`.
+   */
+  readonly heightTolerance?: number;
+  /**
+   * Safety cap: if trimming would drop more than this fraction of the floor, the
+   * spread is considered structural (e.g. a genuine multi-level floor) and nothing
+   * is trimmed. Defaults to `0.3` ("small numbers" of strays only).
+   */
+  readonly maxStrayFraction?: number;
+  /** Never trim the floor below this many cells. Defaults to `16`. */
+  readonly minKeepCells?: number;
+}
+
+/** Result of {@link trimStrayFloorCells}. */
+export interface StrayTrimResult {
+  /** The retained floor cell indices (the dense, contiguous core). */
+  readonly cells: number[];
+  /** Cells dropped because their height was a floater-like outlier. */
+  readonly droppedHeightOutliers: number;
+  /** Cells dropped because they were spatially-isolated peripheral specks. */
+  readonly droppedPeripheral: number;
+  /** Median floor height used as the reference plane. */
+  readonly medianHeight: number;
+  /** Whether any cells were dropped. */
+  readonly changed: boolean;
+}
+
+/**
+ * Ignore a small number of stray peripheral splats/cells in a detected floor.
+ *
+ * Large, floater-heavy scans leave scattered cells at outlier heights inside an
+ * otherwise-flat floor component; triangulating them creates vertical cliffs that
+ * Recast splits into tiny fragments. This helper drops height outliers (relative
+ * to the median floor plane) and any spatially-isolated specks, keeping the
+ * largest contiguous core. It is deliberately conservative: if the would-be
+ * removals exceed `maxStrayFraction`, the spread is treated as structural and the
+ * input is returned unchanged, so clean and legitimately multi-level floors are
+ * untouched.
+ */
+export function trimStrayFloorCells(
+  field: WalkableGroundFieldResult,
+  cells: number[],
+  options: StrayTrimOptions = {}
+): StrayTrimResult {
+  const enabled = options.enabled ?? true;
+  const heightTolerance = options.heightTolerance ?? 0.5;
+  const maxStrayFraction = options.maxStrayFraction ?? 0.3;
+  const minKeepCells = options.minKeepCells ?? 16;
+
+  const noop: StrayTrimResult = {
+    cells,
+    droppedHeightOutliers: 0,
+    droppedPeripheral: 0,
+    medianHeight: Number.NaN,
+    changed: false,
+  };
+  if (!enabled || cells.length <= minKeepCells) return noop;
+
+  const heights = cells
+    .map((idx) => field.cells[idx]?.height)
+    .filter((h): h is number => Number.isFinite(h))
+    .sort((a, b) => a - b);
+  if (heights.length === 0) return noop;
+  const medianHeight = heights[Math.floor(heights.length / 2)];
+
+  const withinBand = cells.filter((idx) => {
+    const h = field.cells[idx]?.height;
+    return Number.isFinite(h) && Math.abs((h as number) - medianHeight) <= heightTolerance;
+  });
+  const droppedHeightOutliers = cells.length - withinBand.length;
+  if (droppedHeightOutliers > maxStrayFraction * cells.length || withinBand.length < minKeepCells) {
+    return noop;
+  }
+
+  const width = field.width;
+  const height = field.height;
+  const inBand = new Set(withinBand);
+  const visited = new Set<number>();
+  let best: number[] = [];
+  for (const startIdx of withinBand) {
+    if (visited.has(startIdx)) continue;
+    const queue = [startIdx];
+    visited.add(startIdx);
+    const cluster: number[] = [];
+    while (queue.length > 0) {
+      const idx = queue.shift()!;
+      cluster.push(idx);
+      const row = Math.floor(idx / width);
+      const col = idx % width;
+      const neighbors = [
+        row > 0 ? idx - width : -1,
+        row + 1 < height ? idx + width : -1,
+        col > 0 ? idx - 1 : -1,
+        col + 1 < width ? idx + 1 : -1,
+      ];
+      for (const next of neighbors) {
+        if (next >= 0 && inBand.has(next) && !visited.has(next)) {
+          visited.add(next);
+          queue.push(next);
+        }
+      }
+    }
+    if (cluster.length > best.length) best = cluster;
+  }
+
+  const droppedPeripheral = withinBand.length - best.length;
+  const totalDropped = droppedHeightOutliers + droppedPeripheral;
+  if (best.length < minKeepCells || totalDropped > maxStrayFraction * cells.length) {
+    return noop;
+  }
+
+  return {
+    cells: best,
+    droppedHeightOutliers,
+    droppedPeripheral,
+    medianHeight,
+    changed: totalDropped > 0,
+  };
+}
+
+/** Tuning for {@link estimateDenseFloorSeed}. */
+export interface DenseSeedOptions {
+  /** Master switch. Defaults to `true` (built-in, on by default). */
+  readonly enabled?: boolean;
+  /** Height histogram bin size (meters) used to find the dense floor band. Defaults to `0.25`. */
+  readonly heightBin?: number;
+  /**
+   * Keep only cells at/above this density percentile when locating the dense
+   * floor (0..1). Higher = stricter, ignores more sparse strays. Defaults to `0.6`.
+   */
+  readonly densityPercentile?: number;
+  /**
+   * Minimum horizontal/vertical move (meters) from the current seed before a
+   * re-seed + field rebuild is worthwhile. Defaults to `2.0`.
+   */
+  readonly reseedThreshold?: number;
+}
+
+function cellCenterWorld(field: WalkableGroundFieldResult, idx: number): [number, number, number] {
+  const width = field.width;
+  const row = Math.floor(idx / width);
+  const col = idx % width;
+  const cell = field.cells[idx];
+  const h = Number.isFinite(cell.height) ? cell.height : 0;
+  const o = field.basis.origin;
+  const t = field.basis.tangent;
+  const b = field.basis.bitangent;
+  const u = field.basis.up;
+  const c = col + 0.5;
+  const r = row + 0.5;
+  return [
+    o[0] + t[0] * c * field.cell_size + b[0] * r * field.cell_size + u[0] * h,
+    o[1] + t[1] * c * field.cell_size + b[1] * r * field.cell_size + u[1] * h,
+    o[2] + t[2] * c * field.cell_size + b[2] * r * field.cell_size + u[2] * h,
+  ];
+}
+
+interface DenseFloorCore {
+  /** Indices of the dense floor-band cells. */
+  readonly cells: number[];
+  /** Density-weighted modal floor height (oriented Y). */
+  readonly modalHeight: number;
+  /** Density-weighted centroid of the dense floor band. */
+  readonly centroid: [number, number, number];
+}
+
+/**
+ * Find the dense floor band: among cells carrying real surface density, keep the
+ * densest fraction, take the density-weighted modal height (where most splats
+ * actually sit), and return that band's cells + density-weighted centroid. Sparse
+ * peripheral/under-floor floaters contribute little weight and fall outside the
+ * modal band, so they are effectively ignored.
+ */
+function computeDenseFloorCore(
+  field: WalkableGroundFieldResult,
+  heightBin: number,
+  densityPercentile: number
+): DenseFloorCore | null {
+  const candidates: Array<{ idx: number; height: number; density: number }> = [];
+  for (let i = 0; i < field.cells.length; i++) {
+    const cell = field.cells[i];
+    if (!Number.isFinite(cell.height)) continue;
+    const density = Math.max(cell.peak_density ?? 0, cell.surface_confidence ?? 0);
+    if (density <= 0) continue;
+    candidates.push({ idx: i, height: cell.height, density });
+  }
+  if (candidates.length < 8) return null;
+
+  const sortedDensity = candidates.map((c) => c.density).sort((a, b) => a - b);
+  const threshold = sortedDensity[Math.min(sortedDensity.length - 1, Math.floor(sortedDensity.length * densityPercentile))];
+  const dense = candidates.filter((c) => c.density >= threshold);
+  if (dense.length === 0) return null;
+
+  const bins = new Map<number, number>();
+  for (const c of dense) {
+    const bin = Math.round(c.height / heightBin);
+    bins.set(bin, (bins.get(bin) ?? 0) + c.density);
+  }
+  let modalBin = 0;
+  let modalWeight = -1;
+  for (const [bin, weight] of bins) {
+    if (weight > modalWeight) {
+      modalWeight = weight;
+      modalBin = bin;
+    }
+  }
+  const modalHeight = modalBin * heightBin;
+
+  const core = dense.filter((c) => Math.abs(c.height - modalHeight) <= heightBin);
+  if (core.length === 0) return null;
+
+  let wx = 0;
+  let wy = 0;
+  let wz = 0;
+  let ws = 0;
+  for (const c of core) {
+    const center = cellCenterWorld(field, c.idx);
+    wx += center[0] * c.density;
+    wy += center[1] * c.density;
+    wz += center[2] * c.density;
+    ws += c.density;
+  }
+  if (ws <= 0) return null;
+  return {
+    cells: core.map((c) => c.idx),
+    modalHeight,
+    centroid: [wx / ws, wy / ws, wz / ws],
+  };
+}
+
+/**
+ * Estimate a collision seed located in the DENSE floor area of the scene, so the
+ * pipeline anchors on the real room floor instead of a sparse floater plane below
+ * it (the common failure on large, floater-heavy scans). Returns `fallbackSeed`
+ * when there isn't enough signal to be confident.
+ */
+export function estimateDenseFloorSeed(
+  field: WalkableGroundFieldResult,
+  fallbackSeed: number[],
+  options: DenseSeedOptions = {}
+): number[] {
+  if (!(options.enabled ?? true)) return fallbackSeed;
+  const core = computeDenseFloorCore(field, options.heightBin ?? 0.25, options.densityPercentile ?? 0.6);
+  return core ? core.centroid : fallbackSeed;
+}
+
+/**
+ * Estimate an adapted default region (oriented-space AABB) around the dense floor:
+ * generous in XZ (covers the whole floor band) but tightly clamped in Y to the
+ * floor plus walkable headroom. This excludes deep stray floaters below/above the
+ * real floor so floor detection is no longer dragged off the dense area. Returns
+ * `null` when there isn't enough signal.
+ */
+export function estimateDenseFloorRegion(
+  field: WalkableGroundFieldResult,
+  options: DenseSeedOptions = {}
+): { min: number[]; max: number[] } | null {
+  if (!(options.enabled ?? true)) return null;
+  const core = computeDenseFloorCore(field, options.heightBin ?? 0.25, options.densityPercentile ?? 0.6);
+  if (!core) return null;
+
+  const yMin = core.modalHeight - 0.6;
+  const yMax = core.modalHeight + 3.0;
+
+  let minX = Infinity;
+  let minZ = Infinity;
+  let maxX = -Infinity;
+  let maxZ = -Infinity;
+  let any = false;
+  for (let i = 0; i < field.cells.length; i++) {
+    const cell = field.cells[i];
+    if (!Number.isFinite(cell.height)) continue;
+    if (cell.height < yMin || cell.height > yMax) continue;
+    const center = cellCenterWorld(field, i);
+    if (center[0] < minX) minX = center[0];
+    if (center[0] > maxX) maxX = center[0];
+    if (center[2] < minZ) minZ = center[2];
+    if (center[2] > maxZ) maxZ = center[2];
+    any = true;
+  }
+  if (!any) return null;
+
+  const margin = field.cell_size * 2;
+  return {
+    min: [minX - margin, yMin, minZ - margin],
+    max: [maxX + margin, yMax, maxZ + margin],
+  };
+}
+
+export interface FastFloorMesh {
   positions: Float32Array;
   indices: Uint32Array;
   selectedCellCount: number;
@@ -199,10 +658,19 @@ interface FastFloorMesh {
   seedDistance: number;
 }
 
-function buildFastFloorMesh(
+/**
+ * Build a planar floor mesh from a walkable ground field by selecting the best
+ * connected floor component near the seed. Throws a typed {@link FastNavFloorError}
+ * when no usable floor of at least `minRoomFloorArea` square meters is found, so
+ * callers can escalate extraction parameters and retry. A small number of stray
+ * peripheral cells are ignored via {@link trimStrayFloorCells} (configurable).
+ */
+export function buildFastFloorMesh(
   field: WalkableGroundFieldResult,
   seed: number[] | null,
-  log: FastNavLogger
+  minRoomFloorArea: number,
+  log: FastNavLogger,
+  strayTrim?: StrayTrimOptions
 ): FastFloorMesh {
   const width = field.width;
   const height = field.height;
@@ -327,7 +795,6 @@ function buildFastFloorMesh(
     };
   };
 
-  const MIN_ROOM_FLOOR_AREA = 4.0;
   const areaOfSelection = (sel: { selected: { cells: number[] } }): number =>
     sel.selected.cells.length * field.cell_size * field.cell_size;
 
@@ -340,7 +807,7 @@ function buildFastFloorMesh(
   let components = strictComponents;
   let fallbackUsed = false;
 
-  if (!selection || areaOfSelection(selection) < MIN_ROOM_FLOOR_AREA) {
+  if (!selection || areaOfSelection(selection) < minRoomFloorArea) {
     const relaxedMask = buildMask(true);
     const relaxedComponents = collectComponents(relaxedMask);
     const relaxedSelection = selectComponent(relaxedComponents);
@@ -359,41 +826,70 @@ function buildFastFloorMesh(
   if (!selection) {
     const largest = [...components].sort((a, b) => b.cells.length - a.cells.length)[0];
     const largestArea = largest ? largest.cells.length * field.cell_size * field.cell_size : 0;
-    throw new Error(
+    throw new FastNavFloorError(
+      'no_component',
       `Fast nav could not find a viable floor component. ` +
         `Components=${components.length}, largest=${largest?.cells.length ?? 0} cells ` +
         `(${largestArea.toFixed(2)} m^2), states=${JSON.stringify(stateCounts)}. ` +
-        `Try a different splat with a clearer room floor.`
+        `Try a different splat with a clearer room floor.`,
+      { area: largestArea, components: components.length, stateCounts }
     );
   }
 
   const selected = selection.selected;
-  const selectedArea = selected.cells.length * field.cell_size * field.cell_size;
-  if (selectedArea < MIN_ROOM_FLOOR_AREA) {
-    throw new Error(
+
+  // Ignore a small number of stray peripheral cells/floaters so the floor stays a
+  // clean, contiguous plane that Recast won't shatter into tiny islands.
+  const trimmed = trimStrayFloorCells(field, selected.cells, strayTrim);
+  const floorCells = trimmed.cells;
+  if (trimmed.changed) {
+    log(
+      `[INFO] Fast floor stray trim: dropped ${trimmed.droppedHeightOutliers} height-outlier + ` +
+        `${trimmed.droppedPeripheral} peripheral cell(s), kept ${floorCells.length} ` +
+        `(median floor y=${trimmed.medianHeight.toFixed(3)}).`
+    );
+  }
+
+  let cx = 0;
+  let cy = 0;
+  let cz = 0;
+  for (const idx of floorCells) {
+    const center = cellCenter(idx);
+    cx += center[0];
+    cy += center[1];
+    cz += center[2];
+  }
+  const invFloor = floorCells.length > 0 ? 1 / floorCells.length : 0;
+  const floorCentroid: [number, number, number] = [cx * invFloor, cy * invFloor, cz * invFloor];
+
+  const selectedArea = floorCells.length * field.cell_size * field.cell_size;
+  if (selectedArea < minRoomFloorArea) {
+    throw new FastNavFloorError(
+      'too_small',
       `Fast nav floor is too small to be a room (${selectedArea.toFixed(2)} m^2 < ` +
-        `${MIN_ROOM_FLOOR_AREA.toFixed(1)} m^2). components=${components.length}, ` +
-        `accepted=${acceptedCellCount}, states=${JSON.stringify(stateCounts)}.`
+        `${minRoomFloorArea.toFixed(1)} m^2). components=${components.length}, ` +
+        `accepted=${acceptedCellCount}, states=${JSON.stringify(stateCounts)}.`,
+      { area: selectedArea, components: components.length, stateCounts }
     );
   }
   if (selection.usedLargestFallback) {
     fallbackUsed = true;
     log(
       `[WARN] Fast floor used largest viable island because no viable component was close to the seed: ` +
-        `${selected.cells.length} cells, ${selectedArea.toFixed(2)} m^2, ` +
+        `${floorCells.length} cells, ${selectedArea.toFixed(2)} m^2, ` +
         `seedDistance=${selected.distanceToSeed.toFixed(2)}`
     );
   } else if (components[0] !== selected) {
     log(
       `[WARN] Fast floor ignored tiny or weak seed-near fragments and selected a viable floor island: ` +
-        `${selected.cells.length} cells, ${selectedArea.toFixed(2)} m^2, ` +
+        `${floorCells.length} cells, ${selectedArea.toFixed(2)} m^2, ` +
         `seedDistance=${selected.distanceToSeed.toFixed(2)}`
     );
   }
 
   const positions: number[] = [];
   const indices: number[] = [];
-  for (const idx of selected.cells) {
+  for (const idx of floorCells) {
     const row = Math.floor(idx / width);
     const col = idx % width;
     const cell = field.cells[idx];
@@ -410,23 +906,158 @@ function buildFastFloorMesh(
   log(
     `[INFO] Fast floor field: accepted=${acceptedCellCount}, obstacles=${obstacleCellCount}, ` +
       `rejected=${rejectedCellCount}, components=${components.length}, ` +
-      `selectedCells=${selected.cells.length}, selectedArea=${selectedArea.toFixed(2)}, ` +
+      `selectedCells=${floorCells.length}, selectedArea=${selectedArea.toFixed(2)}, ` +
       `maskCells=${selectedMask.filter(Boolean).length}`
   );
 
   return {
     positions: new Float32Array(positions),
     indices: new Uint32Array(indices),
-    selectedCellCount: selected.cells.length,
+    selectedCellCount: floorCells.length,
     acceptedCellCount,
     obstacleCellCount,
     rejectedCellCount,
     selectedArea,
-    centroid: selected.centroid,
+    centroid: floorCentroid,
     componentCount: components.length,
     fallbackUsed,
     seedDistance: selected.distanceToSeed,
   };
+}
+
+/** Arguments for {@link extractFloorFieldWithRecovery}. */
+export interface ExtractFloorFieldArgs {
+  /** Raw, already-decompressed splat bytes. */
+  readonly bytes: Uint8Array;
+  /** Base fast-field {@link MeshSettings} that each recovery step is merged over. */
+  readonly baseSettings: MeshSettings;
+  /** Carve seed in oriented space; snapped to the detected floor plane per attempt. */
+  readonly seed: number[];
+  /** Resolved recovery ladder (use {@link resolveRecovery} to fill defaults). */
+  readonly recovery: FastNavRecoveryConfig;
+  /** Default stray-floater trimming for steps that don't specify their own. */
+  readonly strayTrim?: StrayTrimOptions;
+  /** Density-aware re-seeding to anchor on the dense floor (on by default). */
+  readonly denseSeed?: DenseSeedOptions;
+  /** Progress sink. */
+  readonly log: FastNavLogger;
+}
+
+/** Successful result of {@link extractFloorFieldWithRecovery}. */
+export interface ExtractFloorFieldResult {
+  readonly field: WalkableGroundFieldResult;
+  readonly floorMesh: FastFloorMesh;
+  /** Seed snapped to the floor plane of the winning attempt. */
+  readonly effectiveSeed: number[];
+  /** Label of the recovery step that produced the floor. */
+  readonly stepLabel: string;
+}
+
+/**
+ * Run floor-field extraction with the built-in adaptive recovery ladder: for each
+ * step, merge its settings over `baseSettings`, build the walkable ground field,
+ * snap the seed to the detected floor plane, then build the floor mesh with that
+ * step's `minRoomFloorArea`. On a {@link FastNavFloorError} (including an empty
+ * mesh) it logs and escalates to the next step. The first success wins; if every
+ * step fails it throws an aggregated {@link FastNavFloorError}.
+ */
+export async function extractFloorFieldWithRecovery(args: ExtractFloorFieldArgs): Promise<ExtractFloorFieldResult> {
+  const { bytes, baseSettings, seed, recovery, strayTrim, denseSeed, log } = args;
+  const steps = recovery.steps;
+  const reseedThreshold = denseSeed?.reseedThreshold ?? 2.0;
+  const denseSeedEnabled = denseSeed?.enabled ?? true;
+  let lastError: FastNavFloorError | null = null;
+  const attempted: string[] = [];
+
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    const hasMore = i < steps.length - 1;
+    const settings: MeshSettings = { ...baseSettings, ...step.settings };
+
+    try {
+      let field = await splatwalk.buildWalkableGroundField(bytes, settings);
+      let effectiveSeed = seed;
+      const floorPlaneY = field.diagnostics.floor_plane_height;
+      if (Number.isFinite(floorPlaneY)) {
+        effectiveSeed = [seed[0], floorPlaneY, seed[2]];
+        log(`[INFO] Snapped fast seed to floor plane y=${floorPlaneY.toFixed(3)} (step "${step.label}")`);
+      }
+
+      // Anchor on the dense floor area (where most splats actually sit) instead of
+      // a sparse floater plane below it; rebuild the field around the dense seed
+      // AND with a default region adapted to the dense floor band, so deep stray
+      // floaters below/above the real floor no longer drag floor detection off.
+      if (denseSeedEnabled) {
+        const dense = estimateDenseFloorSeed(field, effectiveSeed, denseSeed);
+        const movedXZ = Math.hypot(dense[0] - effectiveSeed[0], dense[2] - effectiveSeed[2]);
+        const movedY = Math.abs(dense[1] - effectiveSeed[1]);
+        if (movedXZ > reseedThreshold || movedY > reseedThreshold) {
+          const rebuild: MeshSettings = { ...settings, collision_seed: dense };
+          // Only adapt the default region when the caller hasn't pinned one.
+          if (!settings.region_min || !settings.region_max) {
+            const region = estimateDenseFloorRegion(field, denseSeed);
+            if (region) {
+              rebuild.region_min = region.min;
+              rebuild.region_max = region.max;
+              log(
+                `[INFO] FAST NAV adapting default region to dense floor band ` +
+                  `(y ${region.min[1].toFixed(2)}..${region.max[1].toFixed(2)}) (step "${step.label}").`
+              );
+            }
+          }
+          log(
+            `[INFO] FAST NAV re-seeding to dense floor area ` +
+              `(${dense.map((v) => v.toFixed(2)).join(', ')}; moved ${movedXZ.toFixed(1)}m XZ, ${movedY.toFixed(1)}m Y) (step "${step.label}").`
+          );
+          field = await splatwalk.buildWalkableGroundField(bytes, rebuild);
+          const reFloorY = field.diagnostics.floor_plane_height;
+          effectiveSeed = Number.isFinite(reFloorY) ? [dense[0], reFloorY, dense[2]] : dense;
+        }
+      }
+
+      const floorMesh = buildFastFloorMesh(
+        field,
+        effectiveSeed,
+        step.minRoomFloorArea,
+        log,
+        step.strayTrim ?? strayTrim
+      );
+      if (floorMesh.positions.length === 0 || floorMesh.indices.length === 0) {
+        throw new FastNavFloorError('empty_mesh', 'Fast nav produced an empty floor mesh.', {
+          components: floorMesh.componentCount,
+        });
+      }
+
+      if (i > 0) {
+        log(
+          `[SUCCESS] FAST NAV recovery succeeded on step "${step.label}" ` +
+            `after ${i} escalation(s): area=${floorMesh.selectedArea.toFixed(2)} m^2.`
+        );
+      }
+      return { field, floorMesh, effectiveSeed, stepLabel: step.label };
+    } catch (error) {
+      if (!(error instanceof FastNavFloorError)) {
+        throw error;
+      }
+      lastError = error;
+      const areaStr = error.area !== undefined ? `${error.area.toFixed(2)} m^2` : 'n/a';
+      attempted.push(`${step.label}(${error.reason})`);
+      log(
+        `[WARN] FAST NAV recovery: step "${step.label}" failed (${error.reason}, ${areaStr})` +
+          (hasMore ? '; escalating extraction parameters...' : '.')
+      );
+    }
+  }
+
+  const summary = attempted.join(' -> ');
+  if (lastError) {
+    throw new FastNavFloorError(
+      lastError.reason,
+      `FAST NAV floor extraction failed after ${steps.length} recovery step(s): ${summary}. ${lastError.message}`,
+      { area: lastError.area, components: lastError.components, stateCounts: lastError.stateCounts }
+    );
+  }
+  throw new FastNavFloorError('no_component', 'FAST NAV recovery had no configured steps.');
 }
 
 function triangleArea(positions: Float32Array, i0: number, i1: number, i2: number): number {
@@ -706,22 +1337,35 @@ function generateNavmeshInWorker(
 export async function runFastNav(options: FastNavOptions): Promise<FastNavResult> {
   const { viewer, bytes } = options;
   const log: FastNavLogger = options.onLog ?? ((message: string): void => console.log(message));
+  const phase: FastNavPhaseListener = options.onPhase ?? ((): void => undefined);
 
   log('[WAIT] Fast path: splat -> floor field -> navmesh -> NPC...');
 
   const base = defaultFastMeshSettings(viewer);
-  const fastSeed = ensureFastCollisionSeed(viewer, bytes, base, log);
-  const navSettings = buildFastFieldSettings(base, fastSeed);
-  let effectiveFastSeed: number[] = navSettings.collision_seed ?? fastSeed;
-
-  const field = splatwalk.buildWalkableGroundField(bytes, navSettings);
-  const floorPlaneY = field.diagnostics.floor_plane_height;
-  if (Number.isFinite(floorPlaneY)) {
-    effectiveFastSeed = [effectiveFastSeed[0], floorPlaneY, effectiveFastSeed[2]];
-    log(`[INFO] Snapped fast seed to floor plane y=${floorPlaneY.toFixed(3)}`);
+  if (options.prune) {
+    if (options.prune.enabled !== undefined) base.prune_floaters = options.prune.enabled;
+    if (options.prune.k !== undefined) base.prune_floaters_k = options.prune.k;
+    if (options.prune.stdRatio !== undefined) base.prune_floaters_std_ratio = options.prune.stdRatio;
   }
 
-  const floorMesh = buildFastFloorMesh(field, effectiveFastSeed, log);
+  // First touch of the splat bytes parses + prunes floaters in the worker.
+  phase('prune');
+  const fastSeed = await ensureFastCollisionSeed(viewer, bytes, base, log);
+  const navSettings = buildFastFieldSettings(base, fastSeed);
+  const recovery = resolveRecovery(options.recovery);
+
+  phase('floor');
+  const extracted = await extractFloorFieldWithRecovery({
+    bytes,
+    baseSettings: navSettings,
+    seed: navSettings.collision_seed ?? fastSeed,
+    recovery,
+    strayTrim: options.strayTrim,
+    denseSeed: options.denseSeed,
+    log,
+  });
+  const floorMesh = extracted.floorMesh;
+  let effectiveFastSeed: number[] = extracted.effectiveSeed;
   const geometry = { positions: floorMesh.positions, indices: floorMesh.indices };
   if (floorMesh.fallbackUsed) {
     effectiveFastSeed = floorMesh.centroid;

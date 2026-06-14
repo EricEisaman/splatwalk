@@ -94,7 +94,10 @@ ctx.onmessage = async (e: MessageEvent) => {
                 return;
             }
 
-            if (![width, height, depth].every(Number.isFinite) || width <= 0 || height <= 0 || depth <= 0) {
+            // A perfectly flat floor (height === 0) is valid for navigation; the
+            // vertical headroom padding below gives Recast the Y extent it needs.
+            // Only the horizontal extents must be positive.
+            if (![width, height, depth].every(Number.isFinite) || width <= 0 || depth <= 0 || height < 0) {
                 ctx.postMessage({ type: 'error', payload: `Collision mesh bounds are invalid: ${width.toFixed(3)}x${height.toFixed(3)}x${depth.toFixed(3)}.` });
                 return;
             }

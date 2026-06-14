@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use wasm_bindgen::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -51,6 +52,16 @@ pub struct MeshSettings {
     pub component_mode: Option<String>,
     pub region_min: Option<Vec<f64>>,
     pub region_max: Option<Vec<f64>>,
+    /// Statistical outlier removal ("prune floaters"). When true (the default),
+    /// stray sparse splats far from the dense surface are removed before any
+    /// geometry/region/seed computation. See `splat::prune_floaters`.
+    pub prune_floaters: Option<bool>,
+    /// Neighbours sampled per splat for outlier removal (default 16). Higher =
+    /// smoother/more conservative estimate.
+    pub prune_floaters_k: Option<usize>,
+    /// Removal aggressiveness: keep splats whose mean neighbour distance is within
+    /// `mean + std_ratio * stddev` (default 2.0). Lower = more aggressive.
+    pub prune_floaters_std_ratio: Option<f64>,
     pub rotation: Option<Vec<f64>>,
     /// When true, negate the Y axis of every parsed splat (position and normal) so that
     /// WASM operates in the same world space the renderer displays. Gaussian-splat loaders
@@ -320,9 +331,99 @@ fn parse_settings(settings: JsValue) -> Result<MeshSettings, JsValue> {
     serde_wasm_bindgen::from_value(settings).map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
+/// Identity of a parsed+pruned+oriented point set, so repeated WASM calls on the
+/// same bytes+settings within a session can reuse the result instead of
+/// re-parsing the PLY and re-running the (expensive) floater prune every time.
+#[derive(Clone, PartialEq)]
+struct ParseKey {
+    len: usize,
+    hash: u64,
+    prune: bool,
+    k: usize,
+    std_ratio_bits: u64,
+    flip_y: bool,
+}
+
+struct ParseCacheEntry {
+    key: ParseKey,
+    points: Vec<splat::PointNormal>,
+}
+
+thread_local! {
+    static PARSE_CACHE: RefCell<Option<ParseCacheEntry>> = RefCell::new(None);
+}
+
+/// Cheap content fingerprint: FNV-1a over the length plus a strided sample of the
+/// bytes. Full hashing of tens of MB on every call would itself be costly; a
+/// sampled hash is more than enough to detect "same file" within a session.
+fn fingerprint(data: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET ^ (data.len() as u64);
+    // ~4096 samples spread across the buffer.
+    let stride = (data.len() / 4096).max(1);
+    let mut i = 0;
+    while i < data.len() {
+        hash ^= data[i] as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+        i += stride;
+    }
+    hash
+}
+
 fn parse_splats(data: &[u8], settings: &MeshSettings) -> Result<Vec<splat::PointNormal>, JsValue> {
+    let prune = settings.prune_floaters.unwrap_or(true);
+    let k = settings.prune_floaters_k.unwrap_or(16);
+    let std_ratio = settings.prune_floaters_std_ratio.unwrap_or(2.0);
+    let flip_y = settings.flip_y.unwrap_or(false);
+
+    let key = ParseKey {
+        len: data.len(),
+        hash: fingerprint(data),
+        prune,
+        k,
+        std_ratio_bits: std_ratio.to_bits(),
+        flip_y,
+    };
+
+    // Cache hit: reuse the previously parsed+pruned+oriented points.
+    if let Some(points) = PARSE_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .filter(|entry| entry.key == key)
+            .map(|entry| entry.points.clone())
+    }) {
+        log(&format!("Reusing cached splats ({} points)", points.len()));
+        return Ok(points);
+    }
+
+    log("@progress parse 0");
     let mut splats = splat::parse_ply(data).map_err(|e| JsValue::from_str(&e))?;
-    if settings.flip_y.unwrap_or(false) {
+
+    // Prune stray floater splats at the single ingest chokepoint so every
+    // downstream op (bounds, region suggestion, seed, floor field, mesh) operates
+    // on the cleaned set. Defaults on; integrators can disable or tune it.
+    if prune {
+        let result = splat::prune_floaters(splats, k, std_ratio, 0.4);
+        match result.skipped_reason {
+            Some(reason) => log(&format!(
+                "Floater prune skipped ({}); kept all {} splats",
+                reason, result.input_count
+            )),
+            None => log(&format!(
+                "Pruned {} floater splats (k={}, std_ratio={:.2}): {} -> {}",
+                result.removed_count,
+                k,
+                std_ratio,
+                result.input_count,
+                result.input_count - result.removed_count
+            )),
+        }
+        splats = result.points;
+    }
+
+    if flip_y {
         for p in &mut splats {
             p.point.y = -p.point.y;
             p.normal.y = -p.normal.y;
@@ -331,6 +432,14 @@ fn parse_splats(data: &[u8], settings: &MeshSettings) -> Result<Vec<splat::Point
     } else {
         log(&format!("Parsed {} splats", splats.len()));
     }
+
+    PARSE_CACHE.with(|cache| {
+        *cache.borrow_mut() = Some(ParseCacheEntry {
+            key,
+            points: splats.clone(),
+        });
+    });
+
     Ok(splats)
 }
 

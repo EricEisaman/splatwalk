@@ -1,11 +1,5 @@
-import init, {
-    init_splatwalk,
-    build_walkable_ground_field,
-    convert_splat_to_mesh,
-    convert_splat_to_navmesh_basis,
-    get_splat_bounds,
-    suggest_region,
-} from '../../pkg/wasm_splatwalk/wasm_splatwalk.js';
+/// <reference types="vite/client" />
+import SplatWorker from './splat.worker?worker';
 
 export interface MeshBuffers {
     vertices: Float32Array;
@@ -199,13 +193,58 @@ export interface MeshSettings {
     component_mode?: 'largest' | 'nearest_region_center' | 'all';
     region_min?: number[];
     region_max?: number[];
+    /**
+     * Statistical outlier removal ("prune floaters"). When true (the default),
+     * stray sparse splats far from the dense surface are removed before any
+     * geometry/region/seed computation. Applies to every WASM entry point.
+     */
+    prune_floaters?: boolean;
+    /** Neighbours sampled per splat for outlier removal (default 16). */
+    prune_floaters_k?: number;
+    /**
+     * Removal aggressiveness: keep splats whose mean neighbour distance is within
+     * `mean + std_ratio * stddev` (default 2.0). Lower = more aggressive.
+     */
+    prune_floaters_std_ratio?: number;
     rotation?: number[];
     flip_y?: boolean;
 }
 
+interface PendingCall {
+    resolve: (value: unknown) => void;
+    reject: (reason: Error) => void;
+}
+
+/**
+ * Main-thread proxy for the SplatWalk WASM, which now runs inside a dedicated
+ * Web Worker (`splat.worker.ts`). Every op is async and message-passed so the
+ * heavy parse/prune/floor-field work never blocks UI interaction.
+ *
+ * The (potentially large) splat bytes are transferred to the worker once per
+ * file via {@link ensureLoaded} and reused for all subsequent ops; combined with
+ * the WASM-side parse+prune cache, repeated calls within a run are cheap.
+ */
 export class SplatWalkBridge {
     private static instance: SplatWalkBridge;
-    private isInitialized = false;
+
+    private worker: Worker | null = null;
+    private seq = 0;
+    private readonly pending = new Map<number, PendingCall>();
+    private initPromise: Promise<void> | null = null;
+    /** The Uint8Array reference currently loaded in the worker (identity check). */
+    private activeData: Uint8Array | null = null;
+    /** Number of in-flight worker calls; drives the busy indicator. */
+    private inflight = 0;
+
+    /** Optional hook fired when the bridge transitions busy <-> idle. */
+    public onBusyChange: ((busy: boolean) => void) | null = null;
+
+    /**
+     * Optional hook fired with throttled progress from the WASM worker.
+     * `stage` is a short label (e.g. 'parse', 'prune'); `fraction` is 0..1 when a
+     * real percentage is available, or `null` for indeterminate stages.
+     */
+    public onProgress: ((stage: string, fraction: number | null) => void) | null = null;
 
     private constructor() { }
 
@@ -216,54 +255,99 @@ export class SplatWalkBridge {
         return SplatWalkBridge.instance;
     }
 
+    private ensureWorker(): Worker {
+        if (!this.worker) {
+            this.worker = new SplatWorker();
+            this.worker.onmessage = (e: MessageEvent): void => {
+                const data = e.data;
+                if (data?.kind === 'log') {
+                    // Replay worker/WASM logs through the main-thread console so any
+                    // existing console capture (e.g. homepage System Logs) sees them.
+                    const level = data.level as 'log' | 'warn' | 'error';
+                    console[level](data.message);
+                    return;
+                }
+                if (data?.kind === 'progress') {
+                    this.onProgress?.(data.stage as string, data.fraction as number | null);
+                    return;
+                }
+                if (data?.kind === 'result') {
+                    const call = this.pending.get(data.id);
+                    if (!call) return;
+                    this.pending.delete(data.id);
+                    if (data.ok) call.resolve(data.result);
+                    else call.reject(new Error(data.error));
+                }
+            };
+        }
+        return this.worker;
+    }
+
+    private call<T>(type: string, payload: unknown, transfer: Transferable[] = []): Promise<T> {
+        const worker = this.ensureWorker();
+        const id = ++this.seq;
+        this.beginCall();
+        return new Promise<T>((resolve, reject) => {
+            this.pending.set(id, {
+                resolve: (value) => { this.endCall(); resolve(value as T); },
+                reject: (reason) => { this.endCall(); reject(reason); },
+            });
+            worker.postMessage({ id, type, payload }, transfer);
+        });
+    }
+
+    private beginCall(): void {
+        this.inflight += 1;
+        if (this.inflight === 1) this.onBusyChange?.(true);
+    }
+
+    private endCall(): void {
+        this.inflight = Math.max(0, this.inflight - 1);
+        if (this.inflight === 0) this.onBusyChange?.(false);
+    }
+
     public async init(): Promise<void> {
-        if (this.isInitialized) return;
-
-        try {
-            await init();
-            const message = init_splatwalk();
-            console.log('Rust says:', message);
-            this.isInitialized = true;
-        } catch (error) {
-            console.error('Failed to initialize SplatWalk WASM:', error);
-            throw error;
+        if (!this.initPromise) {
+            this.initPromise = this.call<void>('init', null).catch((error) => {
+                this.initPromise = null;
+                throw error;
+            });
         }
+        await this.initPromise;
     }
 
-    public getSplatBounds(data: Uint8Array, settings: MeshSettings): SplatBounds {
-        this.assertInitialized();
-        return get_splat_bounds(data, settings) as SplatBounds;
+    /** Transfer the splat bytes to the worker once; reuse for subsequent ops. */
+    private async ensureLoaded(data: Uint8Array): Promise<void> {
+        if (this.activeData === data) return;
+        // Copy so the caller's array stays usable, then transfer the copy.
+        const buffer = data.slice().buffer;
+        await this.call<void>('loadSplat', { data: buffer }, [buffer]);
+        this.activeData = data;
     }
 
-    public suggestRegion(data: Uint8Array, settings: MeshSettings): SuggestedRegion {
-        this.assertInitialized();
-        return suggest_region(data, settings) as SuggestedRegion;
+    public async getSplatBounds(data: Uint8Array, settings: MeshSettings): Promise<SplatBounds> {
+        await this.ensureLoaded(data);
+        return this.call<SplatBounds>('getSplatBounds', { settings });
     }
 
-    public convertSplatToMesh(data: Uint8Array, settings: MeshSettings): ReconstructionResult {
-        this.assertInitialized();
-        try {
-            return convert_splat_to_mesh(data, settings) as ReconstructionResult;
-        } catch (e) {
-            console.error("Conversion failed in WASM:", e);
-            throw e;
-        }
+    public async suggestRegion(data: Uint8Array, settings: MeshSettings): Promise<SuggestedRegion> {
+        await this.ensureLoaded(data);
+        return this.call<SuggestedRegion>('suggestRegion', { settings });
     }
 
-    public convertSplatToNavmeshBasis(data: Uint8Array, settings: MeshSettings): NavmeshBasisResult {
-        this.assertInitialized();
-        return convert_splat_to_navmesh_basis(data, settings) as NavmeshBasisResult;
+    public async convertSplatToMesh(data: Uint8Array, settings: MeshSettings): Promise<ReconstructionResult> {
+        await this.ensureLoaded(data);
+        return this.call<ReconstructionResult>('convertSplatToMesh', { settings });
     }
 
-    public buildWalkableGroundField(data: Uint8Array, settings: MeshSettings): WalkableGroundFieldResult {
-        this.assertInitialized();
-        return build_walkable_ground_field(data, settings) as WalkableGroundFieldResult;
+    public async convertSplatToNavmeshBasis(data: Uint8Array, settings: MeshSettings): Promise<NavmeshBasisResult> {
+        await this.ensureLoaded(data);
+        return this.call<NavmeshBasisResult>('convertSplatToNavmeshBasis', { settings });
     }
 
-    private assertInitialized(): void {
-        if (!this.isInitialized) {
-            throw new Error("SplatWalk WASM not initialized");
-        }
+    public async buildWalkableGroundField(data: Uint8Array, settings: MeshSettings): Promise<WalkableGroundFieldResult> {
+        await this.ensureLoaded(data);
+        return this.call<WalkableGroundFieldResult>('buildWalkableGroundField', { settings });
     }
 }
 

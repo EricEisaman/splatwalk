@@ -167,6 +167,21 @@
                                     <input type="number" id="paramMaxScale" value="5.0" step="0.5" min="0.1" max="20">
                                 </div>
                                 <div class="control-row">
+                                    <label title="Statistical outlier removal: drop stray floater splats far from the dense surface before any geometry/region/seed computation.">Prune Floaters:</label>
+                                    <label class="toggle-switch">
+                                        <input type="checkbox" id="paramPruneFloaters" checked>
+                                        <span class="slider"></span>
+                                    </label>
+                                </div>
+                                <div class="control-row">
+                                    <label title="Neighbours sampled per splat for outlier removal (higher = smoother/more conservative).">Prune Neighbours (K):</label>
+                                    <input type="number" id="paramPruneFloatersK" value="16" step="1" min="1" max="64">
+                                </div>
+                                <div class="control-row">
+                                    <label title="Removal strength: keep splats within mean + ratio*stddev of neighbour distance. Lower = more aggressive.">Prune Strength (σ):</label>
+                                    <input type="number" id="paramPruneFloatersStdRatio" value="2.0" step="0.1" min="0.5" max="6">
+                                </div>
+                                <div class="control-row">
                                     <label title="Min alignment with ground normal">Normal Align:</label>
                                     <input type="number" id="paramNormalAlign" value="0.30" step="0.05" min="0" max="1">
                                 </div>
@@ -427,6 +442,14 @@
                     </div>
 
                     <canvas id="renderCanvas" class="main-canvas"></canvas>
+
+                    <!-- Processing overlay: shown while WASM work runs in the worker -->
+                    <div id="processingOverlay" class="processing-overlay" aria-live="polite" aria-hidden="true">
+                        <div class="processing-card">
+                            <div class="processing-spinner"></div>
+                            <div id="processingLabel" class="processing-label">Processing…</div>
+                        </div>
+                    </div>
                 </div>
             </div>
 

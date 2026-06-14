@@ -398,6 +398,63 @@ canvas#renderCanvas.highlight {
   display: block;
 }
 
+/* Processing overlay (shown while WASM work runs in the worker) */
+.processing-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 50;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(2px);
+  pointer-events: none;
+}
+
+.processing-overlay.is-active {
+  display: flex;
+}
+
+.processing-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  padding: 22px 30px;
+  border: 1px solid rgba(0, 229, 255, 0.5);
+  border-radius: 10px;
+  background: rgba(8, 12, 18, 0.85);
+  box-shadow: 0 0 24px rgba(0, 229, 255, 0.25);
+}
+
+.processing-spinner {
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  border: 3px solid rgba(0, 229, 255, 0.18);
+  border-top-color: #00e5ff;
+  animation: processing-spin 0.8s linear infinite;
+}
+
+.processing-label {
+  font-size: 13px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #cdebf2;
+}
+
+@keyframes processing-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .processing-spinner {
+    animation-duration: 2s;
+  }
+}
+
 /* Fullscreen Behavior */
 .workbench-container:fullscreen {
   width: 100vw;

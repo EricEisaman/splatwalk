@@ -17,6 +17,7 @@ One `FAST NAV` click takes a raw splat to a walkable navmesh with a spawned, cli
 - **Instant Visualization**: Load and view Gaussian Splat files immediately.
 - **Orientation Control**: Rotate and align splats visually before conversion (90° increments). Rotating a splat after a navmesh exists automatically re-runs the same generation path so the navmesh, spawn point, and agents stay aligned with the re-oriented splat.
 - **Fast Floor Nav Path**: One button can pick a seed, extract a walkable floor field, feed that floor mesh to Recast, initialize the crowd, spawn an NPC, and enable click-to-move.
+- **Floater Pruning (WASM)**: Built-in statistical outlier removal strips stray "floater" splats at ingest so bounds, region, seed, and floor detection lock onto the real scene. On by default and tunable (see *Built-in floater pruning* below).
 - **Advanced Collider NavMesh Basis**: Import a dedicated `.collision.glb` / World Labs Collider Mesh GLB or generate a fallback collider from the splat, then feed only that collider to Recast for manual tuning.
 - **PlayCanvas/SuperSplat Workflow**: Supports scene type, seed, voxel fill/seal, carve, and collider mesh diagnostics modeled after the PlayCanvas collision pipeline.
 - **Navigation Markers**: The scene labels explain the magenta seed marker, blue player agent, green NPC agent, and green walkable navmesh overlay.
@@ -75,6 +76,118 @@ The single most common integration bug is a navmesh that is mirrored or offset f
 - Do **not** derive floor height from renderer meshes or apply visual Y offsets to "fix" alignment. Fix `flip_y`/`rotation`/settings instead.
 
 See [`docs/wasm-api.md`](docs/wasm-api.md) for the full entry-point contract, the ground-field cell states, settings reference, and binary-only integrator guidance.
+
+### Reusable Vue/Vuetify component
+
+The reference UI ships as a drop-in Vuetify component and a headless composable, both re-exported from `src/index.ts`:
+
+```ts
+import {
+  SplatFastNavShowcase,        // full Vuetify card (drop/browse/example -> FAST NAV)
+  useSplatFastNav,             // headless flow for your own UI
+  DEFAULT_EXAMPLE_SCENES,
+  DEFAULT_FAST_NAV_RECOVERY,
+} from "splatwalk";
+```
+
+### Built-in adaptive FAST NAV recovery
+
+Large or sparse splats can produce a floor field that is mostly empty, which used to fail with `Fast nav floor is too small to be a room`. FAST NAV now ships with an **adaptive recovery ladder** that is **on by default at every layer** (the component, the `useSplatFastNav` composable, and the `runFastNav` function). On a floor-extraction failure it automatically escalates the extraction parameters (coarser cells, lower density threshold, higher variance tolerance, higher voxel target, lower confidence) and only relaxes the room-area gate as a last resort, logging each step before retrying.
+
+```vue
+<!-- Recovery is built-in; nothing to wire up: -->
+<SplatFastNavShowcase />
+
+<!-- Override or extend the ladder (e.g. add your own last-resort step): -->
+<SplatFastNavShowcase
+  :recovery="{ steps: [...DEFAULT_FAST_NAV_RECOVERY.steps, myExtraStep] }"
+  :example-scenes="myScenes"
+/>
+```
+
+The same config is available when driving the pipeline yourself:
+
+```ts
+// Headless composable:
+const flow = useSplatFastNav(babylon, { recovery: myRecovery });
+
+// Or the function directly (omit `recovery` to use DEFAULT_FAST_NAV_RECOVERY):
+await runFastNav({ viewer, bytes, recovery: myRecovery });
+```
+
+A recovery step is `{ label, settings: Partial<MeshSettings>, minRoomFloorArea }`; each `settings` is merged over the base fast-field settings. See `DEFAULT_FAST_NAV_RECOVERY` in [`src/navigation/fastNav.ts`](src/navigation/fastNav.ts) for the shipped ladder.
+
+### Built-in floater pruning (WASM statistical outlier removal)
+
+Large, real-world scans almost always contain **stray "floater" splats** — sparse points hanging in the air or below the real floor. They inflate the scene bounds and drag the auto-detected floor/region/seed away from the actual room. SplatWalk removes them at the source with a **statistical outlier removal** pass (same idea as SuperSplat's "remove outliers"): for every splat it measures the mean distance to its `k` nearest neighbours and drops splats whose mean distance exceeds `mean + std_ratio * stddev` of that distribution.
+
+This runs inside the WASM ingest chokepoint (`parse_splats`), so it applies to **every** WASM entry point automatically — `get_splat_bounds`, `suggest_region`, `convert_splat_to_mesh`, `convert_splat_to_navmesh_basis`, and `build_walkable_ground_field`. Bounds, region suggestion, seed placement, the floor field, and the reconstructed mesh all see the cleaned point set. It is **on by default**, rigid-motion invariant, and includes a safety cap: if a pass would remove more than 40% of the scene it is skipped (and logged) so legitimate geometry is never destroyed.
+
+#### WASM `MeshSettings` fields
+
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `prune_floaters` | `boolean` | `true` | Enable statistical outlier removal before any geometry/region/seed computation. |
+| `prune_floaters_k` | `number` | `16` | Neighbours sampled per splat. Higher = smoother/more conservative estimate. |
+| `prune_floaters_std_ratio` | `number` | `2.0` | Keep splats within `mean + std_ratio * stddev`. **Lower = more aggressive.** |
+
+These are passed in the same `MeshSettings` object as every other knob:
+
+```ts
+import { splatwalk } from '@/wasm/bridge';
+
+// All bridge ops are async (they run in a Web Worker — see "Off-main-thread" below).
+const field = await splatwalk.buildWalkableGroundField(bytes, {
+  mode: 2,
+  // ...other settings...
+  prune_floaters: true,        // default; set false to keep every splat
+  prune_floaters_k: 16,        // default
+  prune_floaters_std_ratio: 2.0, // default; try 1.0–1.5 for heavy floaters
+});
+```
+
+#### From the component / composable / `runFastNav`
+
+Pruning is on by default through every layer. Override or tune it with the `prune` option (`PruneFloatersOptions`):
+
+```vue
+<!-- Keep every splat (disable pruning): -->
+<SplatFastNavShowcase :prune="{ enabled: false }" />
+
+<!-- More aggressive pruning for very floater-heavy scans: -->
+<SplatFastNavShowcase :prune="{ k: 24, stdRatio: 1.2 }" />
+```
+
+```ts
+// Composable:
+const flow = useSplatFastNav(babylon, { prune: { stdRatio: 1.5 } });
+
+// Function directly (omit `prune` to use the defaults):
+await runFastNav({ viewer, bytes, prune: { enabled: false } });
+```
+
+On the homepage workbench the same controls live under **Reconstruction** as *Prune Floaters* (toggle), *Prune Neighbours (K)*, and *Prune Strength (σ)*. Each pass logs a line such as `Pruned 12,431 floater splats (k=16, std_ratio=2.00): 980,112 -> 967,681` (or `Floater prune skipped (...)` when the safety cap or a degenerate input applies).
+
+### Off-main-thread execution, caching, and progress
+
+All splat WASM work — parsing, floater pruning, region suggestion, the floor field, and mesh reconstruction — runs in a dedicated **Web Worker** (`src/wasm/splat.worker.ts`), so heavy scans never lock up UI interaction. The `splatwalk` bridge (`src/wasm/bridge.ts`) is therefore an **async proxy**: every op returns a `Promise`.
+
+- **Load-once data transfer**: the splat bytes are transferred to the worker once per file and reused for all subsequent ops, so the (potentially large) buffer isn't re-copied per call.
+- **Parse + prune cache**: the worker's WASM caches the parsed+pruned point cloud keyed by content + prune settings, so the multiple ops in a single FAST NAV run (region suggestion, recovery ladder, re-seed) don't re-parse the PLY or re-run the prune.
+- **Throttled progress**: the prune pass emits a real percentage (capped at ~100 ticks so it never floods the event loop). Workers aren't subject to the main thread's "unresponsive script" timeout, so long passes complete safely. Other stages (PLY parse, field build) intentionally report a **stage label with an indeterminate indicator** rather than a fabricated bar — instrumenting them would add per-iteration overhead for no real accuracy gain.
+
+Wire the progress/busy signals into your own UI:
+
+```ts
+import { splatwalk } from '@/wasm/bridge';
+
+splatwalk.onBusyChange = (busy) => { /* show/hide a spinner */ };
+splatwalk.onProgress = (stage, fraction) => {
+  // stage: 'parse' | 'prune' | 'field' | ...; fraction: 0..1 or null (indeterminate)
+};
+```
+
+The bundled `useSplatFastNav` composable already exposes this as reactive state — `phase` (`'prune' | 'floor' | 'navmesh' | 'done'`) and `progress` (`{ stage, fraction }`) — and `runFastNav` accepts an `onPhase` callback. The `SplatFastNavShowcase` component uses them to drive its step chips (including a live **Prune outliers NN%** step) and a determinate progress ring, so integrators get the processing feedback for free. The homepage workbench shows the same via a spinner overlay with a stage label and percentage.
 
 ## Service Worker and Caching
 

@@ -1,9 +1,10 @@
 import { Viewer } from '../scene/Viewer';
 import { DropZone } from '../components/DropZone';
-import { splatwalk, type GroundFieldCellState, type MeshSettings, type WalkableGroundFieldResult } from '../wasm/bridge';
+import { splatwalk, type GroundFieldCellState, type MeshSettings } from '../wasm/bridge';
 import { Mesh, VertexData, StandardMaterial, Color3, Tools } from '@babylonjs/core';
 /// <reference types="vite/client" />
 import NavWorker from '../navigation/navmesh.worker?worker';
+import { extractFloorFieldWithRecovery, resolveRecovery, estimateDenseFloorRegion } from '../navigation/fastNav';
 import { registerServiceWorker, setupOfflineHandling } from '../pwa/sw-register';
 
 async function main() {
@@ -115,6 +116,43 @@ async function main() {
         }
         console.error(`[ERROR] ${msg}`);
     }
+
+    // Visual cue while the splat WASM pipeline runs (now off the main thread in a
+    // worker): show a spinner overlay whenever any WASM op is in flight. Hiding is
+    // debounced so multi-call operations (e.g. suggestAdaptedRegion fires
+    // suggestRegion + buildWalkableGroundField back-to-back) don't flicker.
+    const processingOverlay = document.getElementById('processingOverlay');
+    const processingLabel = document.getElementById('processingLabel');
+    let hideOverlayTimer: ReturnType<typeof setTimeout> | null = null;
+    const setProcessingOverlay = (busy: boolean, label = 'Processing splat…'): void => {
+        if (!processingOverlay) return;
+        if (busy) {
+            if (hideOverlayTimer) { clearTimeout(hideOverlayTimer); hideOverlayTimer = null; }
+            if (processingLabel) processingLabel.textContent = label;
+            processingOverlay.classList.add('is-active');
+            processingOverlay.setAttribute('aria-hidden', 'false');
+        } else {
+            if (hideOverlayTimer) clearTimeout(hideOverlayTimer);
+            hideOverlayTimer = setTimeout(() => {
+                processingOverlay.classList.remove('is-active');
+                processingOverlay.setAttribute('aria-hidden', 'true');
+                hideOverlayTimer = null;
+            }, 220);
+        }
+    };
+    splatwalk.onBusyChange = (busy: boolean): void => setProcessingOverlay(busy);
+
+    const PROGRESS_STAGE_LABELS: Record<string, string> = {
+        parse: 'Parsing splat…',
+        prune: 'Pruning floaters',
+        field: 'Building floor field…',
+    };
+    splatwalk.onProgress = (stage: string, fraction: number | null): void => {
+        if (!processingLabel) return;
+        const base = PROGRESS_STAGE_LABELS[stage] ?? 'Processing splat…';
+        processingLabel.textContent =
+            fraction !== null ? `${base} ${Math.round(fraction * 100)}%` : base;
+    };
 
     // UI Elements
     const settingsToggle = document.getElementById('settingsToggle');
@@ -319,6 +357,54 @@ async function main() {
             let lastNavUsedFastPath = true;
             let realignNavTimer: ReturnType<typeof setTimeout> | null = null;
 
+            // Suggest a region adapted to the DENSE floor band rather than the raw
+            // suggestRegion() output, which on large floater-heavy scans is dragged
+            // far below the real floor by stray under-floor splats. We build the
+            // ground field once and clamp the region (and floor height) to where the
+            // splats actually concentrate. Falls back to suggestRegion() on failure.
+            const suggestAdaptedRegion = async (
+                bytes: Uint8Array
+            ): Promise<{ region_min: number[]; region_max: number[]; floor_y: number }> => {
+                const baseSettings = buildMeshSettings(false);
+                const suggested = await splatwalk.suggestRegion(bytes, baseSettings);
+                const fallback = {
+                    region_min: suggested.region_min as number[],
+                    region_max: suggested.region_max as number[],
+                    floor_y: suggested.floor_y,
+                };
+                try {
+                    const seedCenter = [
+                        (suggested.region_min[0] + suggested.region_max[0]) * 0.5,
+                        suggested.floor_y,
+                        (suggested.region_min[2] + suggested.region_max[2]) * 0.5,
+                    ];
+                    const field = await splatwalk.buildWalkableGroundField(bytes, { ...baseSettings, collision_seed: seedCenter });
+                    const dense = estimateDenseFloorRegion(field);
+                    if (!dense) return fallback;
+                    // Keep XZ generous (prefer the wider of suggested vs dense), but
+                    // adopt the dense Y band so the region sits at the real floor.
+                    const region_min = [
+                        Math.min(fallback.region_min[0], dense.min[0]),
+                        dense.min[1],
+                        Math.min(fallback.region_min[2], dense.min[2]),
+                    ];
+                    const region_max = [
+                        Math.max(fallback.region_max[0], dense.max[0]),
+                        dense.max[1],
+                        Math.max(fallback.region_max[2], dense.max[2]),
+                    ];
+                    const floor_y = dense.min[1] + 0.6; // modal floor height (region_min Y = modal - 0.6)
+                    console.log(
+                        `[INFO] Adapted region to dense floor band: y ${region_min[1].toFixed(2)}..${region_max[1].toFixed(2)} ` +
+                        `(floor ~${floor_y.toFixed(2)}; suggestRegion floor was ${suggested.floor_y.toFixed(2)}).`
+                    );
+                    return { region_min, region_max, floor_y };
+                } catch (error) {
+                    console.warn(`[WARN] Dense region adaptation failed, using suggestRegion(): ${error}`);
+                    return fallback;
+                }
+            };
+
             const ensureFastCollisionSeed = async (bytes: Uint8Array): Promise<number[] | null> => {
                 const seedX = document.getElementById('paramCollisionSeedX') as HTMLInputElement | null;
                 const seedY = document.getElementById('paramCollisionSeedY') as HTMLInputElement | null;
@@ -337,7 +423,7 @@ async function main() {
                         (regionBounds.min[2] + regionBounds.max[2]) * 0.5,
                     ];
                 } else {
-                    const suggested = splatwalk.suggestRegion(bytes, buildMeshSettings(false));
+                    const suggested = await suggestAdaptedRegion(bytes);
                     seed = [
                         (suggested.region_min[0] + suggested.region_max[0]) * 0.5,
                         suggested.floor_y + carveHeight * 0.5,
@@ -378,234 +464,6 @@ async function main() {
                     collision_seed: seed ?? base.collision_seed,
                     collision_carve_height: 1.7,
                     collision_carve_radius: 0.35,
-                };
-            };
-
-            type FastFloorMesh = {
-                positions: Float32Array;
-                indices: Uint32Array;
-                selectedCellCount: number;
-                acceptedCellCount: number;
-                obstacleCellCount: number;
-                rejectedCellCount: number;
-                selectedArea: number;
-                centroid: [number, number, number];
-                componentCount: number;
-            };
-
-            const buildFastFloorMesh = (field: WalkableGroundFieldResult, seed: number[] | null): FastFloorMesh & { fallbackUsed: boolean, seedDistance: number } => {
-                const width = field.width;
-                const height = field.height;
-                const stateCounts = field.cells.reduce<Record<string, number>>((counts, cell) => {
-                    counts[cell.state] = (counts[cell.state] ?? 0) + 1;
-                    return counts;
-                }, {});
-                const obstacleCellCount = (stateCounts.obstacle ?? 0) + (stateCounts.height_variance ?? 0);
-
-                const origin = field.basis.origin;
-                const tangent = field.basis.tangent;
-                const bitangent = field.basis.bitangent;
-                const up = field.basis.up;
-                const pointAt = (col: number, row: number, cellHeight: number): [number, number, number] => [
-                    origin[0] + tangent[0] * col * field.cell_size + bitangent[0] * row * field.cell_size + up[0] * cellHeight,
-                    origin[1] + tangent[1] * col * field.cell_size + bitangent[1] * row * field.cell_size + up[1] * cellHeight,
-                    origin[2] + tangent[2] * col * field.cell_size + bitangent[2] * row * field.cell_size + up[2] * cellHeight,
-                ];
-                const cellCenter = (idx: number): [number, number, number] => {
-                    const row = Math.floor(idx / width);
-                    const col = idx % width;
-                    const cell = field.cells[idx];
-                    return pointAt(col + 0.5, row + 0.5, Number.isFinite(cell.height) ? cell.height : 0);
-                };
-
-                const buildMask = (relaxed: boolean): boolean[] => field.cells.map((cell) => {
-                    if (cell.state === 'walkable' || cell.state === 'filled') return true;
-                    if (!relaxed) return false;
-                    if (!Number.isFinite(cell.height)) return false;
-                    if (cell.state === 'discarded_component') return true;
-                    if (cell.state === 'low_confidence') {
-                        return cell.variance <= 0.18 && cell.obstacle_score <= 0.42;
-                    }
-                    if (cell.state === 'height_variance') {
-                        return cell.confidence >= 0.01 && cell.variance <= 0.08 && cell.obstacle_score <= 0.35;
-                    }
-                    if (cell.state === 'obstacle') {
-                        return cell.confidence >= 0.02 && cell.variance <= 0.05 && cell.obstacle_score <= 0.52;
-                    }
-                    return false;
-                });
-
-                const collectComponents = (mask: boolean[]): Array<{ cells: number[], centroid: [number, number, number], distanceToSeed: number }> => {
-                    const visited = new Uint8Array(field.cells.length);
-                    const components: Array<{ cells: number[], centroid: [number, number, number], distanceToSeed: number }> = [];
-                    for (let start = 0; start < field.cells.length; start++) {
-                        if (!mask[start] || visited[start]) continue;
-                        const queue = [start];
-                        const cells: number[] = [];
-                        visited[start] = 1;
-                        let sx = 0;
-                        let sy = 0;
-                        let sz = 0;
-
-                        while (queue.length > 0) {
-                            const idx = queue.shift()!;
-                            cells.push(idx);
-                            const center = cellCenter(idx);
-                            sx += center[0];
-                            sy += center[1];
-                            sz += center[2];
-                            const row = Math.floor(idx / width);
-                            const col = idx % width;
-                            const neighbors = [
-                                row > 0 ? idx - width : -1,
-                                row + 1 < height ? idx + width : -1,
-                                col > 0 ? idx - 1 : -1,
-                                col + 1 < width ? idx + 1 : -1,
-                            ];
-                            for (const next of neighbors) {
-                                if (next >= 0 && mask[next] && !visited[next]) {
-                                    visited[next] = 1;
-                                    queue.push(next);
-                                }
-                            }
-                        }
-
-                        const inv = 1 / cells.length;
-                        const centroid: [number, number, number] = [sx * inv, sy * inv, sz * inv];
-                        const distanceToSeed = seed
-                            ? Math.hypot(centroid[0] - seed[0], centroid[1] - seed[1], centroid[2] - seed[2])
-                            : 0;
-                        components.push({ cells, centroid, distanceToSeed });
-                    }
-                    return components;
-                };
-
-                const selectComponent = (components: Array<{ cells: number[], centroid: [number, number, number], distanceToSeed: number }>) => {
-                    const minCells = 20;
-                    const minArea = 1.2;
-                    const maxSeedDistance = 3.25;
-                    const viableComponents = components.filter((component) => {
-                        const area = component.cells.length * field.cell_size * field.cell_size;
-                        return component.cells.length >= minCells && area >= minArea;
-                    });
-                    if (viableComponents.length === 0) return null;
-                    const seedNear = seed
-                        ? viableComponents.filter((component) => component.distanceToSeed <= maxSeedDistance)
-                        : viableComponents;
-                    const candidates = seedNear.length > 0 ? seedNear : viableComponents;
-                    candidates.sort((a, b) => {
-                        if (!seed || seedNear.length === 0) return b.cells.length - a.cells.length;
-                        const score = (component: typeof a): number => {
-                            const area = component.cells.length * field.cell_size * field.cell_size;
-                            return component.distanceToSeed - Math.sqrt(area) * 0.45;
-                        };
-                        return score(a) - score(b) || b.cells.length - a.cells.length;
-                    });
-                    const selected = candidates[0];
-                    return {
-                        selected,
-                        usedLargestFallback: seedNear.length === 0 && !!seed,
-                    };
-                };
-
-                const MIN_ROOM_FLOOR_AREA = 4.0;
-                const areaOfSelection = (sel: { selected: { cells: number[] } }) =>
-                    sel.selected.cells.length * field.cell_size * field.cell_size;
-
-                const strictMask = buildMask(false);
-                const acceptedCellCount = strictMask.filter(Boolean).length;
-                const rejectedCellCount = field.cells.length - acceptedCellCount;
-                const strictComponents = collectComponents(strictMask);
-                let selection = selectComponent(strictComponents);
-                let selectedMask = strictMask;
-                let components = strictComponents;
-                let fallbackUsed = false;
-
-                // Use the relaxed mask when strict selection is missing or below the room-floor
-                // minimum, then keep whichever pass produced the larger usable floor.
-                if (!selection || areaOfSelection(selection) < MIN_ROOM_FLOOR_AREA) {
-                    const relaxedMask = buildMask(true);
-                    const relaxedComponents = collectComponents(relaxedMask);
-                    const relaxedSelection = selectComponent(relaxedComponents);
-                    if (relaxedSelection && (!selection || areaOfSelection(relaxedSelection) > areaOfSelection(selection))) {
-                        selection = relaxedSelection;
-                        selectedMask = relaxedMask;
-                        components = relaxedComponents;
-                        fallbackUsed = true;
-                        console.warn(
-                            `[WARN] Fast floor relaxed mask used: strictComponents=${strictComponents.length}, relaxedComponents=${relaxedComponents.length}, ` +
-                            `states=${JSON.stringify(stateCounts)}`
-                        );
-                    }
-                }
-
-                if (!selection) {
-                    const largest = [...components].sort((a, b) => b.cells.length - a.cells.length)[0];
-                    const largestArea = largest ? largest.cells.length * field.cell_size * field.cell_size : 0;
-                    throw new Error(
-                        `Fast nav could not find a viable floor component. ` +
-                        `Components=${components.length}, largest=${largest?.cells.length ?? 0} cells (${largestArea.toFixed(2)} m^2), ` +
-                        `states=${JSON.stringify(stateCounts)}. Define a floor region seed or import a Collider GLB.`
-                    );
-                }
-
-                const selected = selection.selected;
-                const selectedArea = selected.cells.length * field.cell_size * field.cell_size;
-                if (selectedArea < MIN_ROOM_FLOOR_AREA) {
-                    throw new Error(
-                        `Fast nav floor is too small to be a room (${selectedArea.toFixed(2)} m^2 < ${MIN_ROOM_FLOOR_AREA.toFixed(1)} m^2). ` +
-                        `components=${components.length}, accepted=${acceptedCellCount}, states=${JSON.stringify(stateCounts)}. ` +
-                        `Define a floor region seed inside the room, or import a Collider GLB.`
-                    );
-                }
-                if (selection.usedLargestFallback) {
-                    fallbackUsed = true;
-                    console.warn(
-                        `[WARN] Fast floor used largest viable island because no viable component was close to the seed: ` +
-                        `${selected.cells.length} cells, ${selectedArea.toFixed(2)} m^2, seedDistance=${selected.distanceToSeed.toFixed(2)}`
-                    );
-                } else if (components[0] !== selected) {
-                    console.warn(
-                        `[WARN] Fast floor ignored tiny or weak seed-near fragments and selected a viable floor island: ` +
-                        `${selected.cells.length} cells, ${selectedArea.toFixed(2)} m^2, seedDistance=${selected.distanceToSeed.toFixed(2)}`
-                    );
-                }
-
-                const positions: number[] = [];
-                const indices: number[] = [];
-                for (const idx of selected.cells) {
-                    const row = Math.floor(idx / width);
-                    const col = idx % width;
-                    const cell = field.cells[idx];
-                    const h = Number.isFinite(cell.height) ? cell.height : 0;
-                    const base = positions.length / 3;
-                    const p00 = pointAt(col, row, h);
-                    const p01 = pointAt(col, row + 1, h);
-                    const p11 = pointAt(col + 1, row + 1, h);
-                    const p10 = pointAt(col + 1, row, h);
-                    positions.push(...p00, ...p01, ...p11, ...p10);
-                    indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
-                }
-
-                console.log(
-                    `[INFO] Fast floor field: accepted=${acceptedCellCount}, obstacles=${obstacleCellCount}, ` +
-                    `rejected=${rejectedCellCount}, components=${components.length}, selectedCells=${selected.cells.length}, ` +
-                    `selectedArea=${selectedArea.toFixed(2)}, seedDistance=${selected.distanceToSeed.toFixed(2)}, ` +
-                    `maskCells=${selectedMask.filter(Boolean).length}, centroid=${selected.centroid.map((v) => v.toFixed(3)).join(', ')}`
-                );
-
-                return {
-                    positions: new Float32Array(positions),
-                    indices: new Uint32Array(indices),
-                    selectedCellCount: selected.cells.length,
-                    acceptedCellCount,
-                    obstacleCellCount,
-                    rejectedCellCount,
-                    selectedArea,
-                    centroid: selected.centroid,
-                    componentCount: components.length,
-                    fallbackUsed,
-                    seedDistance: selected.distanceToSeed,
                 };
             };
 
@@ -878,14 +736,17 @@ async function main() {
                 let effectiveFastSeed = navSettings.collision_seed ?? fastSeed;
 
                 if (autoSpawnNpc) {
-                    const field = splatwalk.buildWalkableGroundField(bytes, navSettings);
-                    const floorPlaneY = field.diagnostics.floor_plane_height;
-                    if (effectiveFastSeed && Number.isFinite(floorPlaneY)) {
-                        const snapped = [effectiveFastSeed[0], floorPlaneY, effectiveFastSeed[2]];
-                        console.log(`[INFO] Snapped fast seed to floor plane: y ${effectiveFastSeed[1].toFixed(3)} -> ${floorPlaneY.toFixed(3)}`);
-                        effectiveFastSeed = snapped;
-                    }
-                    const floorMesh = buildFastFloorMesh(field, effectiveFastSeed);
+                    // Shared, built-in adaptive recovery: escalate floor-field extraction
+                    // parameters and retry instead of failing on sparse/large scenes.
+                    const extracted = await extractFloorFieldWithRecovery({
+                        bytes,
+                        baseSettings: navSettings,
+                        seed: effectiveFastSeed ?? fastSeed ?? [],
+                        recovery: resolveRecovery(),
+                        log: (message: string): void => console.log(message),
+                    });
+                    const floorMesh = extracted.floorMesh;
+                    effectiveFastSeed = extracted.effectiveSeed;
                     geometry = {
                         positions: floorMesh.positions,
                         indices: floorMesh.indices,
@@ -906,7 +767,7 @@ async function main() {
                     console.log(`[INFO] Using imported Collider GLB as authoritative Recast input.`);
                     console.log(`[INFO] Imported collider: ${geometry.positions.length / 3} vertices, ${geometry.indices.length / 3} triangles.`);
                 } else {
-                    const basis = splatwalk.convertSplatToNavmeshBasis(bytes, navSettings);
+                    const basis = await splatwalk.convertSplatToNavmeshBasis(bytes, navSettings);
                     geometry = {
                         positions: new Float32Array(basis.mesh.vertices),
                         indices: new Uint32Array(basis.mesh.indices),
@@ -1193,6 +1054,10 @@ async function main() {
                     return Number.isFinite(value) ? value : fallback;
                 };
                 const readInteger = (id: string, fallback: number): number => Math.max(0, Math.round(readNumber(id, fallback)));
+                const readBool = (id: string, fallback: boolean): boolean => {
+                    const input = document.getElementById(id) as HTMLInputElement | null;
+                    return input ? input.checked : fallback;
+                };
 
                 let mode = 2; // Default to Voxels now
                 const modeRadios = document.getElementsByName('reconMode');
@@ -1227,6 +1092,9 @@ async function main() {
                     collision_mesh_mode: ((document.getElementById('paramCollisionMeshMode') as HTMLSelectElement | null)?.value as MeshSettings['collision_mesh_mode']) ?? 'faces',
                     min_alpha: readNumber('paramMinAlpha', 0.05),
                     max_scale: readNumber('paramMaxScale', 5.0),
+                    prune_floaters: readBool('paramPruneFloaters', true),
+                    prune_floaters_k: readInteger('paramPruneFloatersK', 16),
+                    prune_floaters_std_ratio: readNumber('paramPruneFloatersStdRatio', 2.0),
                     normal_align: readNumber('paramNormalAlign', 0.05),
                     ransac_thresh: readNumber('paramRansacThresh', 0.1),
                     floor_projection_epsilon: readNumber('paramFloorProjectionEpsilon', 0.16),
@@ -1304,7 +1172,7 @@ async function main() {
                 newDefineBtn.addEventListener('click', async () => {
                     try {
                         const bytes = await readSplatBytes();
-                        const suggestedRegion = splatwalk.suggestRegion(bytes, buildMeshSettings(false));
+                        const suggestedRegion = await suggestAdaptedRegion(bytes);
                         viewer.enableRegionSelection({
                             min: suggestedRegion.region_min,
                             max: suggestedRegion.region_max,
@@ -1368,7 +1236,7 @@ async function main() {
                         console.log(`[INFO] Reconstruction Settings:`, settings);
                         const start = performance.now();
 
-                        const result = splatwalk.convertSplatToMesh(bytes, settings);
+                        const result = await splatwalk.convertSplatToMesh(bytes, settings);
                         const mesh = result.mesh;
                         const diagnostics = result.diagnostics;
 
@@ -1495,7 +1363,7 @@ async function main() {
                                 console.log("[WAIT] Building 2.5D SDF field overlay...");
                                 try {
                                     const fieldSettings = buildMeshSettings(true);
-                                    const field = splatwalk.buildWalkableGroundField(bytes, fieldSettings);
+                                    const field = await splatwalk.buildWalkableGroundField(bytes, fieldSettings);
                                     viewer.displayGroundFieldOverlay(field, getVisibleGroundFieldStates());
                                     console.log(
                                         `[INFO] Ground field overlay: ${field.width}x${field.height}, ` +

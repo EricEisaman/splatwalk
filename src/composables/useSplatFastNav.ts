@@ -2,7 +2,14 @@ import { computed, ref, type ComputedRef, type Ref } from 'vue';
 
 import { Tools } from '@babylonjs/core';
 
-import { readSplatBytes, runFastNav } from '@/navigation/fastNav';
+import {
+  readSplatBytes,
+  runFastNav,
+  type FastNavRecoveryConfig,
+  type StrayTrimOptions,
+  type PruneFloatersOptions,
+  type FastNavPhase,
+} from '@/navigation/fastNav';
 import { splatwalk } from '@/wasm/bridge';
 import type { UseBabylonViewer } from '@/composables/useBabylonViewer';
 
@@ -19,6 +26,35 @@ export interface LogEntry {
   readonly message: string;
 }
 
+/** Coarse pipeline phase for step indicators (`idle` before any run). */
+export type FastNavUiPhase = FastNavPhase | 'idle';
+
+/** Throttled progress from the WASM worker (fraction is null when indeterminate). */
+export interface FastNavProgress {
+  readonly stage: string;
+  readonly fraction: number | null;
+}
+
+/** Options for {@link useSplatFastNav}. */
+export interface UseSplatFastNavOptions {
+  /**
+   * Optional override for the adaptive FAST NAV floor-field recovery ladder.
+   * When omitted, the built-in default ladder is used (recovery is always on).
+   */
+  readonly recovery?: Partial<FastNavRecoveryConfig>;
+  /**
+   * Optional override for stray-floater trimming of the detected floor. On by
+   * default; pass `{ enabled: false }` to keep every detected floor cell.
+   */
+  readonly strayTrim?: StrayTrimOptions;
+  /**
+   * Optional override for WASM-side floater pruning (statistical outlier removal).
+   * On by default; pass `{ enabled: false }` to keep every splat, or tune
+   * `{ k, stdRatio }`.
+   */
+  readonly prune?: PruneFloatersOptions;
+}
+
 /** Reactive API returned by {@link useSplatFastNav}. */
 export interface UseSplatFastNav {
   readonly status: Ref<FastNavStatus>;
@@ -26,6 +62,10 @@ export interface UseSplatFastNav {
   readonly errorMessage: Ref<string | null>;
   readonly logs: Ref<LogEntry[]>;
   readonly isBusy: ComputedRef<boolean>;
+  /** Current pipeline phase (prune -> floor -> navmesh -> done). */
+  readonly phase: Ref<FastNavUiPhase>;
+  /** Latest throttled WASM progress, or null when none is active. */
+  readonly progress: Ref<FastNavProgress | null>;
   /** Validate, load, auto-run FAST NAV, then frame the player top-down. */
   readonly loadAndProcess: (file: File) => Promise<void>;
   /** Fetch an example splat from a URL, then run the same pipeline. */
@@ -48,11 +88,16 @@ function parseLog(message: string): LogEntry {
  * and end on a top-down view of the player. All Babylon/WASM work is delegated
  * to the viewer and the shared `fastNav` module (no logic in the component).
  */
-export function useSplatFastNav(babylon: UseBabylonViewer): UseSplatFastNav {
+export function useSplatFastNav(
+  babylon: UseBabylonViewer,
+  options: UseSplatFastNavOptions = {}
+): UseSplatFastNav {
   const status = ref<FastNavStatus>('idle');
   const statusMessage = ref('Drop a .ply or .spz splat to begin.');
   const errorMessage = ref<string | null>(null);
   const logs = ref<LogEntry[]>([]);
+  const phase = ref<FastNavUiPhase>('idle');
+  const progress = ref<FastNavProgress | null>(null);
   const isBusy = computed(() => status.value === 'loading' || status.value === 'processing');
 
   let wasmReady = false;
@@ -61,11 +106,18 @@ export function useSplatFastNav(babylon: UseBabylonViewer): UseSplatFastNav {
     logs.value.push(parseLog(message));
   };
 
+  // Throttled WASM progress (parse/prune/...) flows through the shared bridge.
+  splatwalk.onProgress = (stage: string, fraction: number | null): void => {
+    progress.value = { stage, fraction };
+  };
+
   const reset = (): void => {
     status.value = 'idle';
     statusMessage.value = 'Drop a .ply or .spz splat to begin.';
     errorMessage.value = null;
     logs.value = [];
+    phase.value = 'idle';
+    progress.value = null;
   };
 
   const processFile = async (file: File): Promise<void> => {
@@ -96,7 +148,17 @@ export function useSplatFastNav(babylon: UseBabylonViewer): UseSplatFastNav {
 
       status.value = 'processing';
       statusMessage.value = 'Running FAST NAV...';
-      await runFastNav({ viewer, bytes, onLog: appendLog });
+      await runFastNav({
+        viewer,
+        bytes,
+        onLog: appendLog,
+        onPhase: (next) => { phase.value = next; },
+        recovery: options.recovery,
+        strayTrim: options.strayTrim,
+        prune: options.prune,
+      });
+      phase.value = 'done';
+      progress.value = null;
 
       statusMessage.value = 'Framing the player (top-down)...';
       const framing = viewer.focusOnPlayer();
@@ -126,6 +188,8 @@ export function useSplatFastNav(babylon: UseBabylonViewer): UseSplatFastNav {
     }
     errorMessage.value = null;
     logs.value = [];
+    phase.value = 'idle';
+    progress.value = null;
     await processFile(file);
   };
 
@@ -135,6 +199,8 @@ export function useSplatFastNav(babylon: UseBabylonViewer): UseSplatFastNav {
     }
     errorMessage.value = null;
     logs.value = [];
+    phase.value = 'idle';
+    progress.value = null;
 
     try {
       status.value = 'loading';
@@ -158,5 +224,5 @@ export function useSplatFastNav(babylon: UseBabylonViewer): UseSplatFastNav {
     }
   };
 
-  return { status, statusMessage, errorMessage, logs, isBusy, loadAndProcess, loadExample, reset };
+  return { status, statusMessage, errorMessage, logs, isBusy, phase, progress, loadAndProcess, loadExample, reset };
 }
