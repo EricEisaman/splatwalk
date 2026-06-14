@@ -26,6 +26,8 @@ export interface UseSplatFastNav {
   readonly isBusy: ComputedRef<boolean>;
   /** Validate, load, auto-run FAST NAV, then frame the player top-down. */
   readonly loadAndProcess: (file: File) => Promise<void>;
+  /** Fetch an example splat from a URL, then run the same pipeline. */
+  readonly loadExample: (url: string, title: string) => Promise<void>;
   /** Reset back to the idle state, clearing logs and errors. */
   readonly reset: () => void;
 }
@@ -64,20 +66,13 @@ export function useSplatFastNav(babylon: UseBabylonViewer): UseSplatFastNav {
     logs.value = [];
   };
 
-  const loadAndProcess = async (file: File): Promise<void> => {
-    if (isBusy.value) {
-      return;
-    }
-
+  const processFile = async (file: File): Promise<void> => {
     const name = file.name.toLowerCase();
     if (!SUPPORTED_EXTENSIONS.some((ext) => name.endsWith(ext))) {
       errorMessage.value = 'Only .ply and .spz splat files are supported.';
       status.value = 'error';
       return;
     }
-
-    errorMessage.value = null;
-    logs.value = [];
 
     try {
       status.value = 'loading';
@@ -123,5 +118,45 @@ export function useSplatFastNav(babylon: UseBabylonViewer): UseSplatFastNav {
     }
   };
 
-  return { status, statusMessage, errorMessage, logs, isBusy, loadAndProcess, reset };
+  const loadAndProcess = async (file: File): Promise<void> => {
+    if (isBusy.value) {
+      return;
+    }
+    errorMessage.value = null;
+    logs.value = [];
+    await processFile(file);
+  };
+
+  const loadExample = async (url: string, title: string): Promise<void> => {
+    if (isBusy.value) {
+      return;
+    }
+    errorMessage.value = null;
+    logs.value = [];
+
+    try {
+      status.value = 'loading';
+      statusMessage.value = `Fetching ${title}...`;
+      appendLog(`[WAIT] Fetching example scene: ${title}...`);
+
+      const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error(`Failed to fetch ${title}: ${response.status} ${response.statusText}`);
+      }
+
+      const blob = await response.blob();
+      const file = new File([blob], `${title}.ply`, { type: 'application/octet-stream' });
+      appendLog(`[SUCCESS] Fetched ${title} (${(file.size / (1024 * 1024)).toFixed(2)} MB).`);
+
+      await processFile(file);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      errorMessage.value = detail;
+      appendLog(`[ERROR] ${detail}`);
+      status.value = 'error';
+      statusMessage.value = 'Failed to load the example scene.';
+    }
+  };
+
+  return { status, statusMessage, errorMessage, logs, isBusy, loadAndProcess, loadExample, reset };
 }

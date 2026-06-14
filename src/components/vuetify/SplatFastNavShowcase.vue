@@ -11,7 +11,19 @@ const isDragging = ref(false);
 const isFullscreen = ref(false);
 
 const babylon = useBabylonViewer(canvasRef);
-const { status, statusMessage, errorMessage, logs, isBusy, loadAndProcess, reset } = useSplatFastNav(babylon);
+const { status, statusMessage, errorMessage, logs, isBusy, loadAndProcess, loadExample, reset } =
+  useSplatFastNav(babylon);
+
+interface ExampleScene {
+  readonly title: string;
+  readonly url: string;
+}
+
+const EXAMPLE_SCENES: readonly ExampleScene[] = [
+  { title: 'Bedroom', url: 'https://raw.githubusercontent.com/EricEisaman/assets/main/environment/splats/bedroom.ply' },
+  { title: 'Tropical Compound', url: 'https://raw.githubusercontent.com/EricEisaman/assets/main/environment/splats/tropical_compound.ply' },
+  { title: 'Industrial Warehouse', url: 'https://raw.githubusercontent.com/EricEisaman/assets/main/environment/splats/industrial_warehouse.ply' },
+] as const;
 
 const showSnackbar = computed({
   get: () => errorMessage.value !== null,
@@ -146,10 +158,34 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
             <div class="text-center pa-8">
               <v-icon icon="mdi-cloud-upload-outline" size="72" color="primary" class="mb-3" />
               <div class="text-h6 font-weight-bold mb-2">Drop your splat here</div>
-              <div class="text-body-2 text-medium-emphasis mb-5">.ply or .spz · drag &amp; drop or browse</div>
-              <v-btn color="primary" size="large" prepend-icon="mdi-folder-open" @click="onBrowse">
-                Browse files
-              </v-btn>
+              <div class="text-body-2 text-medium-emphasis mb-5">.ply or .spz · drag &amp; drop, browse, or pick an example</div>
+              <div class="d-flex flex-wrap justify-center align-center ga-3">
+                <v-btn color="primary" size="large" prepend-icon="mdi-folder-open" @click="onBrowse">
+                  Browse files
+                </v-btn>
+                <v-menu>
+                  <template #activator="{ props: menuProps }">
+                    <v-btn
+                      v-bind="menuProps"
+                      color="secondary"
+                      size="large"
+                      prepend-icon="mdi-cube-scan"
+                      append-icon="mdi-menu-down"
+                    >
+                      Example scenes
+                    </v-btn>
+                  </template>
+                  <v-list>
+                    <v-list-item
+                      v-for="scene in EXAMPLE_SCENES"
+                      :key="scene.url"
+                      :title="scene.title"
+                      prepend-icon="mdi-cube-outline"
+                      @click="loadExample(scene.url, scene.title)"
+                    />
+                  </v-list>
+                </v-menu>
+              </div>
             </div>
           </v-overlay>
 

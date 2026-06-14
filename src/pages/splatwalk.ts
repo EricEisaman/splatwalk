@@ -1126,6 +1126,12 @@ async function main() {
 
                 if (autoSpawnNpc) {
                     viewer.addNPC();
+                    const framing = viewer.focusOnPlayer();
+                    if (framing) {
+                        console.log(`[INFO] Top-down view set above player at ${framing.player.map((v) => v.toFixed(2)).join(', ')}.`);
+                    } else {
+                        console.warn("[WARN] No player agent found to frame for the top-down view.");
+                    }
                     console.log("[SUCCESS] Fast path complete: navmesh ready, NPC spawned, click navmesh to move.");
                 } else {
                     console.log("[SUCCESS] Simulation ready.");

@@ -16,14 +16,21 @@
 <body>
     <div id="fullscreen">
         <div class="preprocess-container">
-            <!-- Home link -->
-            <a href="/" class="home-link" title="Home">
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-                    stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path>
-                    <polyline points="9 22 9 12 15 12 15 22"></polyline>
-                </svg>
-            </a>
+            <!-- Top-left navigation menu -->
+            <details class="nav-menu">
+                <summary class="nav-menu-toggle" title="Menu" aria-label="Open navigation menu">
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                        stroke-linecap="round" stroke-linejoin="round">
+                        <line x1="3" y1="6" x2="21" y2="6"></line>
+                        <line x1="3" y1="12" x2="21" y2="12"></line>
+                        <line x1="3" y1="18" x2="21" y2="18"></line>
+                    </svg>
+                </summary>
+                <nav class="nav-menu-items">
+                    <a href="/">Home</a>
+                    <a href="/vuetify">Vuetify Example</a>
+                </nav>
+            </details>
 
             <h1>SplatWalk</h1>
 
@@ -64,7 +71,6 @@
                             <option
                                 value="https://raw.githubusercontent.com/EricEisaman/assets/main/environment/splats/industrial_warehouse.ply">
                                 Industrial Warehouse (.ply)</option>
-                            <option value="/sample.ply">Sample (.ply)</option>
                         </select>
                         <div class="mobile-upload-divider">OR</div>
                         <button id="chooseFileBtn" class="cyber-button-pink">CHOOSE LOCAL FILE</button>
