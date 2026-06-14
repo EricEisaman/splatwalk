@@ -1,4 +1,5 @@
 :root {
+  /* Primitive: base palette */
   --bg-dark: #050505;
   --bg-panel: #111111;
   --text-main: #e0e0e0;
@@ -10,7 +11,38 @@
   --neon-amber: #ffaa00;
   --neon-violet: #bc13fe;
 
+  /* Primitive: color channels for alpha compositing (Verou) */
+  --neon-green-rgb: 57 255 20;
+  --neon-blue-rgb: 0 240 255;
+  --neon-pink-rgb: 255 0 153;
+
   --border: #333333;
+
+  /* Primitive: typography */
+  --font-ui: 'Inter', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: 'Fira Code', 'Courier New', monospace;
+
+  /* Primitive: spacing scale */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 15px;
+  --space-5: 20px;
+  --space-6: 25px;
+
+  /* Primitive: radii */
+  --radius: 6px;
+  --radius-sm: 4px;
+
+  /* Semantic */
+  --text-label: #bbb;
+  --panel-border: var(--neon-blue);
+
+  /* Component: settings-panel control sizing (Simmons intrinsic) */
+  --control-w: clamp(7rem, 42%, 8.5rem);
+  --control-h: 36px;
+  --row-gap: var(--space-3);
+  --section-gap: var(--space-5);
 }
 
 *,
@@ -21,7 +53,7 @@
 
 body {
   margin: 0;
-  font-family: 'Inter', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  font-family: var(--font-ui);
   background-color: var(--bg-dark);
   color: var(--text-main);
   height: 100vh;
@@ -53,7 +85,7 @@ h1 {
   -webkit-background-clip: text;
   background-clip: text;
   -webkit-text-fill-color: transparent;
-  filter: drop-shadow(0 0 5px rgba(0, 240, 255, 0.5));
+  filter: drop-shadow(0 0 5px rgb(var(--neon-blue-rgb) / 0.5));
 }
 
 h2 {
@@ -86,7 +118,7 @@ h3 {
 
 .preprocess-section:hover {
   transform: translateY(-2px);
-  box-shadow: 0 15px 40px rgba(0, 240, 255, 0.05);
+  box-shadow: 0 15px 40px rgb(var(--neon-blue-rgb) / 0.05);
   border-color: var(--neon-blue);
 }
 
@@ -110,7 +142,7 @@ canvas#renderCanvas {
 
 canvas#renderCanvas.highlight {
   border-color: var(--neon-green);
-  box-shadow: 0 0 20px rgba(57, 255, 20, 0.3);
+  box-shadow: 0 0 20px rgb(var(--neon-green-rgb) / 0.3);
 }
 
 /* Buttons */
@@ -125,13 +157,13 @@ canvas#renderCanvas.highlight {
   text-transform: uppercase;
   cursor: pointer;
   transition: all 0.3s ease;
-  box-shadow: 0 0 10px rgba(57, 255, 20, 0.1);
+  box-shadow: 0 0 10px rgb(var(--neon-green-rgb) / 0.1);
 }
 
 .primary-button:hover {
   background-color: var(--neon-green);
   color: #000;
-  box-shadow: 0 0 20px rgba(57, 255, 20, 0.5);
+  box-shadow: 0 0 20px rgb(var(--neon-green-rgb) / 0.5);
 }
 
 /* Logs */
@@ -140,7 +172,7 @@ canvas#renderCanvas.highlight {
   border: 1px solid var(--border);
   padding: 20px;
   border-radius: 4px;
-  font-family: 'Fira Code', 'Courier New', monospace;
+  font-family: var(--font-mono);
   margin-top: 20px;
 }
 
@@ -226,7 +258,7 @@ canvas#renderCanvas.highlight {
 /* Error */
 .error-message {
   border: 1px solid var(--neon-pink);
-  background: rgba(255, 0, 153, 0.05);
+  background: rgb(var(--neon-pink-rgb) / 0.05);
   color: var(--neon-pink);
   padding: 15px;
   margin-bottom: 20px;
@@ -238,7 +270,7 @@ canvas#renderCanvas.highlight {
 }
 
 .error-message:focus {
-  box-shadow: 0 0 25px rgba(255, 0, 153, 0.5);
+  box-shadow: 0 0 25px rgb(var(--neon-pink-rgb) / 0.5);
   border-width: 2px;
 }
 
@@ -345,7 +377,7 @@ canvas#renderCanvas.highlight {
   background: var(--neon-blue);
   border-color: var(--neon-blue);
   color: #000;
-  box-shadow: 0 0 15px rgba(0, 240, 255, 0.5);
+  box-shadow: 0 0 15px rgb(var(--neon-blue-rgb) / 0.5);
   transform: scale(1.05);
 }
 
@@ -385,7 +417,7 @@ canvas#renderCanvas.highlight {
   display: flex;
   /* Hide logic handled by class usually, but keeping flex */
   flex-direction: column;
-  gap: 25px;
+  gap: var(--section-gap);
   box-shadow: 10px 0 40px rgba(0, 0, 0, 0.5);
 }
 
@@ -414,8 +446,8 @@ canvas#renderCanvas.highlight {
 
 .controls-section {
   border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-  padding-bottom: 15px;
-  margin-bottom: 5px;
+  padding-bottom: var(--space-4);
+  margin-bottom: var(--space-1);
 }
 
 .controls-section:last-child {
@@ -424,15 +456,109 @@ canvas#renderCanvas.highlight {
   margin-bottom: 0;
 }
 
+/*
+ * Vertical rhythm via the "lobotomized owl" so spacing is consistent whether
+ * the section is revealed as display:block (set by JS) or display:flex.
+ */
+.controls-section> :where(*)+ :where(*) {
+  margin-top: var(--row-gap);
+}
+
+/* Grouped action buttons inside a section */
+.nav-button-group {
+  display: flex;
+  gap: var(--space-2);
+}
+
+.nav-button-group.stack {
+  flex-direction: column;
+}
+
+.nav-legend {
+  border: 1px solid rgb(var(--neon-blue-rgb) / 0.35);
+  background: rgba(0, 0, 0, 0.35);
+  border-radius: var(--radius);
+  padding: 10px;
+  margin: 0;
+  color: var(--text-main);
+  font-size: 0.72rem;
+  line-height: 1.55;
+  box-shadow: inset 0 0 14px rgb(var(--neon-blue-rgb) / 0.08);
+}
+
+.nav-legend-title {
+  color: var(--neon-blue);
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin-bottom: 4px;
+}
+
+.legend-swatch {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  margin-right: 7px;
+  border-radius: 50%;
+  box-shadow: 0 0 8px currentColor;
+}
+
+.legend-swatch.navmesh {
+  color: var(--neon-green);
+  background: var(--neon-green);
+}
+
+.legend-swatch.seed {
+  color: var(--neon-pink);
+  background: var(--neon-pink);
+}
+
+.legend-swatch.player {
+  color: #2458ff;
+  background: #2458ff;
+}
+
+.legend-swatch.npc {
+  color: #5dff7a;
+  background: #5dff7a;
+}
+
 .section-title {
   color: var(--neon-pink);
   font-size: 0.9rem;
   text-transform: uppercase;
   letter-spacing: 1px;
-  margin-bottom: 12px;
+  margin: 0;
   font-weight: bold;
   display: flex;
   align-items: center;
+}
+
+/* Sub-section headers get extra separation from the group above */
+.controls-section > .nav-section-title,
+.controls-section > details {
+  margin-top: var(--section-gap);
+}
+
+/* Collapsible groups keep the same vertical rhythm as a section */
+.settings-panel details {
+  display: flex;
+  flex-direction: column;
+  gap: var(--row-gap);
+}
+
+.settings-panel summary.section-title {
+  cursor: pointer;
+  margin: 0;
+}
+
+/* NPC simulation block: revealed as display:block by JS, so use owl spacing */
+#simulationSection {
+  margin-top: var(--section-gap);
+}
+
+#simulationSection> :where(*)+ :where(*) {
+  margin-top: var(--row-gap);
 }
 
 .section-title::before {
@@ -557,7 +683,7 @@ input[type=range]::-webkit-slider-runnable-track {
   border-radius: 4px;
   cursor: pointer;
   transition: all 0.2s;
-  font-family: 'Fira Code', monospace;
+  font-family: var(--font-mono);
   font-size: 0.8rem;
   min-width: 60px;
   text-align: center;
@@ -576,7 +702,7 @@ input[type=range]::-webkit-slider-runnable-track {
 
 .cyber-button {
   width: 100%;
-  background: linear-gradient(90deg, rgba(57, 255, 20, 0.1) 0%, rgba(57, 255, 20, 0.2) 50%, rgba(57, 255, 20, 0.1) 100%);
+  background: linear-gradient(90deg, rgb(var(--neon-green-rgb) / 0.1) 0%, rgb(var(--neon-green-rgb) / 0.2) 50%, rgb(var(--neon-green-rgb) / 0.1) 100%);
   border: 1px solid var(--neon-green);
   color: var(--neon-green);
   padding: 14px;
@@ -585,54 +711,167 @@ input[type=range]::-webkit-slider-runnable-track {
   font-weight: 800;
   cursor: pointer;
   transition: all 0.3s;
-  text-shadow: 0 0 5px rgba(57, 255, 20, 0.5);
-  border-radius: 6px;
+  text-shadow: 0 0 5px rgb(var(--neon-green-rgb) / 0.5);
+  border-radius: var(--radius);
   /* Match standard look */
 }
 
 .cyber-button:hover {
-  background: rgba(57, 255, 20, 0.3);
-  box-shadow: 0 0 20px rgba(57, 255, 20, 0.4);
+  background: rgb(var(--neon-green-rgb) / 0.3);
+  box-shadow: 0 0 20px rgb(var(--neon-green-rgb) / 0.4);
   letter-spacing: 3px;
+}
+
+/* Compact variant for inline/grouped action buttons */
+.cyber-button.small {
+  padding: var(--space-2);
+  font-size: 0.78rem;
+  letter-spacing: 1px;
+}
+
+.cyber-button.small:hover {
+  letter-spacing: 1.5px;
+}
+
+.setup-action-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 20px;
+  width: 100%;
+}
+
+.setup-action-stack .cyber-button {
+  min-height: 42px;
+  padding: 12px 10px;
+  line-height: 1.1;
+}
+
+.cyber-button-fast {
+  border-color: var(--neon-blue);
+  color: var(--neon-blue);
+  background: linear-gradient(90deg, rgb(var(--neon-blue-rgb) / 0.08), rgb(var(--neon-green-rgb) / 0.12), rgb(var(--neon-blue-rgb) / 0.08));
+  text-shadow: 0 0 5px rgb(var(--neon-blue-rgb) / 0.5);
+}
+
+.cyber-button-fast:hover {
+  background: rgb(var(--neon-blue-rgb) / 0.18);
+  box-shadow: 0 0 20px rgb(var(--neon-blue-rgb) / 0.35);
 }
 
 /* Radio Cards */
 .radio-cards {
   display: flex;
   gap: 10px;
+  min-width: 0;
+  flex: 1 1 auto;
 }
 
 .radio-cards label {
-  flex: 1;
+  flex: 1 1 0;
+  min-width: 0;
   cursor: pointer;
 }
 
 .radio-card-content {
-  border: 1px solid #444;
+  position: relative;
+  overflow: hidden;
+  border: 1px solid rgb(var(--neon-blue-rgb) / 0.35);
   padding: 12px 5px;
   text-align: center;
   border-radius: 4px;
   transition: all 0.2s;
-  color: #888;
-  background: rgba(255, 255, 255, 0.02);
+  color: var(--text-muted);
+  background: linear-gradient(90deg, rgb(var(--neon-blue-rgb) / 0.03), rgb(var(--neon-green-rgb) / 0.03));
   font-size: 0.9rem;
   font-weight: bold;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .radio-card-content:hover {
-  border-color: #666;
-  background: rgba(255, 255, 255, 0.05);
+  border-color: var(--neon-blue);
+  color: var(--neon-blue);
+  background: rgb(var(--neon-blue-rgb) / 0.08);
+  box-shadow: 0 0 12px rgb(var(--neon-blue-rgb) / 0.22);
 }
 
 input[type="radio"]:checked+.radio-card-content {
-  border-color: var(--neon-blue);
-  color: #000;
-  background: var(--neon-blue);
-  box-shadow: 0 0 15px var(--neon-blue);
+  border-color: var(--neon-green);
+  color: var(--neon-green);
+  background: linear-gradient(90deg, rgb(var(--neon-green-rgb) / 0.18), rgb(var(--neon-blue-rgb) / 0.08));
+  box-shadow: 0 0 16px rgb(var(--neon-green-rgb) / 0.38), inset 0 0 18px rgb(var(--neon-green-rgb) / 0.12);
+  text-shadow: 0 0 8px rgb(var(--neon-green-rgb) / 0.7);
 }
 
 input[type="radio"] {
   display: none;
+}
+
+.cyber-check-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(7.5rem, 1fr));
+  gap: var(--space-2) var(--space-3);
+  font-size: 0.78rem;
+}
+
+.cyber-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  cursor: pointer;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  transition: color 0.2s, text-shadow 0.2s;
+}
+
+.cyber-check input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.cyber-check span {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 18px;
+  border: 1px solid rgb(var(--neon-blue-rgb) / 0.65);
+  border-radius: 3px;
+  background: rgba(0, 0, 0, 0.65);
+  box-shadow: inset 0 0 8px rgb(var(--neon-blue-rgb) / 0.12);
+  position: relative;
+  transition: all 0.2s;
+}
+
+.cyber-check:hover {
+  color: var(--neon-blue);
+  text-shadow: 0 0 8px rgb(var(--neon-blue-rgb) / 0.45);
+}
+
+.cyber-check input:checked+span {
+  border-color: var(--neon-green);
+  background: rgb(var(--neon-green-rgb) / 0.18);
+  box-shadow: 0 0 12px rgb(var(--neon-green-rgb) / 0.55), inset 0 0 10px rgb(var(--neon-green-rgb) / 0.25);
+}
+
+.cyber-check input:checked+span::after {
+  content: '';
+  position: absolute;
+  left: 5px;
+  top: 2px;
+  width: 5px;
+  height: 10px;
+  border: solid var(--neon-green);
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+  filter: drop-shadow(0 0 5px rgb(var(--neon-green-rgb) / 0.9));
+}
+
+.cyber-check input:focus-visible+span {
+  outline: 1px solid var(--neon-blue);
+  outline-offset: 2px;
 }
 
 /* Advanced Settings & Inputs */
@@ -658,7 +897,7 @@ input[type="radio"] {
   background: rgba(255, 255, 255, 0.08);
   border-color: var(--neon-blue);
   color: var(--neon-blue);
-  box-shadow: 0 0 10px rgba(0, 240, 255, 0.1);
+  box-shadow: 0 0 10px rgb(var(--neon-blue-rgb) / 0.1);
 }
 
 .advanced-toggle svg {
@@ -669,7 +908,7 @@ input[type="radio"] {
 .advanced-toggle.open {
   color: var(--neon-blue);
   border-color: var(--neon-blue);
-  background: rgba(0, 240, 255, 0.05);
+  background: rgb(var(--neon-blue-rgb) / 0.05);
 }
 
 .advanced-toggle.open svg {
@@ -680,13 +919,15 @@ input[type="radio"] {
 .advanced-settings-panel {
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  padding: 15px;
+  gap: var(--row-gap);
+  padding: var(--space-4);
   background: rgba(0, 0, 0, 0.3);
-  border: 1px solid rgba(0, 240, 255, 0.2);
+  border: 1px solid rgb(var(--neon-blue-rgb) / 0.2);
   border-top: none;
-  border-radius: 0 0 6px 6px;
-  margin-bottom: 20px;
+  border-radius: 0 0 var(--radius) var(--radius);
+  /* Stays visually attached to the toggle above; owl top-margin is removed */
+  margin-top: 0;
+  margin-bottom: var(--space-5);
 }
 
 .settings-panel input[type="number"] {
@@ -694,18 +935,28 @@ input[type="radio"] {
   border: 1px solid #444;
   color: var(--text-main);
   padding: 8px 10px;
-  border-radius: 4px;
-  width: 90px;
+  border-radius: var(--radius-sm);
+  width: var(--control-w);
+  height: var(--control-h);
   text-align: right;
-  font-family: 'Fira Code', monospace;
+  font-family: var(--font-mono);
   font-size: 0.9rem;
   outline: none;
   transition: all 0.2s;
+  -webkit-appearance: none;
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+.settings-panel input[type="number"]::-webkit-inner-spin-button,
+.settings-panel input[type="number"]::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
 }
 
 .settings-panel input[type="number"]:focus {
   border-color: var(--neon-blue);
-  box-shadow: 0 0 8px rgba(0, 240, 255, 0.3);
+  box-shadow: 0 0 8px rgb(var(--neon-blue-rgb) / 0.3);
   background: rgba(0, 0, 0, 0.7);
 }
 
@@ -730,7 +981,7 @@ input[type="radio"] {
 }
 
 .example-selector-container label {
-  font-family: 'Fira Code', monospace;
+  font-family: var(--font-mono);
   font-size: 0.8rem;
   font-weight: 800;
   color: var(--neon-pink);
@@ -743,7 +994,7 @@ input[type="radio"] {
   color: var(--text-main);
   padding: 8px 12px;
   border-radius: 4px;
-  font-family: 'Inter', sans-serif;
+  font-family: var(--font-ui);
   font-size: 0.9rem;
   outline: none;
   cursor: pointer;
@@ -759,21 +1010,79 @@ input[type="radio"] {
 
 .cyber-select:hover {
   border-color: var(--neon-pink);
-  box-shadow: 0 0 10px rgba(255, 0, 153, 0.3);
-  background-color: rgba(255, 0, 153, 0.05);
+  box-shadow: 0 0 10px rgb(var(--neon-pink-rgb) / 0.3);
+  background-color: rgb(var(--neon-pink-rgb) / 0.05);
 }
 
 .cyber-select:focus {
   border-color: var(--neon-pink);
-  box-shadow: 0 0 15px rgba(255, 0, 153, 0.5);
+  box-shadow: 0 0 15px rgb(var(--neon-pink-rgb) / 0.5);
 }
 
 .cyber-select option {
   background-color: var(--bg-panel);
   color: var(--text-main);
 }
+
+.settings-panel .cyber-select {
+  width: var(--control-w);
+  min-width: var(--control-w);
+  height: var(--control-h);
+  margin-bottom: 0;
+  background-color: rgba(0, 0, 0, 0.65);
+  border-color: var(--neon-blue);
+  color: var(--neon-green);
+  font-family: var(--font-mono);
+  font-weight: 700;
+  text-shadow: 0 0 6px rgb(var(--neon-green-rgb) / 0.35);
+  box-shadow: inset 0 0 12px rgb(var(--neon-blue-rgb) / 0.08);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2300f0ff' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
+}
+
+.settings-panel .cyber-select:hover,
+.settings-panel .cyber-select:focus {
+  border-color: var(--neon-green);
+  background-color: rgb(var(--neon-green-rgb) / 0.08);
+  box-shadow: 0 0 14px rgb(var(--neon-green-rgb) / 0.35), inset 0 0 12px rgb(var(--neon-blue-rgb) / 0.12);
+}
+
+.settings-panel .cyber-select option {
+  background-color: #050505;
+  color: var(--neon-green);
+}
+
+/* File picker trigger styled to match the settings-panel cyber-select dropdowns. */
+.cyber-file-button {
+  width: var(--control-w);
+  min-width: var(--control-w);
+  height: var(--control-h);
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  background-color: rgba(0, 0, 0, 0.65);
+  border: 1px solid var(--neon-blue);
+  color: var(--neon-green);
+  font-family: var(--font-mono);
+  font-size: 0.9rem;
+  font-weight: 700;
+  text-align: left;
+  text-shadow: 0 0 6px rgb(var(--neon-green-rgb) / 0.35);
+  box-shadow: inset 0 0 12px rgb(var(--neon-blue-rgb) / 0.08);
+  outline: none;
+  cursor: pointer;
+  transition: all 0.2s;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cyber-file-button:hover,
+.cyber-file-button:focus {
+  border-color: var(--neon-green);
+  background-color: rgb(var(--neon-green-rgb) / 0.08);
+  box-shadow: 0 0 14px rgb(var(--neon-green-rgb) / 0.35), inset 0 0 12px rgb(var(--neon-blue-rgb) / 0.12);
+}
 .mobile-upload-divider {
-  font-family: 'Fira Code', monospace;
+  font-family: var(--font-mono);
   font-size: 0.7rem;
   color: var(--text-muted);
   font-weight: bold;
@@ -783,12 +1092,12 @@ input[type="radio"] {
 }
 
 .cyber-button-pink {
-  background: rgba(255, 0, 153, 0.1);
+  background: rgb(var(--neon-pink-rgb) / 0.1);
   border: 1px solid var(--neon-pink);
   color: var(--neon-pink);
   padding: 8px 16px;
   border-radius: 4px;
-  font-family: 'Inter', sans-serif;
+  font-family: var(--font-ui);
   font-size: 0.9rem;
   font-weight: 600;
   cursor: pointer;
@@ -798,8 +1107,8 @@ input[type="radio"] {
 }
 
 .cyber-button-pink:hover {
-  background: rgba(255, 0, 153, 0.3);
-  box-shadow: 0 0 15px rgba(255, 0, 153, 0.4);
+  background: rgb(var(--neon-pink-rgb) / 0.3);
+  box-shadow: 0 0 15px rgb(var(--neon-pink-rgb) / 0.4);
 }
 
 .cyber-button-pink:active {

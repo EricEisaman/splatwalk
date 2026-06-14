@@ -64,6 +64,7 @@
                             <option
                                 value="https://raw.githubusercontent.com/EricEisaman/assets/main/environment/splats/industrial_warehouse.ply">
                                 Industrial Warehouse (.ply)</option>
+                            <option value="/sample.ply">Sample (.ply)</option>
                         </select>
                         <div class="mobile-upload-divider">OR</div>
                         <button id="chooseFileBtn" class="cyber-button-pink">CHOOSE LOCAL FILE</button>
@@ -121,7 +122,7 @@
                                 </div>
                             </div>
 
-                            <div class="control-row" style="margin-top: 15px;">
+                            <div class="control-row">
                                 <label>Mode:</label>
                                 <div class="radio-cards" id="reconModeGroup">
                                     <label>
@@ -168,17 +169,22 @@
                                     <input type="number" id="paramRansacThresh" value="0.16" step="0.01" min="0.01"
                                         max="1">
                                 </div>
-                                <div class="nav-button-group" style="margin-top: 10px; display: flex; gap: 10px;">
-                                    <button id="defineRegionBtn" class="cyber-button secondary"
-                                        style="font-size: 0.8rem; padding: 8px;">DEFINE REGION</button>
-                                    <button id="clearRegionBtn" class="cyber-button tertiary"
-                                        style="font-size: 0.8rem; padding: 8px; display: none;">CLEAR</button>
+                                <div class="nav-button-group">
+                                    <button id="defineRegionBtn" class="cyber-button secondary small">DEFINE REGION</button>
+                                    <button id="clearRegionBtn" class="cyber-button tertiary small"
+                                        style="display: none;">CLEAR</button>
                                 </div>
                             </div>
 
-                            <button id="processBtn" class="cyber-button" style="margin-top: 20px;">
-                                GENERATE MESH
-                            </button>
+                            <div class="setup-action-stack">
+                                <button id="processBtn" class="cyber-button">
+                                    GENERATE MESH
+                                </button>
+                                <button id="fastNavBtn" class="cyber-button cyber-button-fast"
+                                    title="Generate collider, navmesh, crowd, and NPC with conservative defaults.">
+                                    FAST NAV
+                                </button>
+                            </div>
                         </div>
 
                         <!-- Section 2: Results (Hidden initially) -->
@@ -198,11 +204,18 @@
                                 <input type="range" id="meshOpacity" min="0" max="1" step="0.1" value="0.5">
                             </div>
 
-                            <div id="downloadContainer" style="margin-top: 15px;">
+                                <div id="downloadContainer">
                                 <button id="downloadBtn" class="cyber-button">DOWNLOAD .GLB</button>
                             </div>
 
-                            <div class="section-title nav-section-title" style="margin-top: 20px;">Navigation (BETA)
+                            <div class="section-title nav-section-title">Navigation (BETA)
+                            </div>
+                            <div class="nav-legend">
+                                <div class="nav-legend-title">Navigation Legend</div>
+                                <div><span class="legend-swatch navmesh"></span> Green overlay: walkable navmesh</div>
+                                <div><span class="legend-swatch seed"></span> Magenta sphere: seed / start probe</div>
+                                <div><span class="legend-swatch player"></span> Blue cube: player agent</div>
+                                <div><span class="legend-swatch npc"></span> Green sphere: NPC agent</div>
                             </div>
 
                             <div class="control-row">
@@ -230,15 +243,173 @@
                                 <input type="number" id="paramNavSlope" value="45" step="5" min="0" max="90">
                             </div>
 
-                            <div class="nav-button-group"
-                                style="margin-top: 15px; display: flex; flex-direction: column; gap: 10px;">
+                            <div class="section-title nav-section-title">Voxel Collision / NavMesh</div>
+                            <div class="control-row">
+                                <label title="Use generated collision from the splat or import a dedicated collider GLB from PlayCanvas/SuperSplat/World Labs.">Collider Source:</label>
+                                <select id="paramColliderSource" class="cyber-select">
+                                    <option value="generated" selected>Generate</option>
+                                    <option value="imported">Import GLB</option>
+                                </select>
+                            </div>
+                            <div class="control-row">
+                                <label title="Import a .collision.glb or World Labs Collider Mesh GLB.">Collider GLB:</label>
+                                <button type="button" id="colliderGlbBtn" class="cyber-file-button" title="Import a .collision.glb or World Labs Collider Mesh GLB.">Import GLB</button>
+                                <input type="file" id="colliderGlbInput" accept=".glb,.gltf" hidden>
+                            </div>
+                            <div class="control-row">
+                                <label>Show Collider:</label>
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="showColliderMesh" checked>
+                                    <span class="slider"></span>
+                                </label>
+                            </div>
+                            <div class="control-row">
+                                <label>Collider Opacity:</label>
+                                <input type="range" id="colliderOpacity" min="0" max="1" step="0.1" value="0.35">
+                            </div>
+                            <div class="control-row">
+                                <label title="PlayCanvas/SuperSplat-style scene handling for voxel fill/carve.">Scene Type:</label>
+                                <select id="paramCollisionSceneType" class="cyber-select">
+                                    <option value="outdoor" selected>Outdoor</option>
+                                    <option value="indoor">Indoor</option>
+                                    <option value="object">Object</option>
+                                </select>
+                            </div>
+                            <div class="control-row">
+                                <label title="Voxel edge length in meters for collision generation. SuperSplat defaults near 0.05m.">Voxel Size:</label>
+                                <input type="number" id="paramCollisionVoxelSize" value="0.08" step="0.01" min="0.025">
+                            </div>
+                            <div class="control-row">
+                                <label title="Minimum accumulated splat density needed to mark a voxel solid.">Opacity Threshold:</label>
+                                <input type="number" id="paramCollisionOpacityThreshold" value="0.10" step="0.01" min="0.001">
+                            </div>
+                            <div class="control-row">
+                                <label title="World-space X seed for cluster filtering and capsule carve.">Seed X:</label>
+                                <input type="number" id="paramCollisionSeedX" value="0" step="0.1">
+                            </div>
+                            <div class="control-row">
+                                <label title="World-space Y seed, roughly where a visitor/capsule can stand.">Seed Y:</label>
+                                <input type="number" id="paramCollisionSeedY" value="1" step="0.1">
+                            </div>
+                            <div class="control-row">
+                                <label title="World-space Z seed for cluster filtering and capsule carve.">Seed Z:</label>
+                                <input type="number" id="paramCollisionSeedZ" value="0" step="0.1">
+                            </div>
+                            <div class="nav-button-group">
+                                <button id="useRegionSeedBtn" class="cyber-button tertiary small">USE REGION CENTER SEED</button>
+                            </div>
+                            <div class="control-row">
+                                <label title="Fill/seal distance used for indoor external fill or outdoor floor fill.">Fill Size:</label>
+                                <input type="number" id="paramCollisionFillSize" value="1.2" step="0.1" min="0">
+                            </div>
+                            <div class="control-row">
+                                <label title="Capsule height for reachable-space carving.">Carve Height:</label>
+                                <input type="number" id="paramCollisionCarveHeight" value="1.6" step="0.1" min="0.1">
+                            </div>
+                            <div class="control-row">
+                                <label title="Capsule radius for reachable-space carving.">Carve Radius:</label>
+                                <input type="number" id="paramCollisionCarveRadius" value="0.25" step="0.05" min="0.05">
+                            </div>
+                            <div class="control-row">
+                                <label title="Collision mesh emitted from the voxel grid. Faces is exact and stable; smooth is reserved.">Mesh Mode:</label>
+                                <select id="paramCollisionMeshMode" class="cyber-select">
+                                    <option value="faces" selected>faces</option>
+                                    <option value="smooth" disabled>smooth (coming soon)</option>
+                                </select>
+                            </div>
+
+                            <details>
+                                <summary class="section-title nav-section-title">Experimental 2.5D SDF Debug</summary>
+                            <div class="control-row">
+                                <label title="Explicit 2.5D SDF cell size. Leave empty to derive from Voxel Target.">SDF Cell Size:</label>
+                                <input type="number" id="paramSdfCellSize" value="0.15" step="0.01" min="0.03">
+                            </div>
+                            <div class="control-row">
+                                <label title="Vertical bin size for each 2.5D SDF column density profile.">SDF Y Bin:</label>
+                                <input type="number" id="paramSdfVerticalCellSize" value="0.05" step="0.01" min="0.01">
+                            </div>
+                            <div class="control-row">
+                                <label title="Density threshold used to extract surface layers from each column profile.">Density Threshold:</label>
+                                <input type="number" id="paramSdfDensityThreshold" value="0.08" step="0.01" min="0.001">
+                            </div>
+                            <div class="control-row">
+                                <label title="Maximum accepted surface layers per column before marking as variance/multi-layer.">Max Layers:</label>
+                                <input type="number" id="paramSdfMaxLayers" value="2" step="1" min="1" max="4">
+                            </div>
+                            <div class="control-row">
+                                <label title="Neighbor radius for smoothing compatible SDF surface heights.">SDF Smooth:</label>
+                                <input type="number" id="paramSdfSmoothingRadius" value="1" step="1" min="0" max="4">
+                            </div>
+                            <div class="control-row">
+                                <label title="Scale factor for each splat influence radius when writing X/Z density cells.">Influence Scale:</label>
+                                <input type="number" id="paramSdfInfluenceRadiusScale" value="2.5" step="0.1" min="0.5" max="6">
+                            </div>
+                            <div class="control-row">
+                                <label title="Floor projection tolerance around the RANSAC floor plane.">Floor Epsilon:</label>
+                                <input type="number" id="paramFloorProjectionEpsilon" value="0.16" step="0.01" min="0.01">
+                            </div>
+                            <div class="control-row">
+                                <label title="Height above floor plane that counts as obstacle evidence.">Obstacle Epsilon:</label>
+                                <input type="number" id="paramObstacleHeightEpsilon" value="0.24" step="0.01" min="0.01">
+                            </div>
+                            <div class="control-row">
+                                <label title="Maximum local floor height variance accepted as walkable.">Max Variance:</label>
+                                <input type="number" id="paramMaxLocalHeightVariance" value="0.08" step="0.01" min="0.001">
+                            </div>
+                            <div class="control-row">
+                                <label title="Minimum accumulated floor confidence per cell.">Min Confidence:</label>
+                                <input type="number" id="paramMinFloorConfidence" value="0.01" step="0.005" min="0">
+                            </div>
+                            <div class="control-row">
+                                <label title="Only low-confidence cells can be filled within this cell radius.">Hole Fill Radius:</label>
+                                <input type="number" id="paramHoleFillRadius" value="1" step="1" min="0" max="8">
+                            </div>
+                            <div class="control-row">
+                                <label title="Erode accepted floor by agent radius before component selection.">Agent Erosion:</label>
+                                <input type="number" id="paramAgentRadiusErode" value="0" step="0.05" min="0">
+                            </div>
+                            <div class="control-row">
+                                <label title="Which connected component to keep after erosion.">Component Mode:</label>
+                                <select id="paramComponentMode" class="cyber-select">
+                                    <option value="largest" selected>largest</option>
+                                    <option value="nearest_region_center">nearest_region_center</option>
+                                </select>
+                            </div>
+                            <div class="control-row" style="align-items: flex-start;">
+                                <label>Overlay States:</label>
+                                <div class="cyber-check-grid">
+                                    <label class="cyber-check"><input type="checkbox" class="ground-field-state"
+                                            value="walkable" checked><span></span> walkable</label>
+                                    <label class="cyber-check"><input type="checkbox" class="ground-field-state"
+                                            value="filled" checked><span></span> filled</label>
+                                    <label class="cyber-check"><input type="checkbox" class="ground-field-state"
+                                            value="obstacle" checked><span></span> obstacle</label>
+                                    <label class="cyber-check"><input type="checkbox" class="ground-field-state"
+                                            value="height_variance" checked><span></span> height variance</label>
+                                    <label class="cyber-check"><input type="checkbox" class="ground-field-state"
+                                            value="low_confidence"><span></span> low confidence</label>
+                                    <label class="cyber-check"><input type="checkbox" class="ground-field-state"
+                                            value="void"><span></span> void</label>
+                                    <label class="cyber-check"><input type="checkbox" class="ground-field-state"
+                                            value="eroded"><span></span> eroded</label>
+                                    <label class="cyber-check"><input type="checkbox" class="ground-field-state"
+                                            value="discarded_component"><span></span> discarded</label>
+                                </div>
+                            </div>
+                            <div class="nav-button-group">
+                                <button id="generateFieldOverlayBtn" class="cyber-button tertiary small">SHOW SDF DEBUG</button>
+                                <button id="clearFieldOverlayBtn" class="cyber-button tertiary small">CLEAR OVERLAY</button>
+                            </div>
+                            </details>
+
+                            <div class="nav-button-group stack">
                                 <button id="generateNavBtn" class="cyber-button secondary">GENERATE NAVMESH</button>
                                 <button id="downloadNavBtn" class="cyber-button secondary"
                                     style="display: none;">DOWNLOAD NAVMESH</button>
                             </div>
 
                             <!-- NPC Simulation -->
-                            <div id="simulationSection" style="margin-top: 20px; display: none;">
+                            <div id="simulationSection" style="display: none;">
                                 <div class="section-title">Simulation</div>
                                 <button id="addNpcBtn" class="cyber-button tertiary">ADD NPC</button>
                                 <div style="font-size: 11px; opacity: 0.7; margin-top: 5px;">
@@ -261,15 +432,6 @@
         </div>
     </div>
 
-    <script>
-        if ('serviceWorker' in navigator) {
-            window.addEventListener('load', () => {
-                navigator.serviceWorker.register('/sw.js')
-                    .then(reg => console.log('Service Worker registered', reg))
-                    .catch(err => console.error('Service Worker registration failed', err));
-            });
-        }
-    </script>
     <script type="module" src="./src/pages/splatwalk.ts"></script>
 </body>
 

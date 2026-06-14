@@ -2,6 +2,7 @@ import { defineConfig, type Plugin } from 'vite';
 import { resolve } from 'path';
 import { copyFileSync, mkdirSync, readdirSync, existsSync, rmSync, readFileSync, writeFileSync, statSync } from 'fs';
 import { join } from 'path';
+import { createHash } from 'node:crypto';
 
 // Custom plugin for dev server routing
 function devServerRouting(): Plugin {
@@ -642,9 +643,62 @@ function copyWasmModules(): Plugin {
   };
 }
 
+// Plugin to inject the wasm build hash into dist/sw.js.
+// Replaces the __SW_BUILD_ID__ placeholder in the service worker's CACHE_NAME
+// with a hash of the built wasm binary, so every new wasm build produces a new
+// cache id. The service worker clears all other caches on activation, meaning
+// integrators never have to manually discard cache to pick up a new build.
+function injectServiceWorkerBuildId(): Plugin {
+  const computeBuildId = (): string => {
+    const wasmPath = resolve(__dirname, 'pkg', 'wasm_splatwalk', 'wasm_splatwalk_bg.wasm');
+    if (!existsSync(wasmPath)) {
+      console.warn(`[inject-sw-build-id] Warning: wasm not found at ${wasmPath}, falling back to timestamp`);
+      return `t${Date.now().toString(36)}`;
+    }
+    const buf = readFileSync(wasmPath);
+    return createHash('sha256').update(buf).digest('hex').slice(0, 12);
+  };
+
+  const writeSwBuildId = (): void => {
+    const distSw = resolve(__dirname, 'dist', 'sw.js');
+    const publicSw = resolve(__dirname, 'public', 'sw.js');
+
+    // Ensure dist/sw.js exists (copy from public/ if a prior plugin didn't).
+    if (!existsSync(distSw)) {
+      if (!existsSync(publicSw)) {
+        console.warn(`[inject-sw-build-id] Warning: no sw.js found in dist/ or public/`);
+        return;
+      }
+      mkdirSync(resolve(__dirname, 'dist'), { recursive: true });
+      copyFileSync(publicSw, distSw);
+    }
+
+    const buildId = computeBuildId();
+    const original = readFileSync(distSw, 'utf-8');
+    const updated = original.replace(/__SW_BUILD_ID__/g, buildId);
+
+    if (updated === original) {
+      console.warn(`[inject-sw-build-id] Warning: __SW_BUILD_ID__ placeholder not found in dist/sw.js`);
+      return;
+    }
+
+    writeFileSync(distSw, updated, 'utf-8');
+    console.log(`[inject-sw-build-id] ✓ CACHE_NAME set to splatwalk-${buildId}`);
+  };
+
+  return {
+    name: 'inject-sw-build-id',
+    enforce: 'post',
+    // Run after copyPublicAssets has written dist/sw.js.
+    closeBundle() {
+      writeSwBuildId();
+    },
+  };
+}
+
 export default defineConfig({
   publicDir: 'public', // Explicitly enable public directory copying
-  plugins: [devServerRouting(), removeVitePreload(), rewriteWasmImports(), copyPublicAssets(), copyWasmModules()],
+  plugins: [devServerRouting(), removeVitePreload(), rewriteWasmImports(), copyPublicAssets(), copyWasmModules(), injectServiceWorkerBuildId()],
   worker: {
     format: 'es'  // Force ES modules for all workers (fixes IIFE error)
   },

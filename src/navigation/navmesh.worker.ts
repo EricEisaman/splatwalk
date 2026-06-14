@@ -6,6 +6,33 @@ const ctx: Worker = self as any;
 
 let isInitialized = false;
 
+function calculateBounds(positions: Float32Array | number[]): { min: [number, number, number], max: [number, number, number] } {
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+
+    for (let i = 0; i < positions.length; i += 3) {
+        const x = positions[i];
+        const y = positions[i + 1];
+        const z = positions[i + 2];
+
+        if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
+            continue;
+        }
+
+        minX = Math.min(minX, x);
+        minY = Math.min(minY, y);
+        minZ = Math.min(minZ, z);
+        maxX = Math.max(maxX, x);
+        maxY = Math.max(maxY, y);
+        maxZ = Math.max(maxZ, z);
+    }
+
+    return {
+        min: [minX, minY, minZ],
+        max: [maxX, maxY, maxZ],
+    };
+}
+
 async function initialize() {
     if (isInitialized) return;
     console.log('[WORKER] Initializing Recast WASM...');
@@ -24,10 +51,15 @@ ctx.onmessage = async (e: MessageEvent) => {
     }
 
     if (type === 'generate') {
-        const { positions, indices, params } = payload;
+        const { positions, indices, params, sourceLabel, splatBounds, colliderBounds } = payload;
 
         try {
             await initialize();
+
+            if (sourceLabel && !String(sourceLabel).includes('collider') && !String(sourceLabel).includes('floor_field')) {
+                ctx.postMessage({ type: 'error', payload: `Rejected non-collider Recast input source: ${sourceLabel}` });
+                return;
+            }
 
             // 1. Geometry Sanitization
             let nanCount = 0;
@@ -57,6 +89,16 @@ ctx.onmessage = async (e: MessageEvent) => {
             const height = maxY - minY;
             const depth = maxZ - minZ;
 
+            if (positions.length === 0 || indices.length === 0) {
+                ctx.postMessage({ type: 'error', payload: 'Collision mesh is empty. Check voxel seed, fill/carve settings, and scene type.' });
+                return;
+            }
+
+            if (![width, height, depth].every(Number.isFinite) || width <= 0 || height <= 0 || depth <= 0) {
+                ctx.postMessage({ type: 'error', payload: `Collision mesh bounds are invalid: ${width.toFixed(3)}x${height.toFixed(3)}x${depth.toFixed(3)}.` });
+                return;
+            }
+
             // 2. Vertical Headroom Padding
             // Recast needs vertical space to check agent height. If the mesh is too shallow,
             // we must pad the bounding box upwards.
@@ -85,10 +127,18 @@ ctx.onmessage = async (e: MessageEvent) => {
 
             const activeParams = { ...params, cs: finalCS };
 
-            console.log(`[WORKER] Pre-flight Diagnostics:`);
+            console.log(`[WORKER] Collider Pre-flight Diagnostics:`);
+            console.log(`[WORKER]   - Source: ${sourceLabel ?? 'collider_mesh'}`);
             console.log(`[WORKER]   - Size: ${width.toFixed(2)}x${height.toFixed(2)}x${depth.toFixed(2)}`);
+            console.log(`[WORKER]   - Geometry: ${positions.length / 3} vertices, ${indices.length / 3} triangles`);
             console.log(`[WORKER]   - Grid: ${gridW}x${gridD}x${gridH} (Total Cells: ${gridW * gridD * gridH})`);
             console.log(`[WORKER]   - Override: ${finalCS === params.cs ? 'None' : 'AUTO-SCALED to ' + finalCS}`);
+            if (splatBounds) {
+                console.log(`[WORKER]   - Splat Bounds: ${JSON.stringify(splatBounds.min)} to ${JSON.stringify(splatBounds.max)}`);
+            }
+            if (colliderBounds) {
+                console.log(`[WORKER]   - Collider Bounds: ${JSON.stringify(colliderBounds.min)} to ${JSON.stringify(colliderBounds.max)}`);
+            }
 
             if (gridW * gridD > 10000000) {
                 const error = `Voxel grid too dense (${gridW}x${gridD}). Increase Cell Size (cs).`;
@@ -195,6 +245,12 @@ ctx.onmessage = async (e: MessageEvent) => {
             const [rawDebugPositions, rawDebugIndices] = getNavMeshPositionsAndIndices(navMesh);
             const debugPositions = new Float32Array(rawDebugPositions);
             const debugIndices = new Uint32Array(rawDebugIndices);
+            const sourceBounds = {
+                min: [minX, minY, minZ] as [number, number, number],
+                max: [maxX, maxY, maxZ] as [number, number, number],
+            };
+            const debugBounds = calculateBounds(debugPositions);
+            console.log(`[WORKER]   - NavMesh Bounds: ${JSON.stringify(debugBounds.min)} to ${JSON.stringify(debugBounds.max)}`);
 
             // Serialize navmesh for transfer
             console.log('[WORKER] Serializing NavMesh binary data...');
@@ -213,7 +269,12 @@ ctx.onmessage = async (e: MessageEvent) => {
                         headroomPadding: paddedMaxY - maxY,
                         gridDim: [gridW, gridD, gridH],
                         avgUpDot,
-                        wasFlipped
+                        wasFlipped,
+                        sourceLabel: sourceLabel ?? 'collider_mesh',
+                        splatBounds,
+                        colliderBounds,
+                        sourceBounds,
+                        debugBounds
                     }
                 }
             }, [navMeshData.buffer, debugPositions.buffer, debugIndices.buffer] as any);

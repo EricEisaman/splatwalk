@@ -48,6 +48,10 @@ rustup target add wasm32-unknown-unknown 2>/dev/null || true
 # Cargo converts hyphens to underscores in output filenames
 # Use sed instead of tr for better Alpine Linux compatibility
 WASM_FILENAME=$(echo "$CRATE_NAME" | sed 's/-/_/g')
+TARGET_DIR=$(cargo metadata --format-version 1 --no-deps | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
+if [ -z "$TARGET_DIR" ]; then
+    TARGET_DIR="target"
+fi
 
 # Compile to wasm
 echo "Compiling $CRATE_NAME to WASM..."
@@ -57,23 +61,23 @@ echo "Compiling $CRATE_NAME to WASM..."
 echo "Cleaning previous build artifacts for $CRATE_NAME..."
 cargo clean --package "$CRATE_NAME" 2>/dev/null || true
 # Also explicitly remove WASM artifacts to force rebuild
-rm -f "target/wasm32-unknown-unknown/release/${WASM_FILENAME}.wasm" 2>/dev/null || true
-rm -f "target/wasm32-unknown-unknown/release/deps/${WASM_FILENAME}*" 2>/dev/null || true
+rm -f "$TARGET_DIR/wasm32-unknown-unknown/release/${WASM_FILENAME}.wasm" 2>/dev/null || true
+rm -f "$TARGET_DIR/wasm32-unknown-unknown/release/deps/${WASM_FILENAME}*" 2>/dev/null || true
 # Remove incremental compilation artifacts for this package
-rm -rf "target/wasm32-unknown-unknown/release/incremental/${WASM_FILENAME}*" 2>/dev/null || true
+rm -rf "$TARGET_DIR/wasm32-unknown-unknown/release/incremental/${WASM_FILENAME}*" 2>/dev/null || true
 
 if ! cargo build --target wasm32-unknown-unknown --release --package "$CRATE_NAME"; then
     echo "ERROR: cargo build failed for $CRATE_NAME" >&2
     exit 1
 fi
-INPUT_WASM="target/wasm32-unknown-unknown/release/${WASM_FILENAME}.wasm"
+INPUT_WASM="$TARGET_DIR/wasm32-unknown-unknown/release/${WASM_FILENAME}.wasm"
 
 # Verify input WASM file exists and has reasonable size before running wasm-bindgen
 if [ ! -f "$INPUT_WASM" ]; then
     echo "ERROR: Input WASM file not found: $INPUT_WASM" >&2
     echo "Expected location after cargo build --package $CRATE_NAME" >&2
     echo "Available WASM files in target directory:" >&2
-    ls -lh target/wasm32-unknown-unknown/release/*.wasm 2>/dev/null || echo "  (none found)" >&2
+    ls -lh "$TARGET_DIR"/wasm32-unknown-unknown/release/*.wasm 2>/dev/null || echo "  (none found)" >&2
     exit 1
 fi
 

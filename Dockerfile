@@ -13,7 +13,7 @@ RUN apk add --no-cache \
 
 # Install wasm-bindgen-cli
 # Version must match wasm-bindgen crate version in Cargo.toml
-# Using 0.2.106 which is compatible with Rust 1.71+ and matches "0.2" in Cargo.toml
+# Using 0.2.106 to match the exact wasm-bindgen crate pin in Cargo.toml
 RUN cargo install wasm-bindgen-cli --version 0.2.106
 
 # Ensure wasm-bindgen is in PATH (cargo install puts it in ~/.cargo/bin)

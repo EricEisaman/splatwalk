@@ -1,10 +1,10 @@
 import { Viewer } from '../scene/Viewer';
 import { DropZone } from '../components/DropZone';
-import { splatwalk } from '../wasm/bridge';
+import { splatwalk, type GroundFieldCellState, type MeshSettings, type WalkableGroundFieldResult } from '../wasm/bridge';
 import { Mesh, VertexData, StandardMaterial, Color3 } from '@babylonjs/core';
-import { extractGeometry } from '../navigation/navigation';
 /// <reference types="vite/client" />
 import NavWorker from '../navigation/navmesh.worker?worker';
+import { registerServiceWorker, setupOfflineHandling } from '../pwa/sw-register';
 
 async function main() {
     const canvas = document.getElementById('renderCanvas') as HTMLCanvasElement;
@@ -13,8 +13,9 @@ async function main() {
 
     // Custom Logger
     const originalLog = console.log;
-    console.log = (...args) => {
-        originalLog(...args);
+    const originalWarn = console.warn;
+    const originalError = console.error;
+    const appendSystemLog = (...args: unknown[]) => {
         const msg = args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ');
         if (logDiv) {
             const entry = document.createElement('div');
@@ -31,6 +32,14 @@ async function main() {
                 tag = "WAIT";
                 typeClass = "log-tag-wait";
                 content = msg.substring(6).trim();
+            } else if (msg.startsWith("[WARN]")) {
+                tag = "WARN";
+                typeClass = "log-tag-wait";
+                content = msg.substring(6).trim();
+            } else if (msg.startsWith("[ERROR]")) {
+                tag = "ERROR";
+                typeClass = "log-tag-error";
+                content = msg.substring(7).trim();
             } else if (msg.startsWith("[WORKER]")) {
                 tag = "WORKER";
                 typeClass = "log-tag-worker";
@@ -72,6 +81,23 @@ async function main() {
             logDiv.scrollTop = logDiv.scrollHeight;
         }
     };
+    console.log = (...args) => {
+        originalLog(...args);
+        appendSystemLog(...args);
+    };
+    console.warn = (...args) => {
+        originalWarn(...args);
+        appendSystemLog(...args);
+    };
+    console.error = (...args) => {
+        originalError(...args);
+        appendSystemLog(...args);
+    };
+
+    // Register the service worker (prod) or self-heal stale caches (dev) so a
+    // rebuilt wasm is always picked up without manual cache clearing.
+    registerServiceWorker();
+    setupOfflineHandling();
 
     const logError = (msg: string) => {
         if (errorDiv) {
@@ -87,7 +113,7 @@ async function main() {
             errorDiv.scrollIntoView({ behavior: 'smooth', block: 'center' });
             errorDiv.focus();
         }
-        console.error(msg);
+        console.error(`[ERROR] ${msg}`);
     }
 
     // UI Elements
@@ -141,6 +167,7 @@ async function main() {
     // UI Event Listeners placeholder (will be attached to mesh once created)
     let currentMesh: Mesh | null = null;
     let currentMat: StandardMaterial | null = null;
+    let importedColliderGeometry: { positions: Float32Array, indices: Uint32Array } | null = null;
 
     if (showMeshCheckbox) {
         showMeshCheckbox.addEventListener('change', () => {
@@ -173,6 +200,57 @@ async function main() {
 
         // Init Viewer
         const viewer = new Viewer(canvas);
+        // Expose the viewer for dev-only end-to-end visual tests (camera framing).
+        if (import.meta.env.DEV) {
+            (window as unknown as { __splatwalkViewer?: Viewer }).__splatwalkViewer = viewer;
+        }
+        const colliderGlbInput = document.getElementById('colliderGlbInput') as HTMLInputElement | null;
+        const colliderGlbBtn = document.getElementById('colliderGlbBtn') as HTMLButtonElement | null;
+        const showColliderCheckbox = document.getElementById('showColliderMesh') as HTMLInputElement | null;
+        const colliderOpacitySlider = document.getElementById('colliderOpacity') as HTMLInputElement | null;
+
+        const setColliderGlbLabel = (name: string | null) => {
+            if (colliderGlbBtn) colliderGlbBtn.textContent = name ?? 'Import GLB';
+        };
+
+        colliderGlbBtn?.addEventListener('click', () => colliderGlbInput?.click());
+
+        colliderGlbInput?.addEventListener('change', async () => {
+            const colliderFile = colliderGlbInput.files?.[0];
+            if (!colliderFile) {
+                setColliderGlbLabel(null);
+                return;
+            }
+            if (!/\.(glb|gltf)$/i.test(colliderFile.name)) {
+                logError("Collider import requires a .glb or .gltf file.");
+                setColliderGlbLabel(null);
+                return;
+            }
+
+            try {
+                const opacity = Number.parseFloat(colliderOpacitySlider?.value ?? '0.35') || 0.35;
+                importedColliderGeometry = await viewer.loadColliderMesh(colliderFile, opacity);
+                if (showColliderCheckbox) {
+                    viewer.setColliderVisible(showColliderCheckbox.checked);
+                }
+                const sourceSelect = document.getElementById('paramColliderSource') as HTMLSelectElement | null;
+                if (sourceSelect) sourceSelect.value = 'imported';
+                setColliderGlbLabel(colliderFile.name);
+                console.log(`[INFO] Imported dedicated collider mesh: ${colliderFile.name}`);
+            } catch (error) {
+                importedColliderGeometry = null;
+                setColliderGlbLabel(null);
+                logError(`Collider GLB import failed: ${error}`);
+            }
+        });
+
+        showColliderCheckbox?.addEventListener('change', () => {
+            viewer.setColliderVisible(showColliderCheckbox.checked);
+        });
+
+        colliderOpacitySlider?.addEventListener('input', () => {
+            viewer.setColliderOpacity(Number.parseFloat(colliderOpacitySlider.value));
+        });
 
         // Resize handling for Fullscreen
         document.addEventListener('fullscreenchange', () => {
@@ -200,7 +278,981 @@ async function main() {
 
             // 1. Visualize input splat
             await viewer.loadGaussianSplat(file);
+            importedColliderGeometry = null;
+            if (colliderGlbInput) colliderGlbInput.value = '';
+            setColliderGlbLabel(null);
             console.log("[INFO] Input splat visualized. Ready for setup.");
+
+            let splatBytesPromise: Promise<Uint8Array> | null = null;
+
+            const readSplatBytes = async (): Promise<Uint8Array> => {
+                if (!splatBytesPromise) {
+                    splatBytesPromise = (async () => {
+                        let buffer: ArrayBuffer;
+
+                        if (file.name.toLowerCase().endsWith('.spz')) {
+                            console.log("[INFO] Detected .spz file. Decompressing...");
+                            if ('DecompressionStream' in window) {
+                                const ds = new DecompressionStream('gzip');
+                                const decompressedStream = file.stream().pipeThrough(ds);
+                                buffer = await new Response(decompressedStream).arrayBuffer();
+                                console.log(`[INFO] Decompressed .spz to ${buffer.byteLength} bytes.`);
+                            } else {
+                                throw new Error("Browser does not support DecompressionStream. Cannot read .spz files.");
+                            }
+                        } else {
+                            buffer = await file.arrayBuffer();
+                        }
+
+                        return new Uint8Array(buffer);
+                    })();
+                }
+
+                return splatBytesPromise;
+            };
+
+            let generatedNavData: Uint8Array | null = null;
+            // Track whether a navmesh has been built and which path produced it, so a manual
+            // splat rotation can re-run the same generation and keep the navmesh, spawn point
+            // and agents aligned with the re-oriented splat.
+            let navHasBeenGenerated = false;
+            let lastNavUsedFastPath = true;
+            let realignNavTimer: ReturnType<typeof setTimeout> | null = null;
+
+            const ensureFastCollisionSeed = async (bytes: Uint8Array): Promise<number[] | null> => {
+                const seedX = document.getElementById('paramCollisionSeedX') as HTMLInputElement | null;
+                const seedY = document.getElementById('paramCollisionSeedY') as HTMLInputElement | null;
+                const seedZ = document.getElementById('paramCollisionSeedZ') as HTMLInputElement | null;
+                if (!seedX || !seedY || !seedZ) return null;
+
+                const regionBounds = viewer.getRegionBounds();
+                const carveHeightInput = document.getElementById('paramCollisionCarveHeight') as HTMLInputElement | null;
+                const carveHeight = Number.parseFloat(carveHeightInput?.value ?? '1.6') || 1.6;
+
+                let seed: number[];
+                if (regionBounds) {
+                    seed = [
+                        (regionBounds.min[0] + regionBounds.max[0]) * 0.5,
+                        regionBounds.min[1] + carveHeight * 0.5,
+                        (regionBounds.min[2] + regionBounds.max[2]) * 0.5,
+                    ];
+                } else {
+                    const suggested = splatwalk.suggestRegion(bytes, buildMeshSettings(false));
+                    seed = [
+                        (suggested.region_min[0] + suggested.region_max[0]) * 0.5,
+                        suggested.floor_y + carveHeight * 0.5,
+                        (suggested.region_min[2] + suggested.region_max[2]) * 0.5,
+                    ];
+                }
+
+                seedX.value = seed[0].toFixed(3);
+                seedY.value = seed[1].toFixed(3);
+                seedZ.value = seed[2].toFixed(3);
+                viewer.displaySeedMarker(seed);
+                console.log(`[INFO] Fast path seed: ${seed.map((v) => v.toFixed(3)).join(', ')}`);
+                return seed;
+            };
+
+            const buildFastFieldSettings = (base: MeshSettings, seed: number[] | null): MeshSettings => {
+                return {
+                    ...base,
+                    mode: 2,
+                    voxel_target: Math.max(base.voxel_target ?? 4000, 9000),
+                    min_alpha: Math.max(base.min_alpha ?? 0.05, 0.08),
+                    max_scale: Math.min(base.max_scale ?? 5.0, 3.5),
+                    sdf_cell_size: 0.14,
+                    sdf_vertical_cell_size: 0.05,
+                    sdf_density_threshold: 0.06,
+                    sdf_max_layers: 2,
+                    sdf_smoothing_radius: 2,
+                    sdf_influence_radius_scale: 2.6,
+                    floor_projection_epsilon: 0.20,
+                    obstacle_height_epsilon: 0.34,
+                    obstacle_clearance_min: 0.18,
+                    obstacle_clearance_max: 1.7,
+                    max_local_height_variance: 0.14,
+                    min_floor_confidence: 0.005,
+                    hole_fill_radius: 2,
+                    agent_radius_erode: 0,
+                    component_mode: 'all',
+                    collision_seed: seed ?? base.collision_seed,
+                    collision_carve_height: 1.7,
+                    collision_carve_radius: 0.35,
+                };
+            };
+
+            type FastFloorMesh = {
+                positions: Float32Array;
+                indices: Uint32Array;
+                selectedCellCount: number;
+                acceptedCellCount: number;
+                obstacleCellCount: number;
+                rejectedCellCount: number;
+                selectedArea: number;
+                centroid: [number, number, number];
+                componentCount: number;
+            };
+
+            const buildFastFloorMesh = (field: WalkableGroundFieldResult, seed: number[] | null): FastFloorMesh & { fallbackUsed: boolean, seedDistance: number } => {
+                const width = field.width;
+                const height = field.height;
+                const stateCounts = field.cells.reduce<Record<string, number>>((counts, cell) => {
+                    counts[cell.state] = (counts[cell.state] ?? 0) + 1;
+                    return counts;
+                }, {});
+                const obstacleCellCount = (stateCounts.obstacle ?? 0) + (stateCounts.height_variance ?? 0);
+
+                const origin = field.basis.origin;
+                const tangent = field.basis.tangent;
+                const bitangent = field.basis.bitangent;
+                const up = field.basis.up;
+                const pointAt = (col: number, row: number, cellHeight: number): [number, number, number] => [
+                    origin[0] + tangent[0] * col * field.cell_size + bitangent[0] * row * field.cell_size + up[0] * cellHeight,
+                    origin[1] + tangent[1] * col * field.cell_size + bitangent[1] * row * field.cell_size + up[1] * cellHeight,
+                    origin[2] + tangent[2] * col * field.cell_size + bitangent[2] * row * field.cell_size + up[2] * cellHeight,
+                ];
+                const cellCenter = (idx: number): [number, number, number] => {
+                    const row = Math.floor(idx / width);
+                    const col = idx % width;
+                    const cell = field.cells[idx];
+                    return pointAt(col + 0.5, row + 0.5, Number.isFinite(cell.height) ? cell.height : 0);
+                };
+
+                const buildMask = (relaxed: boolean): boolean[] => field.cells.map((cell) => {
+                    if (cell.state === 'walkable' || cell.state === 'filled') return true;
+                    if (!relaxed) return false;
+                    if (!Number.isFinite(cell.height)) return false;
+                    if (cell.state === 'discarded_component') return true;
+                    if (cell.state === 'low_confidence') {
+                        return cell.variance <= 0.18 && cell.obstacle_score <= 0.42;
+                    }
+                    if (cell.state === 'height_variance') {
+                        return cell.confidence >= 0.01 && cell.variance <= 0.08 && cell.obstacle_score <= 0.35;
+                    }
+                    if (cell.state === 'obstacle') {
+                        return cell.confidence >= 0.02 && cell.variance <= 0.05 && cell.obstacle_score <= 0.52;
+                    }
+                    return false;
+                });
+
+                const collectComponents = (mask: boolean[]): Array<{ cells: number[], centroid: [number, number, number], distanceToSeed: number }> => {
+                    const visited = new Uint8Array(field.cells.length);
+                    const components: Array<{ cells: number[], centroid: [number, number, number], distanceToSeed: number }> = [];
+                    for (let start = 0; start < field.cells.length; start++) {
+                        if (!mask[start] || visited[start]) continue;
+                        const queue = [start];
+                        const cells: number[] = [];
+                        visited[start] = 1;
+                        let sx = 0;
+                        let sy = 0;
+                        let sz = 0;
+
+                        while (queue.length > 0) {
+                            const idx = queue.shift()!;
+                            cells.push(idx);
+                            const center = cellCenter(idx);
+                            sx += center[0];
+                            sy += center[1];
+                            sz += center[2];
+                            const row = Math.floor(idx / width);
+                            const col = idx % width;
+                            const neighbors = [
+                                row > 0 ? idx - width : -1,
+                                row + 1 < height ? idx + width : -1,
+                                col > 0 ? idx - 1 : -1,
+                                col + 1 < width ? idx + 1 : -1,
+                            ];
+                            for (const next of neighbors) {
+                                if (next >= 0 && mask[next] && !visited[next]) {
+                                    visited[next] = 1;
+                                    queue.push(next);
+                                }
+                            }
+                        }
+
+                        const inv = 1 / cells.length;
+                        const centroid: [number, number, number] = [sx * inv, sy * inv, sz * inv];
+                        const distanceToSeed = seed
+                            ? Math.hypot(centroid[0] - seed[0], centroid[1] - seed[1], centroid[2] - seed[2])
+                            : 0;
+                        components.push({ cells, centroid, distanceToSeed });
+                    }
+                    return components;
+                };
+
+                const selectComponent = (components: Array<{ cells: number[], centroid: [number, number, number], distanceToSeed: number }>) => {
+                    const minCells = 20;
+                    const minArea = 1.2;
+                    const maxSeedDistance = 3.25;
+                    const viableComponents = components.filter((component) => {
+                        const area = component.cells.length * field.cell_size * field.cell_size;
+                        return component.cells.length >= minCells && area >= minArea;
+                    });
+                    if (viableComponents.length === 0) return null;
+                    const seedNear = seed
+                        ? viableComponents.filter((component) => component.distanceToSeed <= maxSeedDistance)
+                        : viableComponents;
+                    const candidates = seedNear.length > 0 ? seedNear : viableComponents;
+                    candidates.sort((a, b) => {
+                        if (!seed || seedNear.length === 0) return b.cells.length - a.cells.length;
+                        const score = (component: typeof a): number => {
+                            const area = component.cells.length * field.cell_size * field.cell_size;
+                            return component.distanceToSeed - Math.sqrt(area) * 0.45;
+                        };
+                        return score(a) - score(b) || b.cells.length - a.cells.length;
+                    });
+                    const selected = candidates[0];
+                    return {
+                        selected,
+                        usedLargestFallback: seedNear.length === 0 && !!seed,
+                    };
+                };
+
+                const MIN_ROOM_FLOOR_AREA = 4.0;
+                const areaOfSelection = (sel: { selected: { cells: number[] } }) =>
+                    sel.selected.cells.length * field.cell_size * field.cell_size;
+
+                const strictMask = buildMask(false);
+                const acceptedCellCount = strictMask.filter(Boolean).length;
+                const rejectedCellCount = field.cells.length - acceptedCellCount;
+                const strictComponents = collectComponents(strictMask);
+                let selection = selectComponent(strictComponents);
+                let selectedMask = strictMask;
+                let components = strictComponents;
+                let fallbackUsed = false;
+
+                // Use the relaxed mask when strict selection is missing or below the room-floor
+                // minimum, then keep whichever pass produced the larger usable floor.
+                if (!selection || areaOfSelection(selection) < MIN_ROOM_FLOOR_AREA) {
+                    const relaxedMask = buildMask(true);
+                    const relaxedComponents = collectComponents(relaxedMask);
+                    const relaxedSelection = selectComponent(relaxedComponents);
+                    if (relaxedSelection && (!selection || areaOfSelection(relaxedSelection) > areaOfSelection(selection))) {
+                        selection = relaxedSelection;
+                        selectedMask = relaxedMask;
+                        components = relaxedComponents;
+                        fallbackUsed = true;
+                        console.warn(
+                            `[WARN] Fast floor relaxed mask used: strictComponents=${strictComponents.length}, relaxedComponents=${relaxedComponents.length}, ` +
+                            `states=${JSON.stringify(stateCounts)}`
+                        );
+                    }
+                }
+
+                if (!selection) {
+                    const largest = [...components].sort((a, b) => b.cells.length - a.cells.length)[0];
+                    const largestArea = largest ? largest.cells.length * field.cell_size * field.cell_size : 0;
+                    throw new Error(
+                        `Fast nav could not find a viable floor component. ` +
+                        `Components=${components.length}, largest=${largest?.cells.length ?? 0} cells (${largestArea.toFixed(2)} m^2), ` +
+                        `states=${JSON.stringify(stateCounts)}. Define a floor region seed or import a Collider GLB.`
+                    );
+                }
+
+                const selected = selection.selected;
+                const selectedArea = selected.cells.length * field.cell_size * field.cell_size;
+                if (selectedArea < MIN_ROOM_FLOOR_AREA) {
+                    throw new Error(
+                        `Fast nav floor is too small to be a room (${selectedArea.toFixed(2)} m^2 < ${MIN_ROOM_FLOOR_AREA.toFixed(1)} m^2). ` +
+                        `components=${components.length}, accepted=${acceptedCellCount}, states=${JSON.stringify(stateCounts)}. ` +
+                        `Define a floor region seed inside the room, or import a Collider GLB.`
+                    );
+                }
+                if (selection.usedLargestFallback) {
+                    fallbackUsed = true;
+                    console.warn(
+                        `[WARN] Fast floor used largest viable island because no viable component was close to the seed: ` +
+                        `${selected.cells.length} cells, ${selectedArea.toFixed(2)} m^2, seedDistance=${selected.distanceToSeed.toFixed(2)}`
+                    );
+                } else if (components[0] !== selected) {
+                    console.warn(
+                        `[WARN] Fast floor ignored tiny or weak seed-near fragments and selected a viable floor island: ` +
+                        `${selected.cells.length} cells, ${selectedArea.toFixed(2)} m^2, seedDistance=${selected.distanceToSeed.toFixed(2)}`
+                    );
+                }
+
+                const positions: number[] = [];
+                const indices: number[] = [];
+                for (const idx of selected.cells) {
+                    const row = Math.floor(idx / width);
+                    const col = idx % width;
+                    const cell = field.cells[idx];
+                    const h = Number.isFinite(cell.height) ? cell.height : 0;
+                    const base = positions.length / 3;
+                    const p00 = pointAt(col, row, h);
+                    const p01 = pointAt(col, row + 1, h);
+                    const p11 = pointAt(col + 1, row + 1, h);
+                    const p10 = pointAt(col + 1, row, h);
+                    positions.push(...p00, ...p01, ...p11, ...p10);
+                    indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
+                }
+
+                console.log(
+                    `[INFO] Fast floor field: accepted=${acceptedCellCount}, obstacles=${obstacleCellCount}, ` +
+                    `rejected=${rejectedCellCount}, components=${components.length}, selectedCells=${selected.cells.length}, ` +
+                    `selectedArea=${selectedArea.toFixed(2)}, seedDistance=${selected.distanceToSeed.toFixed(2)}, ` +
+                    `maskCells=${selectedMask.filter(Boolean).length}, centroid=${selected.centroid.map((v) => v.toFixed(3)).join(', ')}`
+                );
+
+                return {
+                    positions: new Float32Array(positions),
+                    indices: new Uint32Array(indices),
+                    selectedCellCount: selected.cells.length,
+                    acceptedCellCount,
+                    obstacleCellCount,
+                    rejectedCellCount,
+                    selectedArea,
+                    centroid: selected.centroid,
+                    componentCount: components.length,
+                    fallbackUsed,
+                    seedDistance: selected.distanceToSeed,
+                };
+            };
+
+            const triangleArea = (positions: Float32Array, i0: number, i1: number, i2: number): number => {
+                const ax = positions[i1] - positions[i0];
+                const ay = positions[i1 + 1] - positions[i0 + 1];
+                const az = positions[i1 + 2] - positions[i0 + 2];
+                const bx = positions[i2] - positions[i0];
+                const by = positions[i2 + 1] - positions[i0 + 1];
+                const bz = positions[i2 + 2] - positions[i0 + 2];
+                const cx = ay * bz - az * by;
+                const cy = az * bx - ax * bz;
+                const cz = ax * by - ay * bx;
+                return 0.5 * Math.sqrt(cx * cx + cy * cy + cz * cz);
+            };
+
+            type NavIslandMetadata = {
+                area: number;
+                centroid: [number, number, number];
+                distanceToSeed: number;
+                triangleCount: number;
+                islandCount: number;
+            };
+
+            const filterNavmeshIslandNearSeed = (
+                positions: Float32Array,
+                indices: Uint32Array,
+                seed: number[] | null
+            ): { positions: Float32Array, indices: Uint32Array, metadata: NavIslandMetadata | null } => {
+                const triangleCount = Math.floor(indices.length / 3);
+                if (!seed || triangleCount <= 1) {
+                    return { positions, indices, metadata: null };
+                }
+
+                const vertexToTriangles = new Map<string, number[]>();
+                const vertexKey = (vertexIndex: number): string => {
+                    const p = vertexIndex * 3;
+                    return `${positions[p].toFixed(3)},${positions[p + 1].toFixed(3)},${positions[p + 2].toFixed(3)}`;
+                };
+
+                for (let tri = 0; tri < triangleCount; tri++) {
+                    for (let corner = 0; corner < 3; corner++) {
+                        const key = vertexKey(indices[tri * 3 + corner]);
+                        const triangles = vertexToTriangles.get(key);
+                        if (triangles) {
+                            triangles.push(tri);
+                        } else {
+                            vertexToTriangles.set(key, [tri]);
+                        }
+                    }
+                }
+
+                const visited = new Uint8Array(triangleCount);
+                const components: Array<{ triangles: number[], area: number, centroid: [number, number, number], distanceToSeed: number }> = [];
+                for (let startTri = 0; startTri < triangleCount; startTri++) {
+                    if (visited[startTri]) continue;
+
+                    const stack = [startTri];
+                    const component: number[] = [];
+                    visited[startTri] = 1;
+                    let area = 0;
+                    let weightedX = 0;
+                    let weightedY = 0;
+                    let weightedZ = 0;
+
+                    while (stack.length > 0) {
+                        const tri = stack.pop()!;
+                        component.push(tri);
+                        const i0 = indices[tri * 3] * 3;
+                        const i1 = indices[tri * 3 + 1] * 3;
+                        const i2 = indices[tri * 3 + 2] * 3;
+                        const triArea = triangleArea(positions, i0, i1, i2);
+                        area += triArea;
+                        const cx = (positions[i0] + positions[i1] + positions[i2]) / 3;
+                        const cy = (positions[i0 + 1] + positions[i1 + 1] + positions[i2 + 1]) / 3;
+                        const cz = (positions[i0 + 2] + positions[i1 + 2] + positions[i2 + 2]) / 3;
+                        weightedX += cx * triArea;
+                        weightedY += cy * triArea;
+                        weightedZ += cz * triArea;
+
+                        for (let corner = 0; corner < 3; corner++) {
+                            const neighbors = vertexToTriangles.get(vertexKey(indices[tri * 3 + corner])) ?? [];
+                            for (const nextTri of neighbors) {
+                                if (!visited[nextTri]) {
+                                    visited[nextTri] = 1;
+                                    stack.push(nextTri);
+                                }
+                            }
+                        }
+                    }
+
+                    const invArea = area > 0 ? 1 / area : 0;
+                    const centroid: [number, number, number] = [
+                        weightedX * invArea,
+                        weightedY * invArea,
+                        weightedZ * invArea,
+                    ];
+                    const dx = centroid[0] - seed[0];
+                    const dy = centroid[1] - seed[1];
+                    const dz = centroid[2] - seed[2];
+                    components.push({
+                        triangles: component,
+                        area,
+                        centroid,
+                        distanceToSeed: Math.sqrt(dx * dx + dy * dy + dz * dz),
+                    });
+                }
+
+                if (components.length <= 1) {
+                    const only = components[0];
+                    return {
+                        positions,
+                        indices,
+                        metadata: only ? {
+                            area: only.area,
+                            centroid: only.centroid,
+                            distanceToSeed: only.distanceToSeed,
+                            triangleCount,
+                            islandCount: 1,
+                        } : null,
+                    };
+                }
+
+                const largestArea = Math.max(...components.map((component) => component.area));
+                const viable = components.filter((component) => component.area >= largestArea * 0.08);
+                viable.sort((a, b) => a.distanceToSeed - b.distanceToSeed || b.area - a.area);
+                const selected = viable[0] ?? components.sort((a, b) => b.area - a.area)[0];
+
+                const remap = new Map<number, number>();
+                const filteredPositions: number[] = [];
+                const filteredIndices: number[] = [];
+                const addVertex = (oldIndex: number): number => {
+                    const existing = remap.get(oldIndex);
+                    if (existing !== undefined) return existing;
+                    const next = filteredPositions.length / 3;
+                    const p = oldIndex * 3;
+                    filteredPositions.push(positions[p], positions[p + 1], positions[p + 2]);
+                    remap.set(oldIndex, next);
+                    return next;
+                };
+
+                const orderedTriangles = [...selected.triangles].sort((a, b) => {
+                    const centroidDistance = (tri: number): number => {
+                        const i0 = indices[tri * 3] * 3;
+                        const i1 = indices[tri * 3 + 1] * 3;
+                        const i2 = indices[tri * 3 + 2] * 3;
+                        const cx = (positions[i0] + positions[i1] + positions[i2]) / 3;
+                        const cy = (positions[i0 + 1] + positions[i1 + 1] + positions[i2 + 1]) / 3;
+                        const cz = (positions[i0 + 2] + positions[i1 + 2] + positions[i2 + 2]) / 3;
+                        const dx = cx - seed[0];
+                        const dy = cy - seed[1];
+                        const dz = cz - seed[2];
+                        return Math.sqrt(dx * dx + dy * dy + dz * dz);
+                    };
+                    return centroidDistance(a) - centroidDistance(b);
+                });
+
+                for (const tri of orderedTriangles) {
+                    filteredIndices.push(
+                        addVertex(indices[tri * 3]),
+                        addVertex(indices[tri * 3 + 1]),
+                        addVertex(indices[tri * 3 + 2])
+                    );
+                }
+
+                console.log(
+                    `[INFO] Fast nav island filter: kept ${selected.triangles.length}/${triangleCount} triangles ` +
+                    `across ${components.length} islands, area=${selected.area.toFixed(2)}, seedDistance=${selected.distanceToSeed.toFixed(2)}`
+                );
+
+                return {
+                    positions: new Float32Array(filteredPositions),
+                    indices: new Uint32Array(filteredIndices),
+                    metadata: {
+                        area: selected.area,
+                        centroid: selected.centroid,
+                        distanceToSeed: selected.distanceToSeed,
+                        triangleCount: selected.triangles.length,
+                        islandCount: components.length,
+                    },
+                };
+            };
+
+            const validateFastNavIsland = (metadata: NavIslandMetadata | null, seed: number[] | null, expectedFloorY: number | null): void => {
+                if (!metadata) {
+                    console.warn("[WARN] Fast nav island validation skipped because no seed island metadata was available.");
+                    return;
+                }
+
+                const floorDelta = expectedFloorY !== null ? metadata.centroid[1] - expectedFloorY : 0;
+                console.log(
+                    `[INFO] Fast nav selected island: triangles=${metadata.triangleCount}, area=${metadata.area.toFixed(2)}, ` +
+                    `centroid=${metadata.centroid.map((v) => v.toFixed(3)).join(', ')}, seedDistance=${metadata.distanceToSeed.toFixed(2)}, ` +
+                    `floorDelta=${expectedFloorY !== null ? floorDelta.toFixed(2) : 'n/a'}`
+                );
+
+                if (metadata.area < 0.35 || metadata.triangleCount < 2) {
+                    throw new Error("Fast nav rejected a tiny navmesh island. The floor field did not produce a usable room-floor region. Try defining a region seed on the floor or importing a Collider GLB for manual nav.");
+                }
+                if (seed && metadata.distanceToSeed > 6.0) {
+                    throw new Error("Fast nav rejected an island too far from the seed. Move the seed onto the room floor or define a tighter region.");
+                }
+                if (expectedFloorY !== null && floorDelta < -0.7) {
+                    throw new Error("Fast nav rejected a navmesh below the expected floor. Define a region seed on the visible room floor or import a Collider GLB for manual nav.");
+                }
+            };
+
+            const chooseNpcSpawnPoint = (positions: Float32Array, indices: Uint32Array, playerSpawn: { x: number, y: number, z: number } | null): [number, number, number] | null => {
+                if (!playerSpawn || indices.length < 3) return null;
+
+                let best: [number, number, number] | null = null;
+                let bestScore = -Infinity;
+                for (let i = 0; i + 2 < indices.length; i += 3) {
+                    const i0 = indices[i] * 3;
+                    const i1 = indices[i + 1] * 3;
+                    const i2 = indices[i + 2] * 3;
+                    const candidate: [number, number, number] = [
+                        (positions[i0] + positions[i1] + positions[i2]) / 3,
+                        (positions[i0 + 1] + positions[i1 + 1] + positions[i2 + 1]) / 3,
+                        (positions[i0 + 2] + positions[i1 + 2] + positions[i2 + 2]) / 3,
+                    ];
+                    const dx = candidate[0] - playerSpawn.x;
+                    const dz = candidate[2] - playerSpawn.z;
+                    const horizontalDistance = Math.sqrt(dx * dx + dz * dz);
+                    const yPenalty = Math.abs(candidate[1] - playerSpawn.y);
+                    const score = horizontalDistance - yPenalty * 2;
+                    if (horizontalDistance >= 0.75 && score > bestScore) {
+                        best = candidate;
+                        bestScore = score;
+                    }
+                }
+
+                return best;
+            };
+
+            const runNavmeshFromCollider = async (autoSpawnNpc = false): Promise<void> => {
+                console.log(autoSpawnNpc ? "[WAIT] Fast path: splat -> collider -> navmesh -> NPC..." : "[WAIT] Building navmesh from dedicated collider source...");
+                const bytes = await readSplatBytes();
+                let fastSeed: number[] | null = null;
+                if (autoSpawnNpc) {
+                    fastSeed = await ensureFastCollisionSeed(bytes);
+                }
+
+                const navSettings = autoSpawnNpc
+                    ? buildFastFieldSettings(buildMeshSettings(true), fastSeed)
+                    : buildMeshSettings(true);
+                if (autoSpawnNpc) {
+                    console.log(
+                        `[INFO] Fast preset: floor-field source, cell=0.14, obstacleEps=0.34, variance=0.14, component=all, ` +
+                        `seed=${(navSettings.collision_seed ?? fastSeed)?.map((v) => v.toFixed(3)).join(', ') ?? 'auto'}`
+                    );
+                }
+                if (navSettings.collision_seed) {
+                    viewer.displaySeedMarker(navSettings.collision_seed);
+                }
+
+                const colliderSourceSelect = document.getElementById('paramColliderSource') as HTMLSelectElement | null;
+                let colliderSource = colliderSourceSelect?.value ?? 'generated';
+                if (autoSpawnNpc && colliderSource === 'imported' && !importedColliderGeometry) {
+                    colliderSource = 'generated';
+                    if (colliderSourceSelect) {
+                        colliderSourceSelect.value = 'generated';
+                    }
+                    console.warn("[WARN] Fast path switched to generated collider because no Collider GLB is loaded.");
+                }
+                const showColliderCheckbox = document.getElementById('showColliderMesh') as HTMLInputElement | null;
+                const colliderOpacitySlider = document.getElementById('colliderOpacity') as HTMLInputElement | null;
+                let geometry: { positions: Float32Array, indices: Uint32Array };
+                let sourceLabel = 'generated_voxel_collider';
+                let effectiveFastSeed = navSettings.collision_seed ?? fastSeed;
+
+                if (autoSpawnNpc) {
+                    const field = splatwalk.buildWalkableGroundField(bytes, navSettings);
+                    const floorPlaneY = field.diagnostics.floor_plane_height;
+                    if (effectiveFastSeed && Number.isFinite(floorPlaneY)) {
+                        const snapped = [effectiveFastSeed[0], floorPlaneY, effectiveFastSeed[2]];
+                        console.log(`[INFO] Snapped fast seed to floor plane: y ${effectiveFastSeed[1].toFixed(3)} -> ${floorPlaneY.toFixed(3)}`);
+                        effectiveFastSeed = snapped;
+                    }
+                    const floorMesh = buildFastFloorMesh(field, effectiveFastSeed);
+                    geometry = {
+                        positions: floorMesh.positions,
+                        indices: floorMesh.indices,
+                    };
+                    if (floorMesh.fallbackUsed) {
+                        effectiveFastSeed = floorMesh.centroid;
+                        viewer.displaySeedMarker(floorMesh.centroid);
+                        console.warn(`[WARN] Fast nav relocated the seed marker to the accepted floor island centroid: ${floorMesh.centroid.map((v) => v.toFixed(3)).join(', ')}`);
+                    }
+                    sourceLabel = 'fast_floor_field';
+                    console.log(
+                        `[INFO] Fast floor Recast source: vertices=${geometry.positions.length / 3}, triangles=${geometry.indices.length / 3}, ` +
+                        `selectedCells=${floorMesh.selectedCellCount}, area=${floorMesh.selectedArea.toFixed(2)}`
+                    );
+                } else if (colliderSource === 'imported') {
+                    geometry = importedColliderGeometry ?? viewer.getColliderMeshBuffers();
+                    sourceLabel = 'imported_collider_glb';
+                    console.log(`[INFO] Using imported Collider GLB as authoritative Recast input.`);
+                    console.log(`[INFO] Imported collider: ${geometry.positions.length / 3} vertices, ${geometry.indices.length / 3} triangles.`);
+                } else {
+                    const basis = splatwalk.convertSplatToNavmeshBasis(bytes, navSettings);
+                    geometry = {
+                        positions: new Float32Array(basis.mesh.vertices),
+                        indices: new Uint32Array(basis.mesh.indices),
+                    };
+                    const opacity = Number.parseFloat(colliderOpacitySlider?.value ?? '0.35') || 0.35;
+                    viewer.displayColliderMesh(geometry.positions, geometry.indices, opacity);
+                    if (showColliderCheckbox) {
+                        viewer.setColliderVisible(showColliderCheckbox.checked);
+                    }
+
+                    console.log(`[INFO] Generated collider: ${basis.mesh.vertex_count} vertices, ${basis.mesh.face_count} faces.`);
+                    console.log(
+                        `[INFO] Collision grid: ${basis.diagnostics.collision_grid_width}x${basis.diagnostics.collision_grid_height}x${basis.diagnostics.collision_grid_depth}, ` +
+                        `voxel=${basis.diagnostics.collision_voxel_size.toFixed(3)}, ` +
+                        `scene=${basis.diagnostics.collision_scene_type}, mesh=${basis.diagnostics.collision_mesh_mode}`
+                    );
+                    console.log(
+                        `[INFO] Collision stages: occupied=${basis.diagnostics.collision_occupied_voxels}, ` +
+                        `clusterKept=${basis.diagnostics.collision_cluster_kept_voxels}, ` +
+                        `clusterDiscarded=${basis.diagnostics.collision_cluster_discarded_voxels}, ` +
+                        `filled=${basis.diagnostics.collision_filled_voxels}, ` +
+                        `carved=${basis.diagnostics.collision_carved_voxels}, ` +
+                        `surfaceFaces=${basis.diagnostics.collision_surface_faces}`
+                    );
+                    console.log(
+                        `[INFO] Collision seed: used=${JSON.stringify(basis.diagnostics.collision_seed_used ?? navSettings.collision_seed)}, ` +
+                        `state=${basis.diagnostics.collision_seed_state}, ` +
+                        `externalFillLeaked=${basis.diagnostics.collision_external_fill_leaked}`
+                    );
+                    if (basis.diagnostics.collision_seed_used) {
+                        viewer.displaySeedMarker(basis.diagnostics.collision_seed_used);
+                    }
+                    if (basis.diagnostics.collision_external_fill_leaked) {
+                        console.warn("[WARN] Indoor external fill skipped because the seed leaked to exterior. Move the seed inside the room or increase fill size.");
+                    }
+                }
+
+                const splatBounds = viewer.getSplatBoundsForDiagnostics();
+                const colliderBounds = autoSpawnNpc ? null : viewer.getColliderBounds();
+                if (splatBounds) {
+                    console.log(`[INFO] Splat bounds: min=${splatBounds.min.toString()}, max=${splatBounds.max.toString()}`);
+                }
+                if (colliderBounds) {
+                    console.log(`[INFO] Collider bounds: min=${colliderBounds.min.toString()}, max=${colliderBounds.max.toString()}`);
+                }
+
+                if (geometry.positions.length === 0 || geometry.indices.length === 0) {
+                    throw new Error(`Collider mesh is empty. Import a Collider GLB or adjust seed, scene type, voxel size, opacity, or carve capsule.`);
+                }
+
+                const params = {
+                    cs: autoSpawnNpc ? 0.12 : parseFloat((document.getElementById('paramNavCS') as HTMLInputElement).value),
+                    ch: autoSpawnNpc ? 0.10 : parseFloat((document.getElementById('paramNavCH') as HTMLInputElement).value),
+                    walkableHeight: autoSpawnNpc ? 1.7 : parseFloat((document.getElementById('paramNavHeight') as HTMLInputElement).value),
+                    walkableRadius: autoSpawnNpc ? 0.45 : parseFloat((document.getElementById('paramNavRadius') as HTMLInputElement).value),
+                    walkableClimb: autoSpawnNpc ? 0.25 : parseFloat((document.getElementById('paramNavClimb') as HTMLInputElement).value),
+                    walkableSlopeAngle: autoSpawnNpc ? 28 : parseFloat((document.getElementById('paramNavSlope') as HTMLInputElement).value),
+                    maxEdgeLen: 12,
+                    maxSimplificationError: autoSpawnNpc ? 0.5 : 0.8,
+                    minRegionArea: autoSpawnNpc ? 24 : 2,
+                    mergeRegionArea: autoSpawnNpc ? 36 : 12,
+                    maxVertsPerPoly: 6,
+                    detailSampleDist: 6,
+                    detailSampleMaxError: 1
+                };
+
+                const fastAttempts = [
+                    { label: 'strict', params },
+                    {
+                        label: 'balanced',
+                        params: {
+                            ...params,
+                            cs: 0.15,
+                            ch: 0.12,
+                            walkableHeight: 1.4,
+                            walkableRadius: 0.32,
+                            walkableClimb: 0.4,
+                            walkableSlopeAngle: 38,
+                            maxSimplificationError: 0.8,
+                            minRegionArea: 8,
+                            mergeRegionArea: 16,
+                        }
+                    },
+                    {
+                        label: 'recovery',
+                        params: {
+                            ...params,
+                            cs: 0.18,
+                            ch: 0.14,
+                            walkableHeight: 1.2,
+                            walkableRadius: 0.25,
+                            walkableClimb: 0.55,
+                            walkableSlopeAngle: 45,
+                            maxSimplificationError: 1.0,
+                            minRegionArea: 2,
+                            mergeRegionArea: 8,
+                        }
+                    },
+                ];
+                const attempts = autoSpawnNpc ? fastAttempts : [{ label: 'manual', params }];
+
+                let result: { navMeshData: Uint8Array, debugPositions: Float32Array, debugIndices: Uint32Array, report: any } | null = null;
+                let lastError: unknown = null;
+                for (const attempt of attempts) {
+                    console.log(`[INFO] NavMesh Parameters (${attempt.label}):`, attempt.params);
+                    console.log("[WAIT] Spawning NavMesh Worker...");
+
+                    const worker = new NavWorker();
+                    try {
+                        result = await new Promise<{ navMeshData: Uint8Array, debugPositions: Float32Array, debugIndices: Uint32Array, report: any }>((resolve, reject) => {
+                            worker.onmessage = (e: MessageEvent) => {
+                                const { type, payload } = e.data;
+                                if (type === 'done') {
+                                    worker.terminate();
+                                    resolve(payload);
+                                } else if (type === 'error') {
+                                    worker.terminate();
+                                    reject(new Error(payload));
+                                }
+                            };
+
+                            worker.postMessage({
+                                type: 'generate',
+                                payload: {
+                                    positions: geometry.positions,
+                                    indices: geometry.indices,
+                                    params: attempt.params,
+                                    sourceLabel,
+                                    splatBounds: splatBounds ? { min: splatBounds.min.asArray(), max: splatBounds.max.asArray() } : null,
+                                    colliderBounds: colliderBounds ? { min: colliderBounds.min.asArray(), max: colliderBounds.max.asArray() } : null,
+                                }
+                            });
+                        });
+                        if (autoSpawnNpc && attempt.label !== 'strict') {
+                            console.warn(`[WARN] Fast nav recovered with ${attempt.label} Recast settings.`);
+                        }
+                        break;
+                    } catch (error) {
+                        worker.terminate();
+                        lastError = error;
+                        if (!autoSpawnNpc || attempt === attempts[attempts.length - 1]) {
+                            break;
+                        }
+                        console.warn(`[WARN] Fast nav ${attempt.label} attempt failed; retrying with relaxed Recast settings.`);
+                    }
+                }
+
+                if (!result) {
+                    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+                }
+
+                generatedNavData = result.navMeshData;
+                navHasBeenGenerated = true;
+                lastNavUsedFastPath = autoSpawnNpc;
+                console.log("[SUCCESS] NavMesh generated successfully!");
+
+                const { report } = result;
+                if (report) {
+                    if (report.isOverride) {
+                        console.warn(`[WARN] AUTO-SCALED: Cell Size adjusted to ${report.activeCS}m for environment resolution.`);
+                    }
+                    if (report.wasFlipped) {
+                        console.log(`[INFO] Winding Correction: System auto-corrected mesh orientation for Recast compatibility.`);
+                    }
+                    if (report.headroomPadding > 0) {
+                        console.log(`[INFO] Applied +${report.headroomPadding.toFixed(2)}m vertical padding for headroom.`);
+                    }
+                    console.log(`[INFO] Mesh Normal Quality: ${(report.avgUpDot * 100).toFixed(1)}% Up-Facing`);
+                    console.log(`[INFO] Final Voxel Grid: ${report.gridDim[0]}x${report.gridDim[1]}x${report.gridDim[2]}`);
+                    console.log(`[INFO] Recast source: ${report.sourceLabel}`);
+                    if (report.splatBounds) {
+                        console.log(`[INFO] Splat bounds audit: ${JSON.stringify(report.splatBounds.min)} to ${JSON.stringify(report.splatBounds.max)}`);
+                    }
+                    if (report.colliderBounds) {
+                        console.log(`[INFO] Collider bounds audit: ${JSON.stringify(report.colliderBounds.min)} to ${JSON.stringify(report.colliderBounds.max)}`);
+                    }
+                    if (report.sourceBounds && report.debugBounds) {
+                        console.log(`[INFO] Recast input Y bounds: ${report.sourceBounds.min[1].toFixed(3)} to ${report.sourceBounds.max[1].toFixed(3)}`);
+                        console.log(`[INFO] Recast debug Y bounds: ${report.debugBounds.min[1].toFixed(3)} to ${report.debugBounds.max[1].toFixed(3)}`);
+                    }
+                }
+
+                console.log("[WAIT] Rendering NavMesh visual overlay...");
+                const expectedFloorY = autoSpawnNpc && effectiveFastSeed && navSettings.collision_carve_height
+                    ? effectiveFastSeed[1] - navSettings.collision_carve_height * 0.5
+                    : null;
+                const visualNavmesh = { positions: result.debugPositions, indices: result.debugIndices, metadata: null as NavIslandMetadata | null };
+                if (autoSpawnNpc) {
+                    const safety = filterNavmeshIslandNearSeed(result.debugPositions, result.debugIndices, effectiveFastSeed);
+                    validateFastNavIsland(safety.metadata, effectiveFastSeed, expectedFloorY);
+                    if (safety.metadata && safety.metadata.islandCount > 1) {
+                        console.warn(`[WARN] Fast floor Recast returned ${safety.metadata.islandCount} islands; display/crowd will still use the full field-derived Recast result.`);
+                    }
+                }
+                const spawnPoint = await viewer.displayNavMesh(visualNavmesh.positions, visualNavmesh.indices, 0);
+                if (autoSpawnNpc && spawnPoint) {
+                    const npcSpawn = chooseNpcSpawnPoint(visualNavmesh.positions, visualNavmesh.indices, spawnPoint);
+                    viewer.setPreferredNavSpawnPoints(
+                        [spawnPoint.x, spawnPoint.y, spawnPoint.z],
+                        npcSpawn
+                    );
+                    console.log(`[INFO] Player agent spawn: ${spawnPoint.x.toFixed(3)}, ${spawnPoint.y.toFixed(3)}, ${spawnPoint.z.toFixed(3)}`);
+                    if (npcSpawn) {
+                        console.log(`[INFO] NPC preferred spawn: ${npcSpawn.map((v) => v.toFixed(3)).join(', ')}`);
+                    } else {
+                        console.warn("[WARN] No separated NPC spawn point found on the visible navmesh island.");
+                    }
+                }
+                (document.getElementById('resultSection') as HTMLElement | null)!.style.display = 'block';
+                const downloadNavBtn = document.getElementById('downloadNavBtn') as HTMLButtonElement | null;
+                if (downloadNavBtn) downloadNavBtn.style.display = 'block';
+
+                console.log("[WAIT] Initializing NPC Crowd Simulation...");
+                await viewer.initCrowd(result.navMeshData, spawnPoint);
+                const simulationSection = document.getElementById('simulationSection') as HTMLDivElement | null;
+                if (simulationSection) simulationSection.style.display = 'block';
+
+                if (autoSpawnNpc) {
+                    viewer.addNPC();
+                    console.log("[SUCCESS] Fast path complete: navmesh ready, NPC spawned, click navmesh to move.");
+                } else {
+                    console.log("[SUCCESS] Simulation ready.");
+                }
+            };
+
+            const fastNavBtn = document.getElementById('fastNavBtn');
+            if (fastNavBtn) {
+                const newFastNavBtn = fastNavBtn.cloneNode(true) as HTMLButtonElement;
+                fastNavBtn.parentNode?.replaceChild(newFastNavBtn, fastNavBtn);
+                newFastNavBtn.addEventListener('click', async () => {
+                    try {
+                        errorDiv.style.display = 'none';
+                        document.getElementById('resultSection')!.style.display = 'block';
+                        toggleSettings(true);
+                        await runNavmeshFromCollider(true);
+                    } catch (error) {
+                        logError(`Fast nav path failed: ${error}`);
+                    }
+                });
+            }
+
+            const globalDownloadNavBtn = document.getElementById('downloadNavBtn') as HTMLButtonElement | null;
+            const globalGenerateNavBtn = document.getElementById('generateNavBtn') as HTMLButtonElement | null;
+            const globalAddNpcBtn = document.getElementById('addNpcBtn') as HTMLButtonElement | null;
+            if (globalGenerateNavBtn) {
+                globalGenerateNavBtn.onclick = async () => {
+                    try {
+                        await runNavmeshFromCollider(false);
+                    } catch (error) {
+                        logError(`NavMesh generation failed: ${error}`);
+                    }
+                };
+            }
+            if (globalDownloadNavBtn) {
+                globalDownloadNavBtn.onclick = () => {
+                    if (!generatedNavData) {
+                        console.warn("[WARN] No navmesh binary generated yet.");
+                        return;
+                    }
+                    const blob = new Blob([generatedNavData as any], { type: 'application/octet-stream' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `${file.name.replace(/\.(ply|spz)$/i, "")}.nav`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                    console.log("[Main] NavMesh binary download started.");
+                };
+            }
+            if (globalAddNpcBtn) {
+                globalAddNpcBtn.onclick = () => viewer.addNPC();
+            }
+
+            const buildMeshSettings = (includeRegion: boolean): MeshSettings => {
+                const readNumber = (id: string, fallback: number): number => {
+                    const input = document.getElementById(id) as HTMLInputElement | null;
+                    const value = input ? Number(input.value) : NaN;
+                    return Number.isFinite(value) ? value : fallback;
+                };
+                const readInteger = (id: string, fallback: number): number => Math.max(0, Math.round(readNumber(id, fallback)));
+
+                let mode = 2; // Default to Voxels now
+                const modeRadios = document.getElementsByName('reconMode');
+                for (let i = 0; i < modeRadios.length; i++) {
+                    if ((modeRadios[i] as HTMLInputElement).checked) {
+                        mode = parseInt((modeRadios[i] as HTMLInputElement).value);
+                        break;
+                    }
+                }
+
+                const rot = viewer.getSplatRotation();
+                const settings: MeshSettings = {
+                    mode,
+                    voxel_target: readNumber('paramVoxelTarget', 4000),
+                    sdf_cell_size: readNumber('paramSdfCellSize', 0.15),
+                    sdf_vertical_cell_size: readNumber('paramSdfVerticalCellSize', 0.05),
+                    sdf_density_threshold: readNumber('paramSdfDensityThreshold', 0.08),
+                    sdf_max_layers: readInteger('paramSdfMaxLayers', 2),
+                    sdf_smoothing_radius: readInteger('paramSdfSmoothingRadius', 1),
+                    sdf_influence_radius_scale: readNumber('paramSdfInfluenceRadiusScale', 2.5),
+                    collision_voxel_size: readNumber('paramCollisionVoxelSize', 0.08),
+                    collision_opacity_threshold: readNumber('paramCollisionOpacityThreshold', 0.10),
+                    collision_scene_type: ((document.getElementById('paramCollisionSceneType') as HTMLSelectElement | null)?.value as MeshSettings['collision_scene_type']) ?? 'outdoor',
+                    collision_seed: [
+                        readNumber('paramCollisionSeedX', 0),
+                        readNumber('paramCollisionSeedY', 1),
+                        readNumber('paramCollisionSeedZ', 0),
+                    ],
+                    collision_fill_size: readNumber('paramCollisionFillSize', 1.2),
+                    collision_carve_height: readNumber('paramCollisionCarveHeight', 1.6),
+                    collision_carve_radius: readNumber('paramCollisionCarveRadius', 0.25),
+                    collision_mesh_mode: ((document.getElementById('paramCollisionMeshMode') as HTMLSelectElement | null)?.value as MeshSettings['collision_mesh_mode']) ?? 'faces',
+                    min_alpha: readNumber('paramMinAlpha', 0.05),
+                    max_scale: readNumber('paramMaxScale', 5.0),
+                    normal_align: readNumber('paramNormalAlign', 0.05),
+                    ransac_thresh: readNumber('paramRansacThresh', 0.1),
+                    floor_projection_epsilon: readNumber('paramFloorProjectionEpsilon', 0.16),
+                    height_projection_epsilon: readNumber('paramFloorProjectionEpsilon', 0.16),
+                    obstacle_height_epsilon: readNumber('paramObstacleHeightEpsilon', 0.24),
+                    max_local_height_variance: readNumber('paramMaxLocalHeightVariance', 0.08),
+                    min_floor_confidence: readNumber('paramMinFloorConfidence', 0.01),
+                    hole_fill_radius: readInteger('paramHoleFillRadius', 1),
+                    agent_radius_erode: readNumber('paramAgentRadiusErode', 0),
+                    component_mode: ((document.getElementById('paramComponentMode') as HTMLSelectElement | null)?.value as MeshSettings['component_mode']) ?? 'largest',
+                    rotation: [rot.x, rot.y, rot.z],
+                    flip_y: viewer.isSplatYFlipped(),
+                };
+
+                if (includeRegion) {
+                    const regionBounds = viewer.getRegionBounds();
+                    settings.region_min = regionBounds?.min;
+                    settings.region_max = regionBounds?.max;
+                }
+
+                return settings;
+            };
+
+            const getVisibleGroundFieldStates = (): Set<GroundFieldCellState> => {
+                const visible = new Set<GroundFieldCellState>();
+                document.querySelectorAll<HTMLInputElement>('.ground-field-state').forEach((checkbox) => {
+                    if (checkbox.checked) {
+                        visible.add(checkbox.value as GroundFieldCellState);
+                    }
+                });
+                return visible;
+            };
 
             // 2. Attach Rotation Listeners
             const attachRotListener = (id: string, axis: 'x' | 'y' | 'z') => {
@@ -211,6 +1263,20 @@ async function main() {
                     newBtn.addEventListener('click', () => {
                         console.log(`[UI] Rotation ${axis} clicked`);
                         viewer.rotateSplat(axis);
+                        // A rotation changes the splat orientation that WASM bakes into the
+                        // navmesh, basis and spawn points. If a navmesh already exists it is now
+                        // stale, so re-run the same generation path to re-align everything.
+                        // Debounced so rapid multi-axis clicks collapse into a single rebuild.
+                        if (navHasBeenGenerated) {
+                            if (realignNavTimer) clearTimeout(realignNavTimer);
+                            realignNavTimer = setTimeout(() => {
+                                realignNavTimer = null;
+                                console.log("[INFO] Splat rotated -- re-aligning navmesh to the new orientation...");
+                                runNavmeshFromCollider(lastNavUsedFastPath).catch((error) => {
+                                    logError(`Navmesh re-alignment after rotation failed: ${error}`);
+                                });
+                            }, 350);
+                        }
                     });
                 }
             };
@@ -229,17 +1295,51 @@ async function main() {
                 const newClearBtn = clearRegionBtn.cloneNode(true) as HTMLButtonElement;
                 clearRegionBtn.parentNode?.replaceChild(newClearBtn, clearRegionBtn);
 
-                newDefineBtn.addEventListener('click', () => {
-                    viewer.enableRegionSelection();
-                    newClearBtn.style.display = 'block';
-                    newDefineBtn.textContent = 'UPDATE REGION';
-                    console.log("[UI] Region selection mode active");
+                newDefineBtn.addEventListener('click', async () => {
+                    try {
+                        const bytes = await readSplatBytes();
+                        const suggestedRegion = splatwalk.suggestRegion(bytes, buildMeshSettings(false));
+                        viewer.enableRegionSelection({
+                            min: suggestedRegion.region_min,
+                            max: suggestedRegion.region_max,
+                        });
+                        newClearBtn.style.display = 'block';
+                        newDefineBtn.textContent = 'UPDATE REGION';
+                        console.log(`[UI] Region selection mode active: ${JSON.stringify(suggestedRegion.region_min)} to ${JSON.stringify(suggestedRegion.region_max)}`);
+                    } catch (error) {
+                        logError(`Region suggestion failed: ${error}`);
+                    }
                 });
 
                 newClearBtn.addEventListener('click', () => {
                     viewer.disableRegionSelection();
                     newClearBtn.style.display = 'none';
                     newDefineBtn.textContent = 'DEFINE REGION';
+                });
+            }
+
+            const useRegionSeedBtn = document.getElementById('useRegionSeedBtn');
+            if (useRegionSeedBtn) {
+                const newUseRegionSeedBtn = useRegionSeedBtn.cloneNode(true) as HTMLButtonElement;
+                useRegionSeedBtn.parentNode?.replaceChild(newUseRegionSeedBtn, useRegionSeedBtn);
+                newUseRegionSeedBtn.addEventListener('click', () => {
+                    const regionBounds = viewer.getRegionBounds();
+                    if (!regionBounds) {
+                        console.warn("[WARN] Define a region first, then use its center as the collision seed.");
+                        return;
+                    }
+                    const carveHeightInput = document.getElementById('paramCollisionCarveHeight') as HTMLInputElement | null;
+                    const carveHeight = Number.parseFloat(carveHeightInput?.value ?? '1.6') || 1.6;
+                    const seed = [
+                        (regionBounds.min[0] + regionBounds.max[0]) * 0.5,
+                        regionBounds.min[1] + carveHeight * 0.5,
+                        (regionBounds.min[2] + regionBounds.max[2]) * 0.5,
+                    ];
+                    (document.getElementById('paramCollisionSeedX') as HTMLInputElement | null)!.value = seed[0].toFixed(3);
+                    (document.getElementById('paramCollisionSeedY') as HTMLInputElement | null)!.value = seed[1].toFixed(3);
+                    (document.getElementById('paramCollisionSeedZ') as HTMLInputElement | null)!.value = seed[2].toFixed(3);
+                    viewer.displaySeedMarker(seed);
+                    console.log(`[UI] Collision seed set from region center: ${seed.map((v) => v.toFixed(3)).join(', ')}`);
                 });
             }
 
@@ -252,47 +1352,8 @@ async function main() {
                 newProcessBtn.addEventListener('click', async () => {
                     console.log("[WAIT] Starting generation...");
                     try {
-                        let buffer: ArrayBuffer;
-
-                        // Handle .spz decompression
-                        if (file.name.toLowerCase().endsWith('.spz')) {
-                            console.log("[INFO] Detected .spz file. Decompressing...");
-                            if ('DecompressionStream' in window) {
-                                const ds = new DecompressionStream('gzip');
-                                const decompressedStream = file.stream().pipeThrough(ds);
-                                buffer = await new Response(decompressedStream).arrayBuffer();
-                                console.log(`[INFO] Decompressed .spz to ${buffer.byteLength} bytes.`);
-                            } else {
-                                throw new Error("Browser does not support DecompressionStream. Cannot read .spz files.");
-                            }
-                        } else {
-                            buffer = await file.arrayBuffer();
-                        }
-
-                        const bytes = new Uint8Array(buffer);
-
-                        // Get Settings
-                        let mode = 2; // Default to Voxels now
-                        const modeRadios = document.getElementsByName('reconMode');
-                        for (let i = 0; i < modeRadios.length; i++) {
-                            if ((modeRadios[i] as HTMLInputElement).checked) {
-                                mode = parseInt((modeRadios[i] as HTMLInputElement).value);
-                                break;
-                            }
-                        }
-
-                        const rot = viewer.getSplatRotation();
-                        const settings = {
-                            mode: mode,
-                            voxel_target: parseFloat((document.getElementById('paramVoxelTarget') as HTMLInputElement).value) || 4000,
-                            min_alpha: parseFloat((document.getElementById('paramMinAlpha') as HTMLInputElement).value) || 0.05,
-                            max_scale: parseFloat((document.getElementById('paramMaxScale') as HTMLInputElement).value) || 5.0,
-                            normal_align: parseFloat((document.getElementById('paramNormalAlign') as HTMLInputElement).value) || 0.05,
-                            ransac_thresh: parseFloat((document.getElementById('paramRansacThresh') as HTMLInputElement).value) || 0.1,
-                            region_min: viewer.getRegionBounds()?.min,
-                            region_max: viewer.getRegionBounds()?.max,
-                            rotation: [rot.x, rot.y, rot.z]
-                        };
+                        const bytes = await readSplatBytes();
+                        const settings = buildMeshSettings(true);
 
                         if (settings.region_min && settings.region_max) {
                             console.log(`[INFO] Applying region constraint: ${JSON.stringify(settings.region_min)} to ${JSON.stringify(settings.region_max)}`);
@@ -302,20 +1363,27 @@ async function main() {
                         const start = performance.now();
 
                         const result = splatwalk.convertSplatToMesh(bytes, settings);
+                        const mesh = result.mesh;
+                        const diagnostics = result.diagnostics;
 
                         const end = performance.now();
                         console.log(`[INFO] Conversion complete in ${(end - start).toFixed(2)}ms`);
-                        console.log(`[INFO] Mesh: ${result.vertex_count} vertices, ${result.face_count} faces`);
+                        console.log(`[INFO] Mesh: ${mesh.vertex_count} vertices, ${mesh.face_count} faces`);
+                        console.log(
+                            `[INFO] Diagnostics: points=${diagnostics.points_after_filter}/${diagnostics.points_total}, ` +
+                            `grid=${diagnostics.grid_width}x${diagnostics.grid_height}, ` +
+                            `faces=${diagnostics.faces_generated}, holes_filled=${diagnostics.holes_filled}`
+                        );
 
                         // Region Integrity Audit
                         if (settings.region_min && settings.region_max) {
                             console.log(`[WAIT] Auditing mesh region integrity...`);
                             let outsideCount = 0;
                             const epsilon = 0.001;
-                            for (let i = 0; i < result.vertices.length; i += 3) {
-                                const x = result.vertices[i];
-                                const y = result.vertices[i + 1];
-                                const z = result.vertices[i + 2];
+                            for (let i = 0; i < mesh.vertices.length; i += 3) {
+                                const x = mesh.vertices[i];
+                                const y = mesh.vertices[i + 1];
+                                const z = mesh.vertices[i + 2];
 
                                 if (x < settings.region_min[0] - epsilon || x > settings.region_max[0] + epsilon ||
                                     y < settings.region_min[1] - epsilon || y > settings.region_max[1] + epsilon ||
@@ -324,24 +1392,24 @@ async function main() {
                                 }
                             }
                             if (outsideCount === 0) {
-                                console.log(`[SUCCESS] Region Integrity Verified: All ${result.vertex_count} vertices are within bounds.`);
+                                console.log(`[SUCCESS] Region Integrity Verified: All ${mesh.vertex_count} vertices are within bounds.`);
                             } else {
-                                console.warn(`[INFO] Region Audit: ${outsideCount} vertices (${((outsideCount / result.vertex_count) * 100).toFixed(1)}%) were outside defined region.`);
+                                console.warn(`[WARN] Region Audit: ${outsideCount} vertices (${((outsideCount / mesh.vertex_count) * 100).toFixed(1)}%) were outside defined region.`);
                             }
                         }
 
                         // WASM Output Audit
                         let outNan = 0, outInf = 0;
-                        for (let i = 0; i < result.vertices.length; i++) {
-                            const v = result.vertices[i];
+                        for (let i = 0; i < mesh.vertices.length; i++) {
+                            const v = mesh.vertices[i];
                             if (isNaN(v)) outNan++;
                             else if (!isFinite(v)) outInf++;
                         }
                         if (outNan > 0 || outInf > 0) {
-                            console.warn(`[INFO] WASM produced artifacts: ${outNan} NaNs, ${outInf} Infinities. Sanitization will handle these.`);
+                            console.warn(`[WARN] WASM produced artifacts: ${outNan} NaNs, ${outInf} Infinities. Sanitization will handle these.`);
                         }
 
-                        if (result.vertex_count === 0) {
+                        if (mesh.vertex_count === 0) {
                             logError("Resulting mesh has 0 vertices. Conversion failed to produce geometry.");
                             return;
                         }
@@ -355,10 +1423,10 @@ async function main() {
                         const customMesh = new Mesh("custom_mesh", scene);
                         const vertexData = new VertexData();
 
-                        vertexData.positions = result.vertices;
+                        vertexData.positions = mesh.vertices;
 
-                        if (result.indices && result.indices.length > 0) {
-                            vertexData.indices = result.indices;
+                        if (mesh.indices && mesh.indices.length > 0) {
+                            vertexData.indices = mesh.indices;
                         } else {
                             console.warn("[WARN] No indices returned.");
                         }
@@ -370,7 +1438,7 @@ async function main() {
 
                         // Create material
                         const mat = new StandardMaterial("mat", scene);
-                        if (result.indices.length === 0 || result.face_count === 0) {
+                        if (mesh.indices.length === 0 || mesh.face_count === 0) {
                             mat.pointsCloud = true;
                             mat.pointSize = 2;
                         } else {
@@ -412,98 +1480,55 @@ async function main() {
                         // --- NavMesh Generation Logic ---
                         const generateNavBtn = document.getElementById('generateNavBtn') as HTMLButtonElement;
                         const downloadNavBtn = document.getElementById('downloadNavBtn') as HTMLButtonElement;
-                        const simulationSection = document.getElementById('simulationSection') as HTMLDivElement;
                         const addNpcBtn = document.getElementById('addNpcBtn') as HTMLButtonElement;
+                        const generateFieldOverlayBtn = document.getElementById('generateFieldOverlayBtn') as HTMLButtonElement;
+                        const clearFieldOverlayBtn = document.getElementById('clearFieldOverlayBtn') as HTMLButtonElement;
 
-                        let generatedNavData: Uint8Array | null = null;
+                        if (generateFieldOverlayBtn) {
+                            generateFieldOverlayBtn.onclick = async () => {
+                                console.log("[WAIT] Building 2.5D SDF field overlay...");
+                                try {
+                                    const fieldSettings = buildMeshSettings(true);
+                                    const field = splatwalk.buildWalkableGroundField(bytes, fieldSettings);
+                                    viewer.displayGroundFieldOverlay(field, getVisibleGroundFieldStates());
+                                    console.log(
+                                        `[INFO] Ground field overlay: ${field.width}x${field.height}, ` +
+                                        `cell=${field.cell_size.toFixed(3)}, filled=${field.diagnostics.cells_filled}, ` +
+                                        `eroded=${field.diagnostics.cells_eroded}, discarded=${field.diagnostics.cells_discarded_component}`
+                                    );
+                                    console.log(
+                                        `[INFO] SDF columns: yBins=${field.diagnostics.sdf_profile_bins}, ` +
+                                        `yBinSize=${field.diagnostics.sdf_vertical_cell_size.toFixed(3)}, ` +
+                                        `threshold=${field.diagnostics.sdf_density_threshold.toFixed(3)}, ` +
+                                        `surfaces=${field.diagnostics.sdf_cells_with_surface}, ` +
+                                        `multiLayer=${field.diagnostics.sdf_cells_multi_layer}, ` +
+                                        `smoothed=${field.diagnostics.sdf_cells_smoothed}`
+                                    );
+                                    if (field.diagnostics.floor_plane_used_fallback) {
+                                        console.warn("[WARN] Floor fallback active: using lower-percentile Y anchor because RANSAC floor was suspect.");
+                                    }
+                                } catch (e) {
+                                    logError(`Ground field overlay failed: ${e}`);
+                                }
+                            };
+                        }
+
+                        if (clearFieldOverlayBtn) {
+                            clearFieldOverlayBtn.onclick = () => viewer.clearGroundFieldOverlay();
+                        }
 
                         if (generateNavBtn) {
-                            generateNavBtn.addEventListener('click', async () => {
-                                console.log("[WAIT] Extracting geometry for NavMesh...");
+                            generateNavBtn.onclick = async () => {
                                 try {
-                                    const geometry = extractGeometry(customMesh);
-                                    console.log(`[INFO] Extracted ${geometry.positions.length / 3} vertices and ${geometry.indices.length / 3} faces.`);
-
-                                    const params = {
-                                        cs: parseFloat((document.getElementById('paramNavCS') as HTMLInputElement).value),
-                                        ch: parseFloat((document.getElementById('paramNavCH') as HTMLInputElement).value),
-                                        walkableHeight: parseFloat((document.getElementById('paramNavHeight') as HTMLInputElement).value),
-                                        walkableRadius: parseFloat((document.getElementById('paramNavRadius') as HTMLInputElement).value),
-                                        walkableClimb: parseFloat((document.getElementById('paramNavClimb') as HTMLInputElement).value),
-                                        walkableSlopeAngle: parseFloat((document.getElementById('paramNavSlope') as HTMLInputElement).value),
-                                        // Defaults
-                                        maxEdgeLen: 12,
-                                        maxSimplificationError: 1.3,
-                                        minRegionArea: 8,
-                                        mergeRegionArea: 20,
-                                        maxVertsPerPoly: 6,
-                                        detailSampleDist: 6,
-                                        detailSampleMaxError: 1
-                                    };
-
-                                    console.log("[INFO] NavMesh Parameters:", params);
-
-                                    console.log("[WAIT] Spawning NavMesh Worker...");
-                                    const worker = new NavWorker();
-                                    worker.postMessage({
-                                        type: 'generate',
-                                        payload: {
-                                            positions: geometry.positions,
-                                            indices: geometry.indices,
-                                            params
-                                        }
-                                    });
-
-                                    worker.onmessage = async (e: MessageEvent) => {
-                                        const { type, payload } = e.data;
-                                        if (type === 'done') {
-                                            const { navMeshData, debugPositions, debugIndices, report } = payload;
-                                            generatedNavData = navMeshData;
-
-                                            console.log("[SUCCESS] NavMesh generated successfully!");
-
-                                            if (report) {
-                                                if (report.isOverride) {
-                                                    console.warn(`[INFO] AUTO-SCALED: Cell Size adjusted to ${report.activeCS}m for environment resolution.`);
-                                                }
-                                                if (report.wasFlipped) {
-                                                    console.log(`[INFO] Winding Correction: System auto-corrected mesh orientation for Recast compatibility.`);
-                                                }
-                                                if (report.headroomPadding > 0) {
-                                                    console.log(`[INFO] Applied +${report.headroomPadding.toFixed(2)}m vertical padding for headroom.`);
-                                                }
-                                                console.log(`[INFO] Mesh Normal Quality: ${(report.avgUpDot * 100).toFixed(1)}% Up-Facing`);
-                                                console.log(`[INFO] Final Voxel Grid: ${report.gridDim[0]}x${report.gridDim[1]}x${report.gridDim[2]}`);
-                                            }
-
-                                            // Visualize
-                                            console.log("[WAIT] Rendering NavMesh visual overlay...");
-                                            await viewer.displayNavMesh(debugPositions, debugIndices);
-
-                                            // Show download button
-                                            if (downloadNavBtn) downloadNavBtn.style.display = 'block';
-
-                                            // Init Simulation
-                                            console.log("[WAIT] Initializing NPC Crowd Simulation...");
-                                            await viewer.initCrowd(navMeshData);
-                                            if (simulationSection) simulationSection.style.display = 'block';
-                                            console.log("[SUCCESS] Simulation ready.");
-
-                                            worker.terminate();
-                                        } else if (type === 'error') {
-                                            logError(`NavMesh worker error: ${payload}`);
-                                            worker.terminate();
-                                        }
-                                    };
-
+                                    await runNavmeshFromCollider(false);
                                 } catch (e) {
                                     logError(`NavMesh generation failed: ${e}`);
                                 }
-                            });
+                            };
                         }
 
                         if (downloadNavBtn) {
-                            downloadNavBtn.addEventListener('click', () => {
+                            downloadNavBtn.onclick = () => {
                                 if (!generatedNavData) return;
                                 const blob = new Blob([generatedNavData as any], { type: 'application/octet-stream' });
                                 const url = URL.createObjectURL(blob);
@@ -513,13 +1538,13 @@ async function main() {
                                 a.click();
                                 URL.revokeObjectURL(url);
                                 console.log("[Main] NavMesh binary download started.");
-                            });
+                            };
                         }
 
                         if (addNpcBtn) {
-                            addNpcBtn.addEventListener('click', () => {
+                            addNpcBtn.onclick = () => {
                                 viewer.addNPC();
-                            });
+                            };
                         }
 
                     } catch (e) {

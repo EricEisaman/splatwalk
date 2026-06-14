@@ -49,6 +49,7 @@ impl PropertyAccess for Splat {
     }
 }
 
+#[derive(Clone)]
 pub struct PointNormal {
     pub point: Point3<f64>,
     pub normal: Vector3<f64>,
