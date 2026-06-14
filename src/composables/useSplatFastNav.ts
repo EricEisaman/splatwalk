@@ -1,5 +1,7 @@
 import { computed, ref, type ComputedRef, type Ref } from 'vue';
 
+import { Tools } from '@babylonjs/core';
+
 import { readSplatBytes, runFastNav } from '@/navigation/fastNav';
 import { splatwalk } from '@/wasm/bridge';
 import type { UseBabylonViewer } from '@/composables/useBabylonViewer';
@@ -139,13 +141,11 @@ export function useSplatFastNav(babylon: UseBabylonViewer): UseSplatFastNav {
       statusMessage.value = `Fetching ${title}...`;
       appendLog(`[WAIT] Fetching example scene: ${title}...`);
 
-      const response = await fetch(url);
-      if (!response.ok) {
-        throw new Error(`Failed to fetch ${title}: ${response.status} ${response.statusText}`);
-      }
-
-      const blob = await response.blob();
-      const file = new File([blob], `${title}.ply`, { type: 'application/octet-stream' });
+      // Load via Babylon's XHR-based loader (Tools.LoadFile) rather than fetch():
+      // the browser fetch() stream aborts mid-body on some networks, while
+      // Babylon's transport (used everywhere else) downloads reliably.
+      const data = (await Tools.LoadFileAsync(url, true)) as ArrayBuffer;
+      const file = new File([data], `${title}.ply`, { type: 'application/octet-stream' });
       appendLog(`[SUCCESS] Fetched ${title} (${(file.size / (1024 * 1024)).toFixed(2)} MB).`);
 
       await processFile(file);

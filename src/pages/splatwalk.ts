@@ -1,7 +1,7 @@
 import { Viewer } from '../scene/Viewer';
 import { DropZone } from '../components/DropZone';
 import { splatwalk, type GroundFieldCellState, type MeshSettings, type WalkableGroundFieldResult } from '../wasm/bridge';
-import { Mesh, VertexData, StandardMaterial, Color3 } from '@babylonjs/core';
+import { Mesh, VertexData, StandardMaterial, Color3, Tools } from '@babylonjs/core';
 /// <reference types="vite/client" />
 import NavWorker from '../navigation/navmesh.worker?worker';
 import { registerServiceWorker, setupOfflineHandling } from '../pwa/sw-register';
@@ -1579,25 +1579,24 @@ async function main() {
                 console.log(`[WAIT] Fetching example file: ${fileName}...`);
 
                 try {
-                    const response = await fetch(url);
-                    if (!response.ok) {
-                        throw new Error(`Failed to fetch: ${response.statusText} (${response.status})`);
-                    }
-
-                    const blob = await response.blob();
+                    // Load via Babylon's XHR-based loader (Tools.LoadFile) rather than
+                    // fetch(): the browser fetch() stream aborts mid-body on some networks,
+                    // while Babylon's transport (used everywhere else) downloads reliably.
+                    const data = (await Tools.LoadFileAsync(url, true)) as ArrayBuffer;
 
                     // Basic validation
                     if (fileName.toLowerCase().endsWith('.ply')) {
-                        const header = await blob.slice(0, 4).text();
+                        const header = new TextDecoder().decode(new Uint8Array(data, 0, 4));
                         if (header !== "ply\n" && header !== "ply\r") {
                             throw new Error("Fetched data is not a valid PLY file. If this is a Google Drive link, it may be blocked by CORS or showing a virus scan warning.");
                         }
                     }
 
-                    const file = new File([blob], fileName, { type: 'application/octet-stream' });
+                    const file = new File([data], fileName, { type: 'application/octet-stream' });
                     console.log(`[SUCCESS] Example file fetched: ${(file.size / (1024 * 1024)).toFixed(2)} MB.`);
                     handleFileLoad(file);
                 } catch (err: any) {
+                    console.error(`[ERROR] Failed to load example: ${err?.message ?? err}`);
                     logError(`Failed to load example: ${err.message}`);
                     exampleSelect.value = ""; // Reset dropdown
                 }
