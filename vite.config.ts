@@ -1,33 +1,49 @@
-import { defineConfig, type Plugin } from 'vite';
+import { defineConfig, type Plugin, type Connect } from 'vite';
+import vue from '@vitejs/plugin-vue';
+import vuetify from 'vite-plugin-vuetify';
 import { resolve } from 'path';
 import { copyFileSync, mkdirSync, readdirSync, existsSync, rmSync, readFileSync, writeFileSync, statSync } from 'fs';
 import { join } from 'path';
 import { createHash } from 'node:crypto';
 
-// Custom plugin for dev server routing
+// Map clean/extensionless URLs to their built HTML entry. Vite (dev and preview)
+// serves files by path, so the MPA entries need an explicit rewrite the same way
+// nginx maps them in production (see nginx.conf.template).
+function rewriteCleanUrls(req: Connect.IncomingMessage): void {
+  const url = req.url;
+  if (!url) {
+    return;
+  }
+
+  // Only handle HTML-like navigation requests, not assets or Vite internals.
+  const isAssetFile = /\.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|wasm|json|webp|mjs)$/i.test(url);
+  if (!url.endsWith('.html') && (isAssetFile || url.startsWith('/@'))) {
+    return;
+  }
+
+  const query = url.includes('?') ? url.substring(url.indexOf('?')) : '';
+  const path = query ? url.substring(0, url.indexOf('?')) : url;
+
+  if (path === '/app') {
+    req.url = '/index.html' + query;
+  } else if (path === '/vuetify' || path === '/vuetify/') {
+    req.url = '/vuetify.html' + query;
+  }
+}
+
+// Custom plugin for dev + preview server routing of clean URLs.
 function devServerRouting(): Plugin {
   return {
     name: 'dev-server-routing',
     configureServer(server) {
-      server.middlewares.use((req, res, next) => {
-        const url = req.url;
-        if (!url) {
-          next();
-          return;
-        }
-
-        // Only handle HTML requests (not assets)
-        // Check if URL is a file extension (ends with common asset extensions)
-        const isAssetFile = /\.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|wasm|json|webp|mjs)$/i.test(url);
-        if (url.endsWith('.html') || (!isAssetFile && !url.startsWith('/@'))) {
-          // Rewrite /splatwalk to /index.html (or handle root)
-          // Since we moved from g2m.html to index.html, we use root.
-          // But keep for safety if users use old link? No, we are rebranding.
-          // Let's just remove the rewrite or update it if we want /app
-          if (url === '/app' || url.startsWith('/app?')) {
-            req.url = '/index.html' + (url.includes('?') ? url.substring(url.indexOf('?')) : '');
-          }
-        }
+      server.middlewares.use((req, _res, next) => {
+        rewriteCleanUrls(req);
+        next();
+      });
+    },
+    configurePreviewServer(server) {
+      server.middlewares.use((req, _res, next) => {
+        rewriteCleanUrls(req);
         next();
       });
     },
@@ -697,8 +713,13 @@ function injectServiceWorkerBuildId(): Plugin {
 }
 
 export default defineConfig({
+  resolve: {
+    alias: {
+      '@': resolve(__dirname, 'src'),
+    },
+  },
   publicDir: 'public', // Explicitly enable public directory copying
-  plugins: [devServerRouting(), removeVitePreload(), rewriteWasmImports(), copyPublicAssets(), copyWasmModules(), injectServiceWorkerBuildId()],
+  plugins: [vue(), vuetify({ autoImport: true }), devServerRouting(), removeVitePreload(), rewriteWasmImports(), copyPublicAssets(), copyWasmModules(), injectServiceWorkerBuildId()],
   worker: {
     format: 'es'  // Force ES modules for all workers (fixes IIFE error)
   },
@@ -709,6 +730,7 @@ export default defineConfig({
     rollupOptions: {
       input: {
         main: resolve(__dirname, 'index.html'),
+        vuetify: resolve(__dirname, 'vuetify.html'),
       },
       output: {
         format: 'es',

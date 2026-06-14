@@ -34,6 +34,7 @@ services:
         - docker-entrypoint.sh
         - scripts/**
         - index.html
+        - vuetify.html
       ignoredPaths:
         - README.md
         - .git/**

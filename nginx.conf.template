@@ -4,9 +4,12 @@ server {
     root /usr/share/nginx/html;
     index index.html;
 
-    # Apply rate limiting (zones defined in main nginx.conf)
-    # 10 requests per second with burst of 20
-    limit_req zone=general burst=20 nodelay;
+    # Rate limiting (zones defined in main nginx.conf) is applied PER-LOCATION to
+    # HTML navigations only (see the location blocks below). It must NOT live at the
+    # server level: a single page load fans out into dozens/hundreds of parallel
+    # static module chunks (Babylon.js + Vuetify), and a server-wide 10r/s limit
+    # throttles those asset requests, breaking the app. Static assets, /pkg, wasm,
+    # and workers are intentionally left unlimited.
     limit_req_status 429;
 
     # Keep-alive optimizations (inherits from main config, but can override)
@@ -106,11 +109,21 @@ server {
     
     # Root path serves landing page
     location = / {
+        limit_req zone=general burst=20 nodelay;
         try_files /index.html =404;
     }
-    
-    # All other routes fall back to index.html for client-side routing
+
+    # Vuetify FAST NAV showcase (MPA entry built to /vuetify.html at the dist root)
+    location = /vuetify {
+        limit_req zone=general burst=20 nodelay;
+        try_files /vuetify.html =404;
+    }
+
+    # All other routes fall back to index.html for client-side routing.
+    # Rate limiting is applied here (HTML navigations); static assets are matched by
+    # the regex/wasm/pkg/worker locations above and bypass this block entirely.
     location / {
+        limit_req zone=general burst=20 nodelay;
         try_files $uri $uri/ /index.html;
     }
 
