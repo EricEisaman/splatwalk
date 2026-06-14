@@ -57,7 +57,7 @@
   "display": "standalone",
   "background_color": "#111111",
   "theme_color": "#202730",
-  "description": "SplatWalk is a utility that converts Gaussian Splat scenes in .ply or .spz format into efficient 3D assets for games and simulations, generating both 3D .glb meshes and Recast-compatible binary navmesh files.",
+  "description": "SplatWalk converts 3D Gaussian splat (.ply) scenes into .glb ground meshes and Recast-compatible navmesh files using Rust WASM and Babylon.js. .spz support is in progress.",
   "screenshots": [
     {
       "src": "/screenshots/desktop.jpg",

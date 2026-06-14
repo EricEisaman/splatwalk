@@ -41,13 +41,16 @@
             <div class="preprocess-section">
                 <h2>About SplatWalk</h2>
                 <p>
-                    <strong>SplatWalk</strong> is a utility that converts Gaussian Splat scenes in
-                    <strong>.ply</strong> or <strong>.spz</strong> format into efficient 3D assets for
-                    games and simulations, generating both 3D .glb meshes and Recast-compatible binary
-                    <strong>navmesh files</strong>.
-                    This is achieved using advanced <strong>RANSAC Ground Plane Detection</strong> and
-                    <strong>Poisson Reconstruction</strong> with high-performance computational algorithms
-                    powered by Rust WASM and BabylonJS.
+                    <strong>SplatWalk</strong> is a browser-based utility for turning <strong>3D Gaussian splat</strong>
+                    scenes into game-ready assets: exportable <strong>.glb ground meshes</strong> and Recast-compatible
+                    <strong>navmesh binaries</strong>. <strong>.ply</strong> is the primary supported input format;
+                    <strong>.spz</strong> import is available but not yet fully supported.
+                </p>
+                <p>
+                    Use <strong>FAST NAV</strong> to extract a walkable 2.5D floor field and bake click-to-move
+                    navigation in one click, or the advanced <strong>voxel collision</strong> workflow for manual Recast
+                    tuning. Ground meshes can be reconstructed as a RANSAC single plane or a voxelized ground surface.
+                    Processing runs in <strong>Rust WASM</strong> with <strong>Babylon.js</strong> visualization.
                 </p>
             </div>
 
@@ -55,9 +58,8 @@
             <div class="preprocess-section">
                 <h2>3D Workbench</h2>
                 <div class="viewer-description">
-                    <p>Drag and drop <strong>.ply</strong> or <strong>.spz</strong> files on the canvas, use the file
-                        chooser, or select an
-                        example file to begin.</p>
+                    <p>Drag and drop a <strong>.ply</strong> splat on the canvas (<strong>.spz</strong> experimental),
+                        use the file chooser, or select an example file to begin.</p>
                     <div class="example-selector-container">
                         <label for="exampleSelect">SELECT EXAMPLE</label>
                         <select id="exampleSelect" class="cyber-select">
