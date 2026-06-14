@@ -1,5 +1,14 @@
 /// <reference types="vite/client" />
 import SplatWorker from './splat.worker?worker';
+import type { SliceSettings, SliceResult } from './sogTypes';
+
+/** Worker payload shape for slice/convert results before Map reconstruction. */
+interface SliceResultRaw {
+    files: Array<[string, Uint8Array]>;
+    lodMetaPath: string;
+    splatCount: number;
+    chunkCount: number;
+}
 
 export interface MeshBuffers {
     vertices: Float32Array;
@@ -348,6 +357,45 @@ export class SplatWalkBridge {
     public async buildWalkableGroundField(data: Uint8Array, settings: MeshSettings): Promise<WalkableGroundFieldResult> {
         await this.ensureLoaded(data);
         return this.call<WalkableGroundFieldResult>('buildWalkableGroundField', { settings });
+    }
+
+    /**
+     * Slice a splat into a streamed-SOG bundle (`lod-meta.json` + per-chunk SOG
+     * datasets with lossless WebP planes). Returns the universal path-keyed file
+     * map; wrap it in {@link SliceArchive} for download / streaming.
+     */
+    public async sliceSplat(data: Uint8Array, settings: SliceSettings = {}): Promise<SliceResult> {
+        await this.ensureLoaded(data);
+        const raw = await this.call<SliceResultRaw>('sliceSplat', { settings });
+        return this.toSliceResult(raw);
+    }
+
+    /**
+     * Convert a splat into a single (non-LOD) SOG v2 bundle (`meta.json` + WebP
+     * planes). Returns the universal path-keyed file map.
+     */
+    public async convertToSog(data: Uint8Array, settings: SliceSettings = {}): Promise<SliceResult> {
+        await this.ensureLoaded(data);
+        const raw = await this.call<SliceResultRaw>('convertToSog', { settings });
+        return this.toSliceResult(raw);
+    }
+
+    /**
+     * Convert a `.spz` (or `.ply`) splat to a full-fidelity binary `.ply`.
+     * Used to normalize `.spz` input to PLY for the viewer + nav pipeline.
+     */
+    public async spzToPly(data: Uint8Array): Promise<Uint8Array> {
+        await this.ensureLoaded(data);
+        return this.call<Uint8Array>('spzToPly', {});
+    }
+
+    private toSliceResult(raw: SliceResultRaw): SliceResult {
+        return {
+            files: new Map(raw.files),
+            lodMetaPath: raw.lodMetaPath,
+            splatCount: raw.splatCount,
+            chunkCount: raw.chunkCount,
+        };
     }
 }
 

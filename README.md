@@ -23,6 +23,8 @@ One `FAST NAV` click takes a raw splat to a walkable navmesh with a spawned, cli
 - **Navigation Markers**: The scene labels explain the magenta seed marker, blue player agent, green NPC agent, and green walkable navmesh overlay.
 - **2.5D SDF Diagnostics**: Browser-side column fields power the fast floor path and remain available under experimental debug for inspecting accepted, obstacle, variance, and rejected cells.
 - **Mesh Reconstruction**: Integrated Poisson reconstruction for full geometry.
+- **Streamed SOG Export**: Convert a splat into a SOG bundle — a single `meta.json` set or a streamed, Morton-ordered multi-chunk `lod-meta.json` set with lossless WebP planes — decodable by Babylon's SOG loaders and aimed at the GS streaming loader (PR #18563). Full spherical harmonics (configurable degree); large scenes (>1M splats) default to streamed LOD. See [`docs/wasm-api.md`](docs/wasm-api.md) and [`MILESTONES.md`](MILESTONES.md).
+- **Basic `.spz` Support**: `.spz` is normalized to a full-fidelity `.ply` (`spz_to_ply`) so the viewer and nav pipeline only deal with PLY.
 - **One-Click Export**: Download production-ready `.glb` files.
 - **One-Click Export**: Download production-ready `Recast compatible navmesh binary` files.
 

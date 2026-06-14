@@ -20,10 +20,11 @@ export type { FastNavRecoveryConfig, StrayTrimOptions, PruneFloatersOptions };
 </script>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, type ComponentPublicInstance } from 'vue';
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch, type ComponentPublicInstance } from 'vue';
 
 import { useBabylonViewer } from '@/composables/useBabylonViewer';
-import { useSplatFastNav, type LogTag } from '@/composables/useSplatFastNav';
+import { useSplatFastNav, type LogTag, type SogExportMode } from '@/composables/useSplatFastNav';
+import { DEFAULT_AUTO_SLICE_THRESHOLD, DEFAULT_SLICE_SETTINGS, type SliceSettings } from '@/wasm/sogTypes';
 
 const props = withDefaults(
   defineProps<{
@@ -35,6 +36,13 @@ const props = withDefaults(
     prune?: PruneFloatersOptions;
     /** Override the example scenes shown in the "Example scenes" menu. */
     exampleScenes?: readonly ExampleScene[];
+    /** Override the default SOG export / streamed-slice settings. */
+    slice?: SliceSettings;
+    /**
+     * Splat count above which streamed (LOD) export is recommended by default.
+     * Defaults to {@link DEFAULT_AUTO_SLICE_THRESHOLD} (1,000,000).
+     */
+    autoSliceThreshold?: number;
   }>(),
   {
     // Empty object resolves to DEFAULT_FAST_NAV_RECOVERY inside the pipeline,
@@ -43,6 +51,8 @@ const props = withDefaults(
     strayTrim: undefined,
     prune: undefined,
     exampleScenes: () => DEFAULT_EXAMPLE_SCENES,
+    slice: () => ({}),
+    autoSliceThreshold: DEFAULT_AUTO_SLICE_THRESHOLD,
   }
 );
 
@@ -53,8 +63,57 @@ const isDragging = ref(false);
 const isFullscreen = ref(false);
 
 const babylon = useBabylonViewer(canvasRef);
-const { status, statusMessage, errorMessage, logs, isBusy, phase, progress, loadAndProcess, loadExample, reset } =
+const { status, statusMessage, errorMessage, logs, isBusy, phase, progress, splatCount, loadAndProcess, loadExample, exportSog, reset } =
   useSplatFastNav(babylon, { recovery: props.recovery, strayTrim: props.strayTrim, prune: props.prune });
+
+// --- Streamed SOG export -------------------------------------------------
+// Reactive slice settings seeded from the defaults + any `slice` prop override.
+const sliceForm = reactive<Required<SliceSettings>>({
+  sh_degree: props.slice.sh_degree ?? DEFAULT_SLICE_SETTINGS.sh_degree,
+  sh_cluster_count: props.slice.sh_cluster_count ?? DEFAULT_SLICE_SETTINGS.sh_cluster_count,
+  sh_iterations: props.slice.sh_iterations ?? DEFAULT_SLICE_SETTINGS.sh_iterations,
+  chunk_count: props.slice.chunk_count ?? DEFAULT_SLICE_SETTINGS.chunk_count,
+  chunk_extent: props.slice.chunk_extent ?? DEFAULT_SLICE_SETTINGS.chunk_extent,
+  lod_levels: props.slice.lod_levels ?? DEFAULT_SLICE_SETTINGS.lod_levels,
+});
+
+const isLargeScene = computed(
+  () => splatCount.value !== null && splatCount.value > props.autoSliceThreshold
+);
+// Default to streamed export for large scenes (>1M splats), single otherwise.
+const sogMode = ref<SogExportMode>('streamed');
+const sogExporting = ref(false);
+const sogSummary = ref<string | null>(null);
+
+// Auto-pick the recommended mode whenever a new scene's count resolves; the
+// user can still flip it before exporting.
+watch(splatCount, () => {
+  sogSummary.value = null;
+  sogMode.value = isLargeScene.value ? 'streamed' : 'single';
+});
+
+const sogStatusText = computed(() => {
+  if (sogSummary.value) return sogSummary.value;
+  if (splatCount.value === null) return null;
+  return isLargeScene.value
+    ? `${splatCount.value.toLocaleString()} splats — large scene. Streamed LOD export recommended.`
+    : `${splatCount.value.toLocaleString()} splats. Streamed or single SOG export available.`;
+});
+
+async function runSogExport(): Promise<void> {
+  if (sogExporting.value) return;
+  sogExporting.value = true;
+  sogSummary.value = null;
+  try {
+    const archive = await exportSog(sogMode.value, { ...sliceForm });
+    const mb = (archive.byteLength / 1e6).toFixed(1);
+    sogSummary.value = `Exported ${archive.chunkCount} chunk(s), ${archive.fileCount} files (${mb} MB).`;
+  } catch (error) {
+    sogSummary.value = `Export failed: ${error instanceof Error ? error.message : String(error)}`;
+  } finally {
+    sogExporting.value = false;
+  }
+}
 
 // Human-readable progress suffix (e.g. "Pruning floaters 42%") when the worker
 // reports a real fraction during the prune pass.
@@ -273,6 +332,78 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
             Load another
           </v-btn>
         </div>
+
+        <v-expansion-panels v-if="status === 'done'" class="mt-4" variant="accordion">
+          <v-expansion-panel title="Streamed SOG export">
+            <template #text>
+              <div v-if="sogStatusText" class="text-caption mb-3" :class="isLargeScene ? 'text-primary' : 'text-medium-emphasis'">
+                {{ sogStatusText }}
+              </div>
+
+              <v-btn-toggle v-model="sogMode" mandatory density="comfortable" color="primary" class="mb-4">
+                <v-btn value="streamed" prepend-icon="mdi-layers-triple">LOD</v-btn>
+                <v-btn value="single" prepend-icon="mdi-file-outline">Single SOG</v-btn>
+              </v-btn-toggle>
+
+              <v-row dense>
+                <v-col cols="12" sm="4">
+                  <v-text-field
+                    v-model.number="sliceForm.sh_degree"
+                    type="number" min="0" max="3" step="1"
+                    label="SH Degree" density="compact" variant="outlined" hide-details
+                  />
+                </v-col>
+                <v-col cols="12" sm="4">
+                  <v-text-field
+                    v-model.number="sliceForm.sh_cluster_count"
+                    type="number" min="1" max="65536" step="256"
+                    label="SH Palette Size" density="compact" variant="outlined" hide-details
+                  />
+                </v-col>
+                <v-col cols="12" sm="4">
+                  <v-text-field
+                    v-model.number="sliceForm.sh_iterations"
+                    type="number" min="1" max="50" step="1"
+                    label="SH Iterations" density="compact" variant="outlined" hide-details
+                  />
+                </v-col>
+                <template v-if="sogMode === 'streamed'">
+                  <v-col cols="12" sm="4">
+                    <v-text-field
+                      v-model.number="sliceForm.chunk_count"
+                      type="number" min="1000" max="4000000" step="16000"
+                      label="Splats / Chunk" density="compact" variant="outlined" hide-details
+                    />
+                  </v-col>
+                  <v-col cols="12" sm="4">
+                    <v-text-field
+                      v-model.number="sliceForm.chunk_extent"
+                      type="number" min="0" max="1000" step="1"
+                      label="Chunk Extent (m)" density="compact" variant="outlined" hide-details
+                    />
+                  </v-col>
+                  <v-col cols="12" sm="4">
+                    <v-text-field
+                      v-model.number="sliceForm.lod_levels"
+                      type="number" min="1" max="6" step="1"
+                      label="LOD Levels" density="compact" variant="outlined" hide-details
+                    />
+                  </v-col>
+                </template>
+              </v-row>
+
+              <v-btn
+                class="mt-4"
+                color="primary"
+                :loading="sogExporting"
+                prepend-icon="mdi-download"
+                @click="runSogExport"
+              >
+                Export SOG (.zip)
+              </v-btn>
+            </template>
+          </v-expansion-panel>
+        </v-expansion-panels>
 
         <v-expansion-panels v-if="logs.length" class="mt-4" variant="accordion">
           <v-expansion-panel title="System logs">

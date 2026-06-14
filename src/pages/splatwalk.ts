@@ -1,6 +1,8 @@
 import { Viewer } from '../scene/Viewer';
 import { DropZone } from '../components/DropZone';
 import { splatwalk, type GroundFieldCellState, type MeshSettings } from '../wasm/bridge';
+import { SliceArchive } from '../wasm/sliceArchive';
+import { DEFAULT_AUTO_SLICE_THRESHOLD, type SliceSettings } from '../wasm/sogTypes';
 import { Mesh, VertexData, StandardMaterial, Color3, Tools, Material } from '@babylonjs/core';
 /// <reference types="vite/client" />
 import NavWorker from '../navigation/navmesh.worker?worker';
@@ -235,6 +237,45 @@ async function main() {
         });
     }
 
+    // Streamed SOG Export panel: collapsible toggle + mode-dependent visibility.
+    const sogExportToggle = document.getElementById('sogExportToggle');
+    const sogExportPanel = document.getElementById('sogExportPanel');
+    if (sogExportToggle && sogExportPanel) {
+        sogExportToggle.addEventListener('click', () => {
+            const isHidden = sogExportPanel.style.display === 'none';
+            sogExportPanel.style.display = isHidden ? 'flex' : 'none';
+            sogExportToggle.classList.toggle('open', isHidden);
+        });
+    }
+    const sogModeRadios = Array.from(document.getElementsByName('sogMode')) as HTMLInputElement[];
+    const isStreamedSogMode = (): boolean => sogModeRadios.find(r => r.checked)?.value !== 'single';
+    const updateSogModeVisibility = (): void => {
+        const streamed = isStreamedSogMode();
+        document.querySelectorAll('.sog-streamed-only').forEach(el => {
+            (el as HTMLElement).style.display = streamed ? '' : 'none';
+        });
+    };
+    sogModeRadios.forEach(r => r.addEventListener('change', updateSogModeVisibility));
+    updateSogModeVisibility();
+
+    // Read the homepage SOG controls into a typed SliceSettings (omitted values
+    // fall back to the WASM defaults).
+    const buildSliceSettings = (): SliceSettings => {
+        const num = (id: string): number | undefined => {
+            const input = document.getElementById(id) as HTMLInputElement | null;
+            const value = input ? Number(input.value) : NaN;
+            return Number.isFinite(value) ? value : undefined;
+        };
+        return {
+            sh_degree: num('paramSogShDegree'),
+            sh_cluster_count: num('paramSogShClusters'),
+            sh_iterations: num('paramSogShIterations'),
+            chunk_count: num('paramSogChunkCount'),
+            chunk_extent: num('paramSogChunkExtent'),
+            lod_levels: num('paramSogLodLevels'),
+        };
+    };
+
     try {
         console.log("[INFO] Initializing SplatWalk...");
 
@@ -364,16 +405,89 @@ async function main() {
                             } else {
                                 throw new Error("Browser does not support DecompressionStream. Cannot read .spz files.");
                             }
-                        } else {
-                            buffer = await file.arrayBuffer();
+                            // Normalize SPZ to a full-fidelity PLY so the entire nav pipeline
+                            // only ever deals with PLY (basic .spz support).
+                            console.log("[INFO] Converting .spz to .ply (preserving spherical harmonics)...");
+                            const ply = await splatwalk.spzToPly(new Uint8Array(buffer));
+                            console.log(`[INFO] Converted .spz to ${ply.byteLength}-byte .ply.`);
+                            return ply;
                         }
 
+                        buffer = await file.arrayBuffer();
                         return new Uint8Array(buffer);
                     })();
                 }
 
                 return splatBytesPromise;
             };
+
+            // --- Streamed SOG export (per loaded file) ---------------------
+            const sogStatus = document.getElementById('sogExportStatus');
+            const setSogStatus = (text: string, auto = false): void => {
+                if (!sogStatus) return;
+                sogStatus.textContent = text;
+                sogStatus.classList.toggle('sog-auto', auto);
+            };
+            // Reset the export button's listeners for this file by cloning it.
+            const existingSogBtn = document.getElementById('sogExportBtn') as HTMLButtonElement | null;
+            if (existingSogBtn) {
+                const sogBtn = existingSogBtn.cloneNode(true) as HTMLButtonElement;
+                existingSogBtn.replaceWith(sogBtn);
+                sogBtn.addEventListener('click', async () => {
+                    const label = sogBtn.textContent;
+                    try {
+                        sogBtn.disabled = true;
+                        sogBtn.textContent = 'EXPORTING…';
+                        const bytes = await readSplatBytes();
+                        const settings = buildSliceSettings();
+                        const streamed = isStreamedSogMode();
+                        console.log(`[INFO] Exporting ${streamed ? 'streamed LOD' : 'single'} SOG...`);
+                        const result = streamed
+                            ? await splatwalk.sliceSplat(bytes, settings)
+                            : await splatwalk.convertToSog(bytes, settings);
+                        const archive = new SliceArchive(result);
+                        const base = file.name.replace(/\.(ply|spz)$/i, '');
+                        archive.download(`${base}-sog`);
+                        const mb = (archive.byteLength / 1e6).toFixed(1);
+                        console.log(`[INFO] Exported ${archive.fileCount} file(s), ${archive.chunkCount} chunk(s), ${mb} MB.`);
+                        setSogStatus(`Exported ${archive.chunkCount} chunk(s), ${archive.fileCount} files (${mb} MB).`);
+                    } catch (err) {
+                        const message = err instanceof Error ? err.message : String(err);
+                        console.error(`[ERROR] SOG export failed: ${message}`);
+                        setSogStatus(`Export failed: ${message}`);
+                    } finally {
+                        sogBtn.disabled = false;
+                        sogBtn.textContent = label;
+                    }
+                });
+            }
+            // Background: detect large scenes (>1M splats) and recommend/auto-open
+            // streamed export, per the default-slicing requirement.
+            void (async () => {
+                try {
+                    const bytes = await readSplatBytes();
+                    const bounds = await splatwalk.getSplatBounds(bytes, { mode: 2, prune_floaters: false } as MeshSettings);
+                    const count = bounds.point_count;
+                    const large = count > DEFAULT_AUTO_SLICE_THRESHOLD;
+                    setSogStatus(
+                        large
+                            ? `${count.toLocaleString()} splats — large scene. Streamed LOD export recommended.`
+                            : `${count.toLocaleString()} splats. Streamed or single SOG export available.`,
+                        large,
+                    );
+                    if (large) {
+                        const streamedRadio = sogModeRadios.find(r => r.value === 'streamed');
+                        if (streamedRadio) streamedRadio.checked = true;
+                        updateSogModeVisibility();
+                        if (sogExportPanel && sogExportToggle && sogExportPanel.style.display === 'none') {
+                            sogExportPanel.style.display = 'flex';
+                            sogExportToggle.classList.add('open');
+                        }
+                    }
+                } catch {
+                    // Best-effort: status stays blank if bounds can't be computed yet.
+                }
+            })();
 
             let generatedNavData: Uint8Array | null = null;
             // Track whether a navmesh has been built and which path produced it, so a manual

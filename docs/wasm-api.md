@@ -142,6 +142,141 @@ Walkable continuity is judged against neighbors, not intra-column layer spread: 
 
 The browser `FAST NAV` workflow uses this field directly: it snaps the start seed onto the detected floor plane, keeps only `walkable` and `filled` cells (with a relaxed fallback mask for noisy scans), rejects obstacle/discontinuity/void/low-confidence/eroded/discarded cells, selects the connected floor component nearest the seed, triangulates that floor component, and sends that floor mesh to Recast. This keeps the one-button path focused on visible room floors instead of collider boundary artifacts.
 
+## Streamed SOG Export And Slicing
+
+SplatWalk can convert a `.ply`/`.spz` splat into a **SOG** (Spatially Ordered
+Gaussians) bundle — the quantized, WebP-textured format decoded by Babylon's
+`@babylonjs/loaders/SPLAT` (`ParseSogMeta` / `ParseSogMetaAsTextures`). Two
+shapes are produced: a single SOG (`meta.json` + planes) or a streamed,
+multi-chunk LOD bundle (`lod-meta.json` + per-chunk SOG datasets) intended for
+the Babylon GS streaming loader (PR #18563).
+
+All quantization **and** lossless WebP encoding happen inside the WASM call
+(`image-webp`, VP8L), so the returned bytes are final. The TypeScript worker
+only collates them into a path-keyed file map.
+
+### `slice_splat(bytes, settings)`
+
+Slice a splat into a streamed-SOG bundle. Returns a manifest:
+
+```ts
+{
+  lodMetaPath: string;                 // "lod-meta.json"
+  lodMetaJson: string;                 // manifest contents
+  files: { path: string; contents: string }[];          // per-chunk meta.json
+  binaries: { path: string; bytes: Uint8Array }[];       // lossless .webp planes
+  splatCount: number;
+  chunkCount: number;
+}
+```
+
+Bundle layout (paths are bundle-relative, ready to host as-is):
+
+```none
+lod-meta.json
+lod0/chunk0/meta.json
+lod0/chunk0/means_l.webp        # 16-bit means, low byte
+lod0/chunk0/means_u.webp        # 16-bit means, high byte
+lod0/chunk0/scales.webp         # codebook-indexed log-scales
+lod0/chunk0/quats.webp          # largest-three packed rotation
+lod0/chunk0/sh0.webp            # codebook DC color (RGB) + opacity (A)
+lod0/chunk0/shN_centroids.webp  # SH palette centroids (when SH degree > 0)
+lod0/chunk0/shN_labels.webp     # per-splat palette index
+lod0/chunk1/...
+```
+
+`lod-meta.json` (interim schema, `version: 1`; will be reconciled with the
+final Babylon streaming contract):
+
+```ts
+{
+  version: 1;
+  splatCount: number;
+  shDegree: number;
+  chunkCountTarget: number;
+  chunkExtent: number;
+  levels: {
+    level: number;               // 0 = coarsest, last = full detail
+    splatCount: number;
+    chunks: {
+      id: number;
+      splatCount: number;
+      boundMin: [number, number, number];
+      boundMax: [number, number, number];
+      dir: string;               // e.g. "lod0/chunk0"
+      meta: string;              // "meta.json"
+    }[];
+  }[];
+}
+```
+
+### `convert_to_sog(bytes, settings)`
+
+Convert a splat into a single (non-LOD) SOG v2 bundle. Returns the same manifest
+shape as `slice_splat`, with `lodMetaPath: "meta.json"` and all planes at the
+bundle root.
+
+### `spz_to_ply(bytes)`
+
+Convert a `.spz` (or `.ply`) splat to a full-fidelity binary little-endian 3DGS
+`.ply` (`Uint8Array`), preserving the spherical-harmonic stack. SplatWalk uses
+this to normalize `.spz` input to PLY so the viewer and nav pipeline only ever
+deal with PLY. `.spz` files are gzip-compressed; decompress them (e.g. via the
+browser `DecompressionStream`) before calling.
+
+### Slice settings
+
+All fields are optional and fall back to the defaults below:
+
+```ts
+interface SliceSettings {
+  sh_degree?: number;        // exported SH degree cap, 0..3   (default 3)
+  sh_cluster_count?: number; // shN k-means palette size       (default 4096)
+  sh_iterations?: number;    // shN k-means refinement passes  (default 10)
+  chunk_count?: number;      // target splats per LOD chunk    (default 256000)
+  chunk_extent?: number;     // soft chunk extent in meters    (default 16)
+  lod_levels?: number;       // LOD levels, >=1                (default 1)
+}
+```
+
+`sh_degree: 0` drops higher-order SH (no `shN` planes). Larger
+`sh_cluster_count` / `sh_iterations` improve SH fidelity at the cost of encode
+time; the shN k-means assignment is the slowest stage on very large scenes.
+
+### TypeScript bridge and `SliceArchive`
+
+The bridge (`src/wasm/bridge.ts`) returns a universal, path-keyed `SliceResult`
+(`{ files: Map<string, Uint8Array>; lodMetaPath; splatCount; chunkCount }`):
+
+```ts
+const result = await splatwalk.sliceSplat(bytes, { sh_degree: 3, lod_levels: 2 });
+const archive = new SliceArchive(result);
+
+// 1) Download a store-only .zip (internal layout == hostable directory):
+archive.download('myscene-sog');           // -> myscene-sog.zip
+
+// 2) In-app streaming preview (no Service Worker, no network):
+const dir = archive.createBlobDirectory();  // path -> blob: URL
+//   dir.rootUrl          -> blob: URL of lod-meta.json
+//   dir.resolve(path)    -> blob: URL of any bundle file
+//   dir.dispose()        -> revoke all URLs when done
+
+// 3) Production streaming: host the unzipped bundle on any static host/CDN and
+//    stream lod-meta.json by URL (no app code).
+```
+
+`spz_to_ply` is exposed as `splatwalk.spzToPly(bytes)`.
+
+### UI
+
+Both demos expose every slice parameter and default to streamed (LOD) export
+for scenes over 1,000,000 splats:
+
+- **Homepage** (plain DOM): a "Streamed SOG Export" panel in the setup section
+  (`index.html`, wired in `src/pages/splatwalk.ts`).
+- **Vuetify** (`SplatFastNavShowcase`): an "Streamed SOG export" expansion panel;
+  override defaults via the `slice` prop and the `autoSliceThreshold` prop.
+
 ## Fast Nav And Collider NavMesh Pipelines
 
 SplatWalk exposes two navigation workflows in the UI.

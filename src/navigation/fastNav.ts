@@ -225,23 +225,22 @@ interface NavIslandMetadata {
 
 /**
  * Read splat bytes from a `.ply` or `.spz` file. `.spz` files are gzip-compressed
- * and decompressed in-browser via `DecompressionStream`.
+ * and decompressed in-browser via `DecompressionStream`, then normalized to a
+ * full-fidelity `.ply` via the WASM `spzToPly` so the rest of the pipeline only
+ * ever deals with PLY. Requires the WASM to be initialized for `.spz` input.
  */
 export async function readSplatBytes(file: File): Promise<Uint8Array> {
-  let buffer: ArrayBuffer;
-
   if (file.name.toLowerCase().endsWith('.spz')) {
     if (!('DecompressionStream' in window)) {
       throw new Error('Browser does not support DecompressionStream. Cannot read .spz files.');
     }
     const ds = new DecompressionStream('gzip');
     const decompressedStream = file.stream().pipeThrough(ds);
-    buffer = await new Response(decompressedStream).arrayBuffer();
-  } else {
-    buffer = await file.arrayBuffer();
+    const decompressed = new Uint8Array(await new Response(decompressedStream).arrayBuffer());
+    return splatwalk.spzToPly(decompressed);
   }
 
-  return new Uint8Array(buffer);
+  return new Uint8Array(await file.arrayBuffer());
 }
 
 /**

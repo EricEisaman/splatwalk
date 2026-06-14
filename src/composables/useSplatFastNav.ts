@@ -10,8 +10,13 @@ import {
   type PruneFloatersOptions,
   type FastNavPhase,
 } from '@/navigation/fastNav';
-import { splatwalk } from '@/wasm/bridge';
+import { splatwalk, type MeshSettings } from '@/wasm/bridge';
+import { SliceArchive } from '@/wasm/sliceArchive';
+import type { SliceSettings } from '@/wasm/sogTypes';
 import type { UseBabylonViewer } from '@/composables/useBabylonViewer';
+
+/** Which SOG export to produce. */
+export type SogExportMode = 'streamed' | 'single';
 
 /** High-level state of the FAST NAV showcase flow. */
 export type FastNavStatus = 'idle' | 'loading' | 'processing' | 'done' | 'error';
@@ -66,10 +71,19 @@ export interface UseSplatFastNav {
   readonly phase: Ref<FastNavUiPhase>;
   /** Latest throttled WASM progress, or null when none is active. */
   readonly progress: Ref<FastNavProgress | null>;
+  /** Raw splat count of the loaded scene, or null before/while loading. */
+  readonly splatCount: Ref<number | null>;
   /** Validate, load, auto-run FAST NAV, then frame the player top-down. */
   readonly loadAndProcess: (file: File) => Promise<void>;
   /** Fetch an example splat from a URL, then run the same pipeline. */
   readonly loadExample: (url: string, title: string) => Promise<void>;
+  /**
+   * Export the loaded splat as a SOG bundle: `'streamed'` produces a streamed
+   * multi-chunk `lod-meta.json` set; `'single'` produces one SOG `meta.json`.
+   * Returns a {@link SliceArchive} (download / streaming handles). Throws if no
+   * splat is loaded.
+   */
+  readonly exportSog: (mode: SogExportMode, settings?: SliceSettings) => Promise<SliceArchive>;
   /** Reset back to the idle state, clearing logs and errors. */
   readonly reset: () => void;
 }
@@ -98,9 +112,13 @@ export function useSplatFastNav(
   const logs = ref<LogEntry[]>([]);
   const phase = ref<FastNavUiPhase>('idle');
   const progress = ref<FastNavProgress | null>(null);
+  const splatCount = ref<number | null>(null);
   const isBusy = computed(() => status.value === 'loading' || status.value === 'processing');
 
   let wasmReady = false;
+  // Bytes + base name of the loaded scene, retained for SOG export.
+  let currentBytes: Uint8Array | null = null;
+  let currentName = 'splat';
 
   const appendLog = (message: string): void => {
     logs.value.push(parseLog(message));
@@ -118,6 +136,9 @@ export function useSplatFastNav(
     logs.value = [];
     phase.value = 'idle';
     progress.value = null;
+    splatCount.value = null;
+    currentBytes = null;
+    currentName = 'splat';
   };
 
   const processFile = async (file: File): Promise<void> => {
@@ -145,6 +166,16 @@ export function useSplatFastNav(
       appendLog('[INFO] Splat visualized.');
 
       const bytes = await readSplatBytes(file);
+      currentBytes = bytes;
+      currentName = file.name.replace(/\.(ply|spz)$/i, '');
+      // Capture the raw splat count for the export UI (cheap: the parse is cached
+      // and reused by the FAST NAV run below).
+      try {
+        const bounds = await splatwalk.getSplatBounds(bytes, { mode: 2, prune_floaters: false } as MeshSettings);
+        splatCount.value = bounds.point_count;
+      } catch {
+        splatCount.value = null;
+      }
 
       status.value = 'processing';
       statusMessage.value = 'Running FAST NAV...';
@@ -224,5 +255,31 @@ export function useSplatFastNav(
     }
   };
 
-  return { status, statusMessage, errorMessage, logs, isBusy, phase, progress, loadAndProcess, loadExample, reset };
+  const exportSog = async (mode: SogExportMode, settings: SliceSettings = {}): Promise<SliceArchive> => {
+    if (!currentBytes) {
+      throw new Error('No splat loaded to export.');
+    }
+    const result =
+      mode === 'streamed'
+        ? await splatwalk.sliceSplat(currentBytes, settings)
+        : await splatwalk.convertToSog(currentBytes, settings);
+    const archive = new SliceArchive(result);
+    archive.download(`${currentName}-sog`);
+    return archive;
+  };
+
+  return {
+    status,
+    statusMessage,
+    errorMessage,
+    logs,
+    isBusy,
+    phase,
+    progress,
+    splatCount,
+    loadAndProcess,
+    loadExample,
+    exportSog,
+    reset,
+  };
 }

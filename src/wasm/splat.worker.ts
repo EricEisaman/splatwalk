@@ -4,9 +4,47 @@ import init, {
     build_walkable_ground_field,
     convert_splat_to_mesh,
     convert_splat_to_navmesh_basis,
+    convert_to_sog,
     get_splat_bounds,
+    slice_splat,
+    spz_to_ply,
     suggest_region,
 } from '../../pkg/wasm_splatwalk/wasm_splatwalk.js';
+import type { SliceManifestRaw } from './sogTypes';
+
+/**
+ * Collate a raw slice manifest into a flat, path-keyed file map (the universal
+ * representation consumed by download + streaming). Returns the entries plus the
+ * set of transferable buffers so the bytes move to the main thread zero-copy.
+ */
+const collateManifest = (
+    manifest: SliceManifestRaw,
+): { entries: Array<[string, Uint8Array]>; transfer: ArrayBuffer[]; lodMetaPath: string; splatCount: number; chunkCount: number } => {
+    const encoder = new TextEncoder();
+    const entries: Array<[string, Uint8Array]> = [];
+    const transfer: ArrayBuffer[] = [];
+
+    const add = (path: string, bytes: Uint8Array): void => {
+        entries.push([path, bytes]);
+        transfer.push(bytes.buffer as ArrayBuffer);
+    };
+
+    add(manifest.lodMetaPath, encoder.encode(manifest.lodMetaJson));
+    for (const file of manifest.files) {
+        add(file.path, encoder.encode(file.contents));
+    }
+    for (const binary of manifest.binaries) {
+        add(binary.path, binary.bytes);
+    }
+
+    return {
+        entries,
+        transfer,
+        lodMetaPath: manifest.lodMetaPath,
+        splatCount: manifest.splatCount,
+        chunkCount: manifest.chunkCount,
+    };
+};
 
 const ctx: Worker = self as unknown as Worker;
 
@@ -59,6 +97,37 @@ ctx.onmessage = async (e: MessageEvent): Promise<void> => {
         if (!currentData) throw new Error('No splat loaded in worker');
 
         const settings = payload.settings;
+
+        // Slice/convert ops return a (potentially large) file map; collate it and
+        // transfer the byte buffers so nothing is copied on the way out.
+        if (type === 'sliceSplat' || type === 'convertToSog') {
+            const manifest = (type === 'sliceSplat'
+                ? slice_splat(currentData, settings)
+                : convert_to_sog(currentData, settings)) as SliceManifestRaw;
+            const collated = collateManifest(manifest);
+            ctx.postMessage(
+                {
+                    kind: 'result',
+                    id,
+                    ok: true,
+                    result: {
+                        files: collated.entries,
+                        lodMetaPath: collated.lodMetaPath,
+                        splatCount: collated.splatCount,
+                        chunkCount: collated.chunkCount,
+                    },
+                },
+                collated.transfer,
+            );
+            return;
+        }
+
+        if (type === 'spzToPly') {
+            const ply = spz_to_ply(currentData);
+            ctx.postMessage({ kind: 'result', id, ok: true, result: ply }, [ply.buffer as ArrayBuffer]);
+            return;
+        }
+
         let result: unknown;
         switch (type) {
             case 'getSplatBounds':

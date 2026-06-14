@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 
 mod splat;
 mod mesh;
+mod sog;
+mod slice;
 
 #[wasm_bindgen]
 extern "C" {
@@ -487,4 +489,86 @@ pub fn build_walkable_ground_field(data: &[u8], settings: JsValue) -> Result<JsV
     let splats = parse_splats(data, &settings)?;
     let result = mesh::build_walkable_ground_field(&splats, &settings)?;
     Ok(serde_wasm_bindgen::to_value(&result)?)
+}
+
+/// Tunable parameters for SOG export and streamed-SOG slicing. All fields are
+/// optional; omitted values fall back to [`slice::SliceParams::default`].
+#[derive(Deserialize, Default)]
+pub struct SliceSettings {
+    pub sh_degree: Option<usize>,
+    pub sh_cluster_count: Option<usize>,
+    pub sh_iterations: Option<usize>,
+    pub chunk_count: Option<usize>,
+    pub chunk_extent: Option<f64>,
+    pub lod_levels: Option<usize>,
+}
+
+impl SliceSettings {
+    fn to_params(&self) -> slice::SliceParams {
+        let d = slice::SliceParams::default();
+        slice::SliceParams {
+            sh_degree: self.sh_degree.unwrap_or(d.sh_degree).min(3),
+            sh_cluster_count: self.sh_cluster_count.unwrap_or(d.sh_cluster_count).clamp(1, 65536),
+            sh_iterations: self.sh_iterations.unwrap_or(d.sh_iterations).max(1),
+            chunk_count: self.chunk_count.unwrap_or(d.chunk_count).max(1),
+            chunk_extent: self.chunk_extent.unwrap_or(d.chunk_extent).max(0.0),
+            lod_levels: self.lod_levels.unwrap_or(d.lod_levels).max(1),
+        }
+    }
+}
+
+fn parse_slice_settings(settings: JsValue) -> Result<SliceSettings, JsValue> {
+    if settings.is_undefined() || settings.is_null() {
+        return Ok(SliceSettings::default());
+    }
+    serde_wasm_bindgen::from_value(settings).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Slice a `.ply`/`.spz` splat into a streamed-SOG bundle: a `lod-meta.json`
+/// manifest, per-chunk `meta.json` files, and raw RGBA planes for the JS layer
+/// to encode to lossless WebP. Follows Babylon PR #18563's streaming layout.
+#[wasm_bindgen]
+pub fn slice_splat(data: &[u8], settings: JsValue) -> Result<JsValue, JsValue> {
+    let settings = parse_slice_settings(settings)?;
+    let params = settings.to_params();
+    let cloud = splat::parse_full_cloud(data).map_err(|e| JsValue::from_str(&e))?;
+    log(&format!(
+        "Slicing {} splats (SH degree {}, {} LOD level(s), ~{} splats/chunk)",
+        cloud.len(),
+        params.sh_degree,
+        params.lod_levels,
+        params.chunk_count
+    ));
+    let manifest = slice::slice(&cloud, &params).map_err(|e| JsValue::from_str(&e))?;
+    log(&format!(
+        "Sliced into {} chunk(s)",
+        manifest.chunk_count
+    ));
+    Ok(serde_wasm_bindgen::to_value(&manifest)?)
+}
+
+/// Convert a `.ply`/`.spz` splat into a single (non-LOD) SOG v2 bundle:
+/// a `meta.json` plus raw RGBA planes for lossless WebP encoding.
+#[wasm_bindgen]
+pub fn convert_to_sog(data: &[u8], settings: JsValue) -> Result<JsValue, JsValue> {
+    let settings = parse_slice_settings(settings)?;
+    let params = settings.to_params();
+    let cloud = splat::parse_full_cloud(data).map_err(|e| JsValue::from_str(&e))?;
+    let manifest = slice::encode_single(
+        &cloud,
+        params.sh_degree,
+        params.sh_cluster_count,
+        params.sh_iterations,
+    )
+    .map_err(|e| JsValue::from_str(&e))?;
+    Ok(serde_wasm_bindgen::to_value(&manifest)?)
+}
+
+/// Convert a `.spz` (or `.ply`) splat to a binary little-endian 3DGS `.ply`,
+/// preserving the full spherical-harmonic stack. Enables basic `.spz` support
+/// by normalizing everything to PLY for the viewer and nav pipeline.
+#[wasm_bindgen]
+pub fn spz_to_ply(data: &[u8]) -> Result<Vec<u8>, JsValue> {
+    let cloud = splat::parse_full_cloud(data).map_err(|e| JsValue::from_str(&e))?;
+    Ok(splat::write_ply(&cloud))
 }
