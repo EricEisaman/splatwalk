@@ -10,6 +10,7 @@ import {
     Mesh,
     VertexData,
     StandardMaterial,
+    Material,
     PointerEventTypes,
     GizmoManager,
     DynamicTexture,
@@ -82,11 +83,9 @@ export class Viewer {
         try {
             this.disableRegionSelection();
             this.clearGroundFieldOverlay();
-            this.cleanupCrowdObservers();
-            this.navMeshDebugMesh = null;
-            this.navMeshSpawnPoint = null;
+            this.resetDerivedSceneState();
 
-            // Clear existing meshes
+            // Clear remaining meshes (splat and any stragglers)
             while (this.scene.meshes.length > 0) {
                 this.scene.meshes[0].dispose();
             }
@@ -265,6 +264,7 @@ export class Viewer {
     private userMesh: AbstractMesh | null = null;
     private npcMeshes: AbstractMesh[] = [];
     private navMeshDebugMesh: Mesh | null = null;
+    private navMeshMaterial: StandardMaterial | null = null;
     private navMeshVisualOffset: Vector3 = Vector3.Zero();
     private navMeshSpawnPoint: Vector3 | null = null;
     private pointerObserver: any = null;
@@ -425,7 +425,7 @@ export class Viewer {
 
         this.colliderMaterial = new StandardMaterial("collider_mesh_mat", this.scene);
         this.colliderMaterial.diffuseColor = new Color3(0.0, 0.85, 1.0);
-        this.colliderMaterial.alpha = opacity;
+        this.applyAlphaOpacity(this.colliderMaterial, opacity);
         this.colliderMaterial.backFaceCulling = false;
 
         for (const mesh of this.colliderMeshes) {
@@ -453,7 +453,7 @@ export class Viewer {
 
         this.colliderMaterial = new StandardMaterial("collider_mesh_mat", this.scene);
         this.colliderMaterial.diffuseColor = new Color3(0.0, 0.85, 1.0);
-        this.colliderMaterial.alpha = opacity;
+        this.applyAlphaOpacity(this.colliderMaterial, opacity);
         this.colliderMaterial.backFaceCulling = false;
         mesh.material = this.colliderMaterial;
         mesh.isPickable = false;
@@ -479,8 +479,23 @@ export class Viewer {
 
     public setColliderOpacity(opacity: number): void {
         if (this.colliderMaterial) {
-            this.colliderMaterial.alpha = opacity;
+            this.applyAlphaOpacity(this.colliderMaterial, opacity);
         }
+    }
+
+    public setNavMeshVisible(visible: boolean): void {
+        this.navMeshDebugMesh?.setEnabled(visible);
+    }
+
+    public setNavMeshOpacity(opacity: number): void {
+        if (this.navMeshMaterial) {
+            this.applyAlphaOpacity(this.navMeshMaterial, opacity);
+        }
+    }
+
+    private applyAlphaOpacity(material: StandardMaterial, alpha: number): void {
+        material.alpha = alpha;
+        material.transparencyMode = alpha < 1 ? Material.MATERIAL_ALPHABLEND : Material.MATERIAL_OPAQUE;
     }
 
     public getColliderBounds(): { min: Vector3, max: Vector3 } | null {
@@ -589,15 +604,9 @@ export class Viewer {
     }
 
     public async displayNavMesh(positions: Float32Array, indices: Uint32Array, visualOffsetY = 0): Promise<Vector3 | null> {
-        const name = "navmesh_debug";
-        if (this.navMeshDebugMesh) {
-            this.navMeshDebugMesh.dispose();
-            this.navMeshDebugMesh = null;
-        }
-        const old = this.scene.getMeshByName(name);
-        if (old) old.dispose();
+        this.clearNavMeshOverlay();
 
-        const mesh = new Mesh(name, this.scene);
+        const mesh = new Mesh("navmesh_debug", this.scene);
         const vertexData = new VertexData();
         vertexData.positions = positions;
         vertexData.indices = indices;
@@ -606,12 +615,13 @@ export class Viewer {
 
         const mat = new StandardMaterial("navmesh_mat", this.scene);
         mat.diffuseColor = new Color3(0, 1, 0);
-        mat.alpha = 0.55;
+        this.applyAlphaOpacity(mat, 0.55);
         mat.backFaceCulling = false;
         mesh.material = mat;
         mesh.isPickable = true;
 
         this.navMeshDebugMesh = mesh;
+        this.navMeshMaterial = mat;
         this.navMeshVisualOffset = new Vector3(0, visualOffsetY, 0);
         this.navMeshSpawnPoint = this.getMostInteriorNavMeshPoint(positions, indices)
             ?? this.getFirstNavMeshPoint(positions, indices);
@@ -718,15 +728,7 @@ export class Viewer {
     public async initCrowd(navMeshData: Uint8Array, spawnPoint?: Vector3 | null): Promise<void> {
         await initRecast();
 
-        if (this.recastNavMesh) this.recastNavMesh.destroy();
-        if (this.crowd) this.crowd.destroy();
-        this.cleanupCrowdObservers();
-        this.userAgent = null;
-        this.npcAgents = [];
-        for (const mesh of this.npcMeshes) {
-            mesh.dispose();
-        }
-        this.npcMeshes = [];
+        this.destroyCrowdSimulation();
 
         const { navMesh } = importNavMesh(navMeshData);
         this.recastNavMesh = navMesh;
@@ -750,7 +752,6 @@ export class Viewer {
             maxSpeed: 5.0,
         });
 
-        if (this.userMesh) this.userMesh.dispose();
         this.userMesh = Mesh.CreateBox("user_agent", 0.5, this.scene);
         const userMat = new StandardMaterial("user_mat", this.scene);
         userMat.diffuseColor = new Color3(0, 0, 1);
@@ -982,6 +983,69 @@ export class Viewer {
             this.scene.onBeforeRenderObservable.remove(this.crowdUpdateObserver);
             this.crowdUpdateObserver = null;
         }
+    }
+
+    private destroyCrowdSimulation(): void {
+        this.cleanupCrowdObservers();
+
+        if (this.crowd) {
+            this.crowd.destroy();
+            this.crowd = null;
+        }
+        if (this.recastNavMesh) {
+            this.recastNavMesh.destroy();
+            this.recastNavMesh = null;
+        }
+
+        this.userAgent = null;
+        this.npcAgents = [];
+
+        if (this.userMesh) {
+            this.userMesh.dispose();
+            this.userMesh = null;
+        }
+        for (const mesh of this.npcMeshes) {
+            mesh.dispose();
+        }
+        this.npcMeshes = [];
+
+        for (const label of this.markerLabels) {
+            if (!label.isDisposed()) {
+                label.dispose();
+            }
+        }
+        this.markerLabels = [];
+    }
+
+    private resetDerivedSceneState(): void {
+        this.destroyCrowdSimulation();
+
+        if (this.seedMarker) {
+            this.seedMarker.dispose();
+            this.seedMarker = null;
+        }
+
+        this.preferredPlayerSpawn = null;
+        this.preferredNpcSpawn = null;
+        this.clearNavMeshOverlay();
+        this.clearColliderMesh();
+    }
+
+    private clearNavMeshOverlay(): void {
+        if (this.navMeshDebugMesh) {
+            this.navMeshDebugMesh.dispose();
+            this.navMeshDebugMesh = null;
+        }
+        const old = this.scene.getMeshByName("navmesh_debug");
+        if (old) {
+            old.dispose();
+        }
+        if (this.navMeshMaterial) {
+            this.navMeshMaterial.dispose();
+            this.navMeshMaterial = null;
+        }
+        this.navMeshSpawnPoint = null;
+        this.navMeshVisualOffset = Vector3.Zero();
     }
 
     public getScene(): Scene {

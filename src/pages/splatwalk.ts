@@ -1,7 +1,7 @@
 import { Viewer } from '../scene/Viewer';
 import { DropZone } from '../components/DropZone';
 import { splatwalk, type GroundFieldCellState, type MeshSettings } from '../wasm/bridge';
-import { Mesh, VertexData, StandardMaterial, Color3, Tools } from '@babylonjs/core';
+import { Mesh, VertexData, StandardMaterial, Color3, Tools, Material } from '@babylonjs/core';
 /// <reference types="vite/client" />
 import NavWorker from '../navigation/navmesh.worker?worker';
 import { extractFloorFieldWithRecovery, resolveRecovery, estimateDenseFloorRegion } from '../navigation/fastNav';
@@ -202,6 +202,11 @@ async function main() {
     const downloadContainer = document.getElementById('downloadContainer');
     const downloadBtn = document.getElementById('downloadBtn');
 
+    const applyMeshMaterialOpacity = (mat: StandardMaterial, alpha: number): void => {
+        mat.alpha = alpha;
+        mat.transparencyMode = alpha < 1 ? Material.MATERIAL_ALPHABLEND : Material.MATERIAL_OPAQUE;
+    };
+
     // UI Event Listeners placeholder (will be attached to mesh once created)
     let currentMesh: Mesh | null = null;
     let currentMat: StandardMaterial | null = null;
@@ -215,7 +220,7 @@ async function main() {
 
     if (meshOpacitySlider) {
         meshOpacitySlider.addEventListener('input', () => {
-            if (currentMat) currentMat.alpha = parseFloat(meshOpacitySlider.value);
+            if (currentMat) applyMeshMaterialOpacity(currentMat, parseFloat(meshOpacitySlider.value));
         });
     }
 
@@ -246,6 +251,17 @@ async function main() {
         const colliderGlbBtn = document.getElementById('colliderGlbBtn') as HTMLButtonElement | null;
         const showColliderCheckbox = document.getElementById('showColliderMesh') as HTMLInputElement | null;
         const colliderOpacitySlider = document.getElementById('colliderOpacity') as HTMLInputElement | null;
+        const showNavMeshCheckbox = document.getElementById('showNavMesh') as HTMLInputElement | null;
+        const navMeshOpacitySlider = document.getElementById('navMeshOpacity') as HTMLInputElement | null;
+
+        const applyNavMeshDisplayState = (): void => {
+            if (showNavMeshCheckbox) {
+                viewer.setNavMeshVisible(showNavMeshCheckbox.checked);
+            }
+            if (navMeshOpacitySlider) {
+                viewer.setNavMeshOpacity(Number.parseFloat(navMeshOpacitySlider.value));
+            }
+        };
 
         const setColliderGlbLabel = (name: string | null) => {
             if (colliderGlbBtn) colliderGlbBtn.textContent = name ?? 'Import GLB';
@@ -290,6 +306,14 @@ async function main() {
             viewer.setColliderOpacity(Number.parseFloat(colliderOpacitySlider.value));
         });
 
+        showNavMeshCheckbox?.addEventListener('change', () => {
+            viewer.setNavMeshVisible(showNavMeshCheckbox.checked);
+        });
+
+        navMeshOpacitySlider?.addEventListener('input', () => {
+            viewer.setNavMeshOpacity(Number.parseFloat(navMeshOpacitySlider.value));
+        });
+
         // Resize handling for Fullscreen
         document.addEventListener('fullscreenchange', () => {
             // Small delay to ensure browser layout is updated
@@ -316,6 +340,8 @@ async function main() {
 
             // 1. Visualize input splat
             await viewer.loadGaussianSplat(file);
+            currentMesh = null;
+            currentMat = null;
             importedColliderGeometry = null;
             if (colliderGlbInput) colliderGlbInput.value = '';
             setColliderGlbLabel(null);
@@ -963,6 +989,7 @@ async function main() {
                     }
                 }
                 const spawnPoint = await viewer.displayNavMesh(visualNavmesh.positions, visualNavmesh.indices, 0);
+                applyNavMeshDisplayState();
                 if (autoSpawnNpc && spawnPoint) {
                     const npcSpawn = chooseNpcSpawnPoint(visualNavmesh.positions, visualNavmesh.indices, spawnPoint);
                     viewer.setPreferredNavSpawnPoints(
@@ -1328,7 +1355,7 @@ async function main() {
                         currentMat = mat;
 
                         if (showMeshCheckbox) customMesh.setEnabled(showMeshCheckbox.checked);
-                        if (meshOpacitySlider) mat.alpha = parseFloat(meshOpacitySlider.value);
+                        if (meshOpacitySlider) applyMeshMaterialOpacity(mat, parseFloat(meshOpacitySlider.value));
 
                         document.getElementById('resultSection')!.style.display = 'block';
                         toggleSettings(true);
