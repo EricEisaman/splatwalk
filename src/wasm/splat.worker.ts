@@ -1,11 +1,13 @@
 /// <reference lib="webworker" />
 import init, {
     init_splatwalk,
+    build_room_floor_mesh,
     build_walkable_ground_field,
     convert_splat_to_mesh,
     convert_splat_to_navmesh_basis,
     convert_to_sog,
     get_splat_bounds,
+    mesh_to_glb,
     slice_splat,
     spz_to_ply,
     suggest_region,
@@ -94,6 +96,15 @@ ctx.onmessage = async (e: MessageEvent): Promise<void> => {
             return;
         }
 
+        // GLB serialization operates on supplied buffers, not the loaded splat.
+        if (type === 'meshToGlb') {
+            const positions = new Float32Array(payload.positions as ArrayBuffer);
+            const indices = new Uint32Array(payload.indices as ArrayBuffer);
+            const glb = mesh_to_glb(positions, indices);
+            ctx.postMessage({ kind: 'result', id, ok: true, result: glb }, [glb.buffer as ArrayBuffer]);
+            return;
+        }
+
         if (!currentData) throw new Error('No splat loaded in worker');
 
         const settings = payload.settings;
@@ -144,6 +155,9 @@ ctx.onmessage = async (e: MessageEvent): Promise<void> => {
                 break;
             case 'buildWalkableGroundField':
                 result = build_walkable_ground_field(currentData, settings);
+                break;
+            case 'buildRoomFloorMesh':
+                result = build_room_floor_mesh(currentData, settings);
                 break;
             default:
                 throw new Error(`Unknown splat worker op: ${type}`);

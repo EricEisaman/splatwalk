@@ -122,15 +122,25 @@ export interface ReconstructionDiagnostics {
     floor_plane?: FloorPlane;
 }
 
-export interface ReconstructionResult {
+/**
+ * Fields present on every v2 WASM result. `api_version` is the hard data
+ * contract; `semver` is the build's semantic version (tracks the crate) and
+ * `capabilities` is an additive list of supported features so integrators can
+ * tolerate additive change instead of hard-failing on a bump.
+ */
+export interface ResultContract {
     api_version: 2;
+    semver: string;
+    capabilities: string[];
+}
+
+export interface ReconstructionResult extends ResultContract {
     mesh: MeshBuffers;
     space: CoordinateSpace;
     diagnostics: ReconstructionDiagnostics;
 }
 
-export interface SplatBounds {
-    api_version: 2;
+export interface SplatBounds extends ResultContract {
     point_count: number;
     oriented_min: [number, number, number];
     oriented_max: [number, number, number];
@@ -138,8 +148,7 @@ export interface SplatBounds {
     space: CoordinateSpace;
 }
 
-export interface SuggestedRegion {
-    api_version: 2;
+export interface SuggestedRegion extends ResultContract {
     region_min: [number, number, number];
     region_max: [number, number, number];
     floor_y: number;
@@ -148,8 +157,7 @@ export interface SuggestedRegion {
     space: CoordinateSpace;
 }
 
-export interface NavmeshBasisResult {
-    api_version: 2;
+export interface NavmeshBasisResult extends ResultContract {
     mesh: MeshBuffers;
     space: CoordinateSpace;
     basis: FieldBasis;
@@ -157,8 +165,7 @@ export interface NavmeshBasisResult {
     diagnostics: ReconstructionDiagnostics;
 }
 
-export interface WalkableGroundFieldResult {
-    api_version: 2;
+export interface WalkableGroundFieldResult extends ResultContract {
     cells: GroundFieldCell[];
     width: number;
     height: number;
@@ -166,6 +173,42 @@ export interface WalkableGroundFieldResult {
     basis: FieldBasis;
     floor_plane: FloorPlane;
     space: CoordinateSpace;
+    diagnostics: ReconstructionDiagnostics;
+}
+
+/** A single attempt in the optional WASM-side room-floor recovery ladder. */
+export interface RoomFloorRecoveryStep {
+    label: string;
+    settings: Partial<MeshSettings>;
+    min_room_floor_area: number;
+}
+
+/** Settings for {@link SplatWalkBridge.buildRoomFloorMesh} (a superset of {@link MeshSettings}). */
+export interface RoomFloorSettings extends MeshSettings {
+    /** Minimum accepted floor area (m^2) for the base attempt. Default 4.0. */
+    min_room_floor_area?: number;
+    /** When true, also emit a GLB of the floor mesh in `glb`. Default false. */
+    emit_glb?: boolean;
+    /** Optional recovery ladder; when omitted a built-in default ladder is used. */
+    recovery?: RoomFloorRecoveryStep[];
+}
+
+/** Result of {@link SplatWalkBridge.buildRoomFloorMesh}: a triangulated room-floor mesh. */
+export interface RoomFloorMeshResult extends ResultContract {
+    mesh: MeshBuffers;
+    /** GLB bytes of the floor mesh, present only when `emit_glb` was set. */
+    glb?: Uint8Array;
+    space: CoordinateSpace;
+    basis: FieldBasis;
+    floor_plane: FloorPlane;
+    selected_area: number;
+    component_count: number;
+    selected_cell_count: number;
+    accepted_cell_count: number;
+    obstacle_cell_count: number;
+    rejected_cell_count: number;
+    fallback_used: boolean;
+    step_label: string;
     diagnostics: ReconstructionDiagnostics;
 }
 
@@ -357,6 +400,30 @@ export class SplatWalkBridge {
     public async buildWalkableGroundField(data: Uint8Array, settings: MeshSettings): Promise<WalkableGroundFieldResult> {
         await this.ensureLoaded(data);
         return this.call<WalkableGroundFieldResult>('buildWalkableGroundField', { settings });
+    }
+
+    /**
+     * Extract a triangulated room-floor mesh entirely in WASM (the binary-side
+     * equivalent of the TypeScript FAST NAV floor path). Rejects with the failure
+     * reason in the message (`no_component` / `too_small` / `empty_mesh`).
+     */
+    public async buildRoomFloorMesh(data: Uint8Array, settings: RoomFloorSettings): Promise<RoomFloorMeshResult> {
+        await this.ensureLoaded(data);
+        return this.call<RoomFloorMeshResult>('buildRoomFloorMesh', { settings });
+    }
+
+    /**
+     * Serialize a positions + indices triangle mesh into minimal GLB bytes via the
+     * WASM glTF writer (no 3D engine needed). Caller arrays are copied, not detached.
+     */
+    public async meshToGlb(positions: Float32Array, indices: Uint32Array): Promise<Uint8Array> {
+        const positionsBuffer = positions.slice().buffer;
+        const indicesBuffer = indices.slice().buffer;
+        return this.call<Uint8Array>(
+            'meshToGlb',
+            { positions: positionsBuffer, indices: indicesBuffer },
+            [positionsBuffer, indicesBuffer]
+        );
     }
 
     /**

@@ -120,6 +120,8 @@ pub fn get_splat_bounds(points: &[PointNormal], settings: &MeshSettings) -> Resu
 
     Ok(SplatBounds {
         api_version: 2,
+        semver: crate::core_semver(),
+        capabilities: crate::capabilities(),
         point_count: context.oriented_points.len(),
         oriented_min: min,
         oriented_max: max,
@@ -138,6 +140,8 @@ pub fn suggest_region(points: &[PointNormal], settings: &MeshSettings) -> Result
 
     Ok(SuggestedRegion {
         api_version: 2,
+        semver: crate::core_semver(),
+        capabilities: crate::capabilities(),
         region_min: [bounds.oriented_min[0], region_min_y, bounds.oriented_min[2]],
         region_max: [
             bounds.oriented_max[0],
@@ -170,6 +174,8 @@ pub fn reconstruct_mesh(points: &[PointNormal], settings: &MeshSettings) -> Reco
 
     ReconstructionResult {
         api_version: 2,
+        semver: crate::core_semver(),
+        capabilities: crate::capabilities(),
         mesh: MeshBuffers::new(mesh.vertices, mesh.indices),
         space: CoordinateSpace::splatwalk_oriented(),
         diagnostics,
@@ -193,6 +199,8 @@ pub fn convert_splat_to_navmesh_basis(points: &[PointNormal], settings: &MeshSet
 
     NavmeshBasisResult {
         api_version: 2,
+        semver: crate::core_semver(),
+        capabilities: crate::capabilities(),
         mesh: MeshBuffers::new(mesh.vertices, mesh.indices),
         space: CoordinateSpace::splatwalk_oriented(),
         basis,
@@ -212,6 +220,8 @@ pub fn build_walkable_ground_field(
 
     Ok(WalkableGroundFieldResult {
         api_version: 2,
+        semver: crate::core_semver(),
+        capabilities: crate::capabilities(),
         cells: field.cells,
         width: field.width,
         height: field.height,
@@ -1963,4 +1973,447 @@ fn reconstruct_poisson(points: &[PointNormal]) -> ReconstructedMesh {
     }
 
     ReconstructedMesh { vertices, indices }
+}
+
+// ---------------------------------------------------------------------------
+// WASM-side room-floor extraction (port of the TypeScript FAST NAV floor path).
+// ---------------------------------------------------------------------------
+
+/// Successful result of [`extract_room_floor`].
+pub struct RoomFloorBuild {
+    pub positions: Vec<f32>,
+    pub indices: Vec<u32>,
+    pub basis: FieldBasis,
+    pub floor_plane: FloorPlane,
+    pub diagnostics: ReconstructionDiagnostics,
+    pub selected_area: f64,
+    pub component_count: usize,
+    pub selected_cell_count: usize,
+    pub accepted_cell_count: usize,
+    pub obstacle_cell_count: usize,
+    pub rejected_cell_count: usize,
+    pub fallback_used: bool,
+    pub step_label: String,
+}
+
+/// Typed failure from [`extract_room_floor`]; `reason` mirrors the TypeScript
+/// `FastNavFloorReason` (`no_component` / `too_small` / `empty_mesh`). `area` and
+/// `components` carry diagnostic context for callers that want it.
+#[allow(dead_code)]
+pub struct RoomFloorError {
+    pub reason: String,
+    pub message: String,
+    pub area: f64,
+    pub components: usize,
+}
+
+struct FloorComponent {
+    cells: Vec<usize>,
+    distance_to_seed: f64,
+}
+
+/// Drop a small number of stray peripheral / height-outlier cells, keeping the
+/// largest contiguous in-band core. Conservative: returns the input unchanged
+/// when removals would be structural. Port of TS `trimStrayFloorCells` defaults.
+fn trim_stray_floor_cells(field: &FieldBuild, cells: &[usize]) -> Vec<usize> {
+    let height_tolerance = 0.5_f64;
+    let max_stray_fraction = 0.3_f64;
+    let min_keep_cells = 16usize;
+
+    if cells.len() <= min_keep_cells {
+        return cells.to_vec();
+    }
+
+    let mut heights: Vec<f64> = cells
+        .iter()
+        .filter_map(|&i| {
+            let h = field.cells[i].height;
+            if h.is_finite() {
+                Some(h as f64)
+            } else {
+                None
+            }
+        })
+        .collect();
+    if heights.is_empty() {
+        return cells.to_vec();
+    }
+    heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median_height = heights[heights.len() / 2];
+
+    let within_band: Vec<usize> = cells
+        .iter()
+        .cloned()
+        .filter(|&i| {
+            let h = field.cells[i].height;
+            h.is_finite() && ((h as f64) - median_height).abs() <= height_tolerance
+        })
+        .collect();
+    let dropped_height_outliers = cells.len() - within_band.len();
+    if (dropped_height_outliers as f64) > max_stray_fraction * cells.len() as f64
+        || within_band.len() < min_keep_cells
+    {
+        return cells.to_vec();
+    }
+
+    let width = field.width;
+    let height = field.height;
+    let in_band: std::collections::HashSet<usize> = within_band.iter().cloned().collect();
+    let mut visited: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut best: Vec<usize> = Vec::new();
+    for &start in &within_band {
+        if visited.contains(&start) {
+            continue;
+        }
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(start);
+        visited.insert(start);
+        let mut cluster: Vec<usize> = Vec::new();
+        while let Some(idx) = queue.pop_front() {
+            cluster.push(idx);
+            let row = idx / width;
+            let col = idx % width;
+            let mut neighbors: Vec<isize> = Vec::with_capacity(4);
+            neighbors.push(if row > 0 { idx as isize - width as isize } else { -1 });
+            neighbors.push(if row + 1 < height { idx as isize + width as isize } else { -1 });
+            neighbors.push(if col > 0 { idx as isize - 1 } else { -1 });
+            neighbors.push(if col + 1 < width { idx as isize + 1 } else { -1 });
+            for n in neighbors {
+                if n >= 0 {
+                    let nu = n as usize;
+                    if in_band.contains(&nu) && !visited.contains(&nu) {
+                        visited.insert(nu);
+                        queue.push_back(nu);
+                    }
+                }
+            }
+        }
+        if cluster.len() > best.len() {
+            best = cluster;
+        }
+    }
+
+    let dropped_peripheral = within_band.len() - best.len();
+    let total_dropped = dropped_height_outliers + dropped_peripheral;
+    if best.len() < min_keep_cells || (total_dropped as f64) > max_stray_fraction * cells.len() as f64
+    {
+        return cells.to_vec();
+    }
+    best
+}
+
+/// Extract a triangulated room-floor mesh from the 2.5D ground field. Port of the
+/// TypeScript `buildFastFloorMesh` selection + trim + triangulation, with the
+/// seed snapped to the detected floor plane.
+pub fn extract_room_floor(
+    points: &[PointNormal],
+    settings: &MeshSettings,
+    min_room_floor_area: f64,
+    step_label: &str,
+) -> Result<RoomFloorBuild, RoomFloorError> {
+    let context = build_context(points, settings);
+    let mut diagnostics = context.diagnostics.clone();
+    let field = build_field(&context, settings, &mut diagnostics).ok_or_else(|| RoomFloorError {
+        reason: "no_component".to_string(),
+        message: "Unable to build walkable ground field".to_string(),
+        area: 0.0,
+        components: 0,
+    })?;
+
+    let cs = field.cell_size;
+    let width = field.width;
+    let height = field.height;
+
+    // Seed (oriented space), snapped to the detected floor plane height.
+    let mut seed: Option<[f64; 3]> = settings.collision_seed.as_ref().and_then(|s| {
+        if s.len() >= 3 {
+            Some([s[0], s[1], s[2]])
+        } else {
+            None
+        }
+    });
+    let floor_y = field.diagnostics.floor_plane_height;
+    if let Some(ref mut s) = seed {
+        if floor_y.is_finite() {
+            s[1] = floor_y;
+        }
+    }
+
+    let o = field.basis.origin;
+    let t = field.basis.tangent;
+    let bi = field.basis.bitangent;
+    let up = field.basis.up;
+    let point_at = |col: f64, row: f64, h: f64| -> [f64; 3] {
+        [
+            o[0] + t[0] * col * cs + bi[0] * row * cs + up[0] * h,
+            o[1] + t[1] * col * cs + bi[1] * row * cs + up[1] * h,
+            o[2] + t[2] * col * cs + bi[2] * row * cs + up[2] * h,
+        ]
+    };
+    let cell_center = |idx: usize| -> [f64; 3] {
+        let row = (idx / width) as f64;
+        let col = (idx % width) as f64;
+        let h = field.cells[idx].height;
+        let h = if h.is_finite() { h as f64 } else { 0.0 };
+        point_at(col + 0.5, row + 0.5, h)
+    };
+
+    // State counts (per documented GroundFieldCellState names).
+    let mut state_counts: std::collections::HashMap<&'static str, usize> =
+        std::collections::HashMap::new();
+    for cell in &field.cells {
+        *state_counts.entry(state_name(&cell.state)).or_insert(0) += 1;
+    }
+    let obstacle_cell_count = *state_counts.get("obstacle").unwrap_or(&0)
+        + *state_counts.get("height_variance").unwrap_or(&0);
+
+    let build_mask = |relaxed: bool| -> Vec<bool> {
+        field
+            .cells
+            .iter()
+            .map(|cell| {
+                match cell.state {
+                    GroundFieldCellState::Walkable | GroundFieldCellState::Filled => return true,
+                    _ => {}
+                }
+                if !relaxed {
+                    return false;
+                }
+                if !cell.height.is_finite() {
+                    return false;
+                }
+                match cell.state {
+                    GroundFieldCellState::DiscardedComponent => true,
+                    GroundFieldCellState::LowConfidence => {
+                        cell.variance <= 0.18 && cell.obstacle_score <= 0.42
+                    }
+                    GroundFieldCellState::HeightVariance => {
+                        cell.confidence >= 0.01 && cell.variance <= 0.08 && cell.obstacle_score <= 0.35
+                    }
+                    GroundFieldCellState::Obstacle => {
+                        cell.confidence >= 0.02 && cell.variance <= 0.05 && cell.obstacle_score <= 0.52
+                    }
+                    _ => false,
+                }
+            })
+            .collect()
+    };
+
+    let collect_components = |mask: &[bool]| -> Vec<FloorComponent> {
+        let mut visited = vec![false; field.cells.len()];
+        let mut components: Vec<FloorComponent> = Vec::new();
+        for start in 0..field.cells.len() {
+            if !mask[start] || visited[start] {
+                continue;
+            }
+            let mut queue = std::collections::VecDeque::new();
+            queue.push_back(start);
+            visited[start] = true;
+            let mut cells: Vec<usize> = Vec::new();
+            let (mut sx, mut sy, mut sz) = (0.0_f64, 0.0_f64, 0.0_f64);
+            while let Some(idx) = queue.pop_front() {
+                cells.push(idx);
+                let c = cell_center(idx);
+                sx += c[0];
+                sy += c[1];
+                sz += c[2];
+                let row = idx / width;
+                let col = idx % width;
+                let mut neighbors: Vec<isize> = Vec::with_capacity(4);
+                neighbors.push(if row > 0 { idx as isize - width as isize } else { -1 });
+                neighbors.push(if row + 1 < height { idx as isize + width as isize } else { -1 });
+                neighbors.push(if col > 0 { idx as isize - 1 } else { -1 });
+                neighbors.push(if col + 1 < width { idx as isize + 1 } else { -1 });
+                for n in neighbors {
+                    if n >= 0 {
+                        let nu = n as usize;
+                        if mask[nu] && !visited[nu] {
+                            visited[nu] = true;
+                            queue.push_back(nu);
+                        }
+                    }
+                }
+            }
+            let inv = 1.0 / cells.len() as f64;
+            let centroid = [sx * inv, sy * inv, sz * inv];
+            let distance_to_seed = match seed {
+                Some(s) => {
+                    let dx = centroid[0] - s[0];
+                    let dy = centroid[1] - s[1];
+                    let dz = centroid[2] - s[2];
+                    (dx * dx + dy * dy + dz * dz).sqrt()
+                }
+                None => 0.0,
+            };
+            components.push(FloorComponent { cells, distance_to_seed });
+        }
+        components
+    };
+
+    let select = |components: &Vec<FloorComponent>| -> Option<(usize, bool)> {
+        let min_cells = 20usize;
+        let min_area = 1.2_f64;
+        let max_seed_distance = 3.25_f64;
+        let viable: Vec<usize> = (0..components.len())
+            .filter(|&i| {
+                let c = &components[i];
+                let area = c.cells.len() as f64 * cs * cs;
+                c.cells.len() >= min_cells && area >= min_area
+            })
+            .collect();
+        if viable.is_empty() {
+            return None;
+        }
+        let seed_near: Vec<usize> = if seed.is_some() {
+            viable
+                .iter()
+                .cloned()
+                .filter(|&i| components[i].distance_to_seed <= max_seed_distance)
+                .collect()
+        } else {
+            viable.clone()
+        };
+        let used_largest_fallback = seed.is_some() && seed_near.is_empty();
+        let mut candidates = if !seed_near.is_empty() { seed_near.clone() } else { viable.clone() };
+        if seed.is_none() || seed_near.is_empty() {
+            candidates.sort_by(|&a, &b| components[b].cells.len().cmp(&components[a].cells.len()));
+        } else {
+            let score = |i: usize| -> f64 {
+                let c = &components[i];
+                let area = c.cells.len() as f64 * cs * cs;
+                c.distance_to_seed - area.sqrt() * 0.45
+            };
+            candidates.sort_by(|&a, &b| {
+                score(a)
+                    .partial_cmp(&score(b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(components[b].cells.len().cmp(&components[a].cells.len()))
+            });
+        }
+        Some((candidates[0], used_largest_fallback))
+    };
+
+    let area_of_sel = |comps: &Vec<FloorComponent>, sel: &Option<(usize, bool)>| -> f64 {
+        sel.as_ref()
+            .map(|(i, _)| comps[*i].cells.len() as f64 * cs * cs)
+            .unwrap_or(0.0)
+    };
+
+    let strict_mask = build_mask(false);
+    let accepted_cell_count = strict_mask.iter().filter(|b| **b).count();
+    let rejected_cell_count = field.cells.len() - accepted_cell_count;
+    let mut components = collect_components(&strict_mask);
+    let mut selection = select(&components);
+    let mut fallback_used = false;
+
+    if selection.is_none() || area_of_sel(&components, &selection) < min_room_floor_area {
+        let relaxed_mask = build_mask(true);
+        let relaxed_components = collect_components(&relaxed_mask);
+        let relaxed_selection = select(&relaxed_components);
+        let relaxed_area = area_of_sel(&relaxed_components, &relaxed_selection);
+        if relaxed_selection.is_some()
+            && (selection.is_none() || relaxed_area > area_of_sel(&components, &selection))
+        {
+            components = relaxed_components;
+            selection = relaxed_selection;
+            fallback_used = true;
+        }
+    }
+
+    let component_count = components.len();
+    let (sel_idx, used_largest_fallback) = match selection {
+        Some(s) => s,
+        None => {
+            let largest = components.iter().map(|c| c.cells.len()).max().unwrap_or(0);
+            let largest_area = largest as f64 * cs * cs;
+            return Err(RoomFloorError {
+                reason: "no_component".to_string(),
+                message: format!(
+                    "Could not find a viable floor component (components={}, largest={} cells, {:.2} m^2).",
+                    component_count, largest, largest_area
+                ),
+                area: largest_area,
+                components: component_count,
+            });
+        }
+    };
+    if used_largest_fallback {
+        fallback_used = true;
+    }
+
+    let floor_cells = trim_stray_floor_cells(&field, &components[sel_idx].cells);
+
+    let selected_area = floor_cells.len() as f64 * cs * cs;
+    if selected_area < min_room_floor_area {
+        return Err(RoomFloorError {
+            reason: "too_small".to_string(),
+            message: format!(
+                "Floor is too small to be a room ({:.2} m^2 < {:.1} m^2, components={}, accepted={}).",
+                selected_area, min_room_floor_area, component_count, accepted_cell_count
+            ),
+            area: selected_area,
+            components: component_count,
+        });
+    }
+
+    let mut positions: Vec<f32> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    for &idx in &floor_cells {
+        let row = (idx / width) as f64;
+        let col = (idx % width) as f64;
+        let h = field.cells[idx].height;
+        let h = if h.is_finite() { h as f64 } else { 0.0 };
+        let base = (positions.len() / 3) as u32;
+        for p in [
+            point_at(col, row, h),
+            point_at(col, row + 1.0, h),
+            point_at(col + 1.0, row + 1.0, h),
+            point_at(col + 1.0, row, h),
+        ] {
+            positions.push(p[0] as f32);
+            positions.push(p[1] as f32);
+            positions.push(p[2] as f32);
+        }
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+
+    if positions.is_empty() || indices.is_empty() {
+        return Err(RoomFloorError {
+            reason: "empty_mesh".to_string(),
+            message: "Produced an empty floor mesh.".to_string(),
+            area: selected_area,
+            components: component_count,
+        });
+    }
+
+    Ok(RoomFloorBuild {
+        positions,
+        indices,
+        basis: field.basis.clone(),
+        floor_plane: field.plane.clone(),
+        diagnostics: field.diagnostics.clone(),
+        selected_area,
+        component_count,
+        selected_cell_count: floor_cells.len(),
+        accepted_cell_count,
+        obstacle_cell_count,
+        rejected_cell_count,
+        fallback_used,
+        step_label: step_label.to_string(),
+    })
+}
+
+/// Stable string name for a [`GroundFieldCellState`] (matches the serde
+/// `snake_case` rename used on the wire).
+fn state_name(state: &GroundFieldCellState) -> &'static str {
+    match state {
+        GroundFieldCellState::Walkable => "walkable",
+        GroundFieldCellState::LowConfidence => "low_confidence",
+        GroundFieldCellState::HeightVariance => "height_variance",
+        GroundFieldCellState::Obstacle => "obstacle",
+        GroundFieldCellState::Void => "void",
+        GroundFieldCellState::Filled => "filled",
+        GroundFieldCellState::Eroded => "eroded",
+        GroundFieldCellState::DiscardedComponent => "discarded_component",
+    }
 }

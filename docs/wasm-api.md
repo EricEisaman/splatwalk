@@ -12,6 +12,27 @@ This document describes the v2 SplatWalk WASM API contract. The v2 API is intent
 - Returned mesh vertices are emitted in the same `splatwalk_oriented` space as region filtering. Integrators should not infer transforms from Babylon preview meshes.
 - Every v2 result includes `api_version: 2` so integrations can fail fast on stale bindings.
 
+### Handedness, up axis, and winding
+
+The target convention is fixed and is part of the binary contract:
+
+- **Up axis:** `+Y` is up. All floor/clearance heuristics assume gravity points along `-Y`, so a Y-down source must set `flip_y` (see below).
+- **Handedness:** `splatwalk_oriented` is **right-handed**. Reported as `handedness: "right"` on every result that carries `space`.
+- **Winding:** returned triangle indices are wound counter-clockwise (front-facing) when viewed from `+` along the face normal, consistent with a right-handed space.
+
+Because the contract is fixed, converting to a specific engine's handedness/up-axis is the integrator's responsibility and should be done **once, at your application boundary** — not by mutating settings per call. Two concrete consequences:
+
+- **A `flip_y` bake is a mirror (negative scale), and a mirror flips winding/orientation.** When `flip_y` is set, every parsed splat's Y (position and normal) is negated before any other stage. A single-axis negation has determinant `-1`, so the effective basis is mirrored. The returned mesh is still internally consistent in `splatwalk_oriented` space, but if your renderer applies its own additional negative-axis bake (the common Gaussian-splat import path), be aware that composing two mirrors restores a right-handed, CCW result, while composing an odd number of mirrors yields a left-handed, CW result. Track the parity of negative-scale bakes between SplatWalk space and your engine and apply a single winding/normal correction at the boundary if the parity is odd.
+- **Do not bake any single engine's root transform into the core.** Handedness/up-axis/winding conversion to a particular engine's root node is engine-specific and does not generalize; keep it in your integration layer. (A future release may add an optional output-handedness setting; until then, convert at the boundary.)
+
+### Versioning and capability flags
+
+Every v2 result carries three compatibility fields:
+
+- `api_version` (currently `2`) — the **hard** data contract. Treat a mismatch as a fatal, fail-fast condition.
+- `semver` (e.g. `"0.2.0"`) — the semantic version of the WASM core build, tracking the crate version. Use it for logging, cache keys, and human-facing diagnostics.
+- `capabilities` — an additive `string[]` of supported features (e.g. `progress_protocol_v1`, `glb_export`, `room_floor_mesh`, `sog_export`, `streamed_sog`). Feature-detect against this list so additive changes (new entry points / fields) do not force a hard failure. Never assume a capability is present without checking; never fail solely because an unknown capability appears.
+
 ## Entry Points
 
 ### `get_splat_bounds(bytes, settings)`
@@ -141,6 +162,53 @@ Obstacle classification is clearance-band aware. Only density inside an agent cl
 Walkable continuity is judged against neighbors, not intra-column layer spread: a cell is rejected as a discontinuity (`height_variance`) only when its floor height departs from the local 8-neighbor median by more than a step threshold derived from `obstacle_height_epsilon`. This replaces the previous intra-column variance gate, which wrongly rejected floor merely because furniture or a ceiling existed somewhere above it.
 
 The browser `FAST NAV` workflow uses this field directly: it snaps the start seed onto the detected floor plane, keeps only `walkable` and `filled` cells (with a relaxed fallback mask for noisy scans), rejects obstacle/discontinuity/void/low-confidence/eroded/discarded cells, selects the connected floor component nearest the seed, triangulates that floor component, and sends that floor mesh to Recast. This keeps the one-button path focused on visible room floors instead of collider boundary artifacts.
+
+## Progress Line Protocol
+
+Long-running WASM calls report coarse progress by emitting a specially-prefixed
+line through the WASM `console` log. This is SplatWalk's own mechanism (the Rust
+core emits it and the reference worker scrapes it), and it is a **stable part of
+the binary contract**, advertised by the `progress_protocol_v1` capability flag.
+
+A batched log-line protocol is used deliberately: a per-iteration callback from
+WASM into JS would be a measurable performance regression for no real accuracy
+gain, so progress is emitted at stage boundaries only.
+
+### Format
+
+```none
+@progress <stage> [<fraction>]
+```
+
+- The line begins with the exact prefix `@progress ` (note the trailing space).
+- `<stage>` is a single whitespace-free token naming the current stage (e.g.
+  `parse`, `prune`, `field`, `mesh`). New stage names may be added over time;
+  treat unknown stages as opaque labels.
+- `<fraction>` is **optional**. When present it is a number in `0..1` giving
+  fractional progress within the stage.
+- **Indeterminate progress:** when `<fraction>` is omitted (or not a finite
+  number), the stage has no meaningful percentage — show a busy/indeterminate
+  indicator rather than a percentage. Do not assume `0`.
+
+### Consuming it
+
+Intercept console output, and for any line starting with `@progress `, split off
+the prefix and parse the remainder:
+
+```ts
+function parseProgress(message: string): { stage: string; fraction: number | null } | null {
+  if (!message.startsWith('@progress ')) return null;
+  const parts = message.slice('@progress '.length).trim().split(/\s+/);
+  const stage = parts[0] ?? 'processing';
+  const fraction = parts.length > 1 ? Number(parts[1]) : NaN;
+  return { stage, fraction: Number.isFinite(fraction) ? fraction : null };
+}
+```
+
+The reference worker (`src/wasm/splat.worker.ts`) does exactly this and re-posts a
+structured `{ stage, fraction }` message; the bridge surfaces it via an
+`onProgress(stage, fraction)` hook. Progress lines must be routed to the progress
+channel and kept out of the human-readable log panel.
 
 ## Streamed SOG Export And Slicing
 

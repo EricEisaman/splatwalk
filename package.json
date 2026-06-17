@@ -1,11 +1,12 @@
 {
   "name": "sigma-wasm",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "npm run build:wasm && vite build",
     "build:wasm": "./scripts/build.sh",
+    "build:package": "./scripts/build-package.sh",
     "build:docker": "docker build -t sigma-wasm .",
     "preview": "vite preview",
     "start": "vite preview --host --port 3000",

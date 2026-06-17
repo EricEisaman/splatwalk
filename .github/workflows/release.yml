@@ -1,0 +1,74 @@
+name: Release
+
+# Build the WASM core, assemble the `splatwalk-core` package, attach the
+# artifacts to a GitHub release, and (optionally) publish to npm. Triggered by a
+# semver tag like `v0.2.0`.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust + wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+
+      # Pin wasm-bindgen-cli to the exact version used by the crate so the JS glue
+      # always matches the binary (see wasm-splatwalk/Cargo.toml).
+      - name: Install wasm-bindgen-cli (pinned)
+        run: cargo install wasm-bindgen-cli --version 0.2.106 --locked
+
+      - name: Install binaryen (wasm-opt)
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Build WASM core
+        run: ./scripts/build.sh
+
+      - name: Assemble splatwalk-core package
+        run: ./scripts/build-package.sh
+
+      - name: Package tarball
+        run: cd dist-pkg && npm pack && mv *.tgz ..
+
+      - name: Create GitHub release with artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            pkg/wasm_splatwalk/wasm_splatwalk.js
+            pkg/wasm_splatwalk/wasm_splatwalk_bg.wasm
+            package/wasm_splatwalk.d.ts
+            splatwalk-core-*.tgz
+          body_path: CHANGELOG.md
+
+      # Publishes only when an NPM_TOKEN secret is configured.
+      - name: Publish to npm
+        if: ${{ env.NPM_TOKEN != '' }}
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: cd dist-pkg && npm publish --access public

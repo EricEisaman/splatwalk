@@ -38,6 +38,7 @@ pnpm-lock.yaml
 #######################################
 # build outputs
 dist/
+dist-pkg/
 pkg/
 target/
 *.tsbuildinfo

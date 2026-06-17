@@ -6,6 +6,7 @@ mod splat;
 mod mesh;
 mod sog;
 mod slice;
+mod glb;
 
 #[wasm_bindgen]
 extern "C" {
@@ -18,6 +19,29 @@ pub fn init_splatwalk() -> String {
     console_error_panic_hook::set_once();
     log("G2M WASM Initialized with Parsing Support");
     "Ready".to_string()
+}
+
+/// Additive capability flags advertised on every result. The integer
+/// `api_version` remains the hard data contract; these flags let integrators
+/// tolerate additive changes (new entry points / fields) instead of hard-failing
+/// on every version bump. See `docs/wasm-api.md` for the documented meaning.
+pub const CAPABILITIES: &[&str] = &[
+    "progress_protocol_v1",
+    "glb_export",
+    "room_floor_mesh",
+    "sog_export",
+    "streamed_sog",
+];
+
+/// Semantic version of the WASM core build. Tracks `Cargo.toml`'s `version` so a
+/// tagged release and the binary always agree.
+pub fn core_semver() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+/// Capability flags as owned strings, ready to serialize into a result.
+pub fn capabilities() -> Vec<String> {
+    CAPABILITIES.iter().map(|s| s.to_string()).collect()
 }
 
 #[derive(Deserialize)]
@@ -280,6 +304,8 @@ impl ReconstructionDiagnostics {
 #[derive(Serialize)]
 pub struct ReconstructionResult {
     pub api_version: u8,
+    pub semver: String,
+    pub capabilities: Vec<String>,
     pub mesh: MeshBuffers,
     pub space: CoordinateSpace,
     pub diagnostics: ReconstructionDiagnostics,
@@ -288,6 +314,8 @@ pub struct ReconstructionResult {
 #[derive(Serialize)]
 pub struct SplatBounds {
     pub api_version: u8,
+    pub semver: String,
+    pub capabilities: Vec<String>,
     pub point_count: usize,
     pub oriented_min: [f64; 3],
     pub oriented_max: [f64; 3],
@@ -298,6 +326,8 @@ pub struct SplatBounds {
 #[derive(Serialize)]
 pub struct SuggestedRegion {
     pub api_version: u8,
+    pub semver: String,
+    pub capabilities: Vec<String>,
     pub region_min: [f64; 3],
     pub region_max: [f64; 3],
     pub floor_y: f64,
@@ -309,6 +339,8 @@ pub struct SuggestedRegion {
 #[derive(Serialize)]
 pub struct NavmeshBasisResult {
     pub api_version: u8,
+    pub semver: String,
+    pub capabilities: Vec<String>,
     pub mesh: MeshBuffers,
     pub space: CoordinateSpace,
     pub basis: FieldBasis,
@@ -319,6 +351,8 @@ pub struct NavmeshBasisResult {
 #[derive(Serialize)]
 pub struct WalkableGroundFieldResult {
     pub api_version: u8,
+    pub semver: String,
+    pub capabilities: Vec<String>,
     pub cells: Vec<GroundFieldCell>,
     pub width: usize,
     pub height: usize,
@@ -327,6 +361,94 @@ pub struct WalkableGroundFieldResult {
     pub floor_plane: FloorPlane,
     pub space: CoordinateSpace,
     pub diagnostics: ReconstructionDiagnostics,
+}
+
+#[derive(Serialize)]
+pub struct RoomFloorMeshResult {
+    pub api_version: u8,
+    pub semver: String,
+    pub capabilities: Vec<String>,
+    pub mesh: MeshBuffers,
+    /// GLB bytes of the floor mesh, present only when `emit_glb` was set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub glb: Option<serde_bytes::ByteBuf>,
+    pub space: CoordinateSpace,
+    pub basis: FieldBasis,
+    pub floor_plane: FloorPlane,
+    pub selected_area: f64,
+    pub component_count: usize,
+    pub selected_cell_count: usize,
+    pub accepted_cell_count: usize,
+    pub obstacle_cell_count: usize,
+    pub rejected_cell_count: usize,
+    pub fallback_used: bool,
+    pub step_label: String,
+    pub diagnostics: ReconstructionDiagnostics,
+}
+
+/// One attempt in the WASM-side room-floor recovery ladder. `settings` is a raw
+/// JSON object whose keys are merged over the base settings for this attempt.
+#[derive(Deserialize, Default)]
+struct RoomFloorStepCfg {
+    label: Option<String>,
+    settings: Option<serde_json::Value>,
+    min_room_floor_area: Option<f64>,
+}
+
+/// Extra (non-`MeshSettings`) options accepted by `build_room_floor_mesh`.
+#[derive(Deserialize, Default)]
+struct RoomFloorOptions {
+    min_room_floor_area: Option<f64>,
+    emit_glb: Option<bool>,
+    recovery: Option<Vec<RoomFloorStepCfg>>,
+}
+
+/// Built-in recovery ladder mirroring the TypeScript `DEFAULT_FAST_NAV_RECOVERY`.
+fn default_room_floor_recovery() -> Vec<RoomFloorStepCfg> {
+    use serde_json::json;
+    vec![
+        RoomFloorStepCfg {
+            label: Some("default".to_string()),
+            settings: Some(json!({})),
+            min_room_floor_area: Some(4.0),
+        },
+        RoomFloorStepCfg {
+            label: Some("relaxed".to_string()),
+            settings: Some(json!({
+                "sdf_density_threshold": 0.04,
+                "max_local_height_variance": 0.2,
+                "obstacle_height_epsilon": 0.42,
+                "min_floor_confidence": 0.003,
+                "hole_fill_radius": 3,
+                "voxel_target": 12000
+            })),
+            min_room_floor_area: Some(4.0),
+        },
+        RoomFloorStepCfg {
+            label: Some("coarse".to_string()),
+            settings: Some(json!({
+                "sdf_cell_size": 0.2,
+                "sdf_density_threshold": 0.03,
+                "max_local_height_variance": 0.28,
+                "min_floor_confidence": 0.002,
+                "voxel_target": 14000,
+                "hole_fill_radius": 3
+            })),
+            min_room_floor_area: Some(2.5),
+        },
+        RoomFloorStepCfg {
+            label: Some("coarse-last-resort".to_string()),
+            settings: Some(json!({
+                "sdf_cell_size": 0.26,
+                "sdf_density_threshold": 0.022,
+                "max_local_height_variance": 0.36,
+                "min_floor_confidence": 0.0015,
+                "voxel_target": 16000,
+                "hole_fill_radius": 4
+            })),
+            min_room_floor_area: Some(1.5),
+        },
+    ]
 }
 
 fn parse_settings(settings: JsValue) -> Result<MeshSettings, JsValue> {
@@ -491,6 +613,95 @@ pub fn build_walkable_ground_field(data: &[u8], settings: JsValue) -> Result<JsV
     Ok(serde_wasm_bindgen::to_value(&result)?)
 }
 
+/// Extract a triangulated room-floor mesh entirely in WASM: the binary-side
+/// equivalent of the TypeScript FAST NAV floor path. Builds the 2.5D walkable
+/// ground field, selects the seed-nearest connected floor component (with a
+/// relaxed-mask and largest-island fallback), trims stray cells, and triangulates
+/// the result. Runs an adaptive recovery ladder (`settings.recovery`, or a
+/// built-in default) and returns the same failure reasons as the TS path
+/// (`no_component` / `too_small` / `empty_mesh`). Set `settings.emit_glb` to also
+/// receive GLB bytes.
+#[wasm_bindgen]
+pub fn build_room_floor_mesh(data: &[u8], settings: JsValue) -> Result<JsValue, JsValue> {
+    let base_value: serde_json::Value = serde_wasm_bindgen::from_value(settings.clone())
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let options: RoomFloorOptions = serde_wasm_bindgen::from_value(settings).unwrap_or_default();
+
+    let emit_glb = options.emit_glb.unwrap_or(false);
+    let base_min_area = options.min_room_floor_area.unwrap_or(4.0);
+    let steps = match options.recovery {
+        Some(steps) if !steps.is_empty() => steps,
+        _ => default_room_floor_recovery(),
+    };
+
+    let base_obj = base_value.as_object().cloned().unwrap_or_default();
+    let mut last_err: Option<mesh::RoomFloorError> = None;
+    let mut attempted: Vec<String> = Vec::new();
+
+    for (i, step) in steps.iter().enumerate() {
+        let label = step.label.clone().unwrap_or_else(|| format!("step{}", i));
+        let min_area = step.min_room_floor_area.unwrap_or(base_min_area);
+
+        let mut merged = base_obj.clone();
+        if let Some(serde_json::Value::Object(patch)) = &step.settings {
+            for (k, v) in patch {
+                merged.insert(k.clone(), v.clone());
+            }
+        }
+        let settings: MeshSettings = serde_json::from_value(serde_json::Value::Object(merged))
+            .map_err(|e| JsValue::from_str(&format!("Invalid room-floor settings: {}", e)))?;
+
+        let splats = parse_splats(data, &settings)?;
+        match mesh::extract_room_floor(&splats, &settings, min_area, &label) {
+            Ok(build) => {
+                let glb = if emit_glb {
+                    let bytes = glb::mesh_to_glb(&build.positions, &build.indices)
+                        .map_err(|e| JsValue::from_str(&e))?;
+                    Some(serde_bytes::ByteBuf::from(bytes))
+                } else {
+                    None
+                };
+                let result = RoomFloorMeshResult {
+                    api_version: 2,
+                    semver: core_semver(),
+                    capabilities: capabilities(),
+                    mesh: MeshBuffers::new(build.positions, build.indices),
+                    glb,
+                    space: CoordinateSpace::splatwalk_oriented(),
+                    basis: build.basis,
+                    floor_plane: build.floor_plane,
+                    selected_area: build.selected_area,
+                    component_count: build.component_count,
+                    selected_cell_count: build.selected_cell_count,
+                    accepted_cell_count: build.accepted_cell_count,
+                    obstacle_cell_count: build.obstacle_cell_count,
+                    rejected_cell_count: build.rejected_cell_count,
+                    fallback_used: build.fallback_used,
+                    step_label: build.step_label,
+                    diagnostics: build.diagnostics,
+                };
+                return Ok(serde_wasm_bindgen::to_value(&result)?);
+            }
+            Err(e) => {
+                attempted.push(format!("{}({})", label, e.reason));
+                last_err = Some(e);
+            }
+        }
+    }
+
+    let summary = attempted.join(" -> ");
+    let msg = match last_err {
+        Some(e) => format!(
+            "FAST NAV floor extraction failed after {} step(s): {}. {}",
+            steps.len(),
+            summary,
+            e.message
+        ),
+        None => "FAST NAV recovery had no configured steps.".to_string(),
+    };
+    Err(JsValue::from_str(&msg))
+}
+
 /// Tunable parameters for SOG export and streamed-SOG slicing. All fields are
 /// optional; omitted values fall back to [`slice::SliceParams::default`].
 #[derive(Deserialize, Default)]
@@ -571,4 +782,13 @@ pub fn convert_to_sog(data: &[u8], settings: JsValue) -> Result<JsValue, JsValue
 pub fn spz_to_ply(data: &[u8]) -> Result<Vec<u8>, JsValue> {
     let cloud = splat::parse_full_cloud(data).map_err(|e| JsValue::from_str(&e))?;
     Ok(splat::write_ply(&cloud))
+}
+
+/// Serialize a positions + indices triangle mesh into minimal binary glTF (GLB)
+/// bytes (no materials/normals). Lets a binary integrator turn vertex/index
+/// buffers into GLB without standing up a 3D engine per call. `positions` are xyz
+/// triplets; `indices` are `u32` triangle indices.
+#[wasm_bindgen]
+pub fn mesh_to_glb(positions: &[f32], indices: &[u32]) -> Result<Vec<u8>, JsValue> {
+    glb::mesh_to_glb(positions, indices).map_err(|e| JsValue::from_str(&e))
 }

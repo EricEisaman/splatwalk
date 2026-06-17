@@ -880,6 +880,7 @@ async function main() {
                     // parameters and retry instead of failing on sparse/large scenes.
                     const extracted = await extractFloorFieldWithRecovery({
                         bytes,
+                        buildField: (b, s) => splatwalk.buildWalkableGroundField(b, s),
                         baseSettings: navSettings,
                         seed: effectiveFastSeed ?? fastSeed ?? [],
                         recovery: resolveRecovery(),

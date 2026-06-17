@@ -31,6 +31,7 @@ export {
   defaultFastMeshSettings,
   FastNavFloorError,
   DEFAULT_FAST_NAV_RECOVERY,
+  FAST_NAV_PRESET,
   type FastNavOptions,
   type FastNavResult,
   type FastNavLogger,
@@ -47,4 +48,30 @@ export {
   type PruneFloatersOptions,
   type ExtractFloorFieldArgs,
   type ExtractFloorFieldResult,
+  type WalkableGroundFieldBuilder,
 } from '@/navigation/fastNav';
+
+/**
+ * The framework-agnostic floor module is the published, binary-friendly surface.
+ * It re-exports the same floor logic without any Babylon dependency, so non-Babylon
+ * and binary-only integrators can import just this module.
+ */
+export * as floor from '@/navigation/floor';
+
+/** WASM core data-contract types, published so binary-only integrators get real types. */
+export type {
+  MeshSettings,
+  MeshBuffers,
+  CoordinateSpace,
+  FloorPlane,
+  FieldBasis,
+  GroundFieldCell,
+  GroundFieldCellState,
+  ReconstructionDiagnostics,
+  ReconstructionResult,
+  SplatBounds,
+  SuggestedRegion,
+  NavmeshBasisResult,
+  WalkableGroundFieldResult,
+  ResultContract,
+} from '@/wasm/bridge';
