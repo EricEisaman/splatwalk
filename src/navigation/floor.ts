@@ -59,6 +59,20 @@ export const FAST_NAV_PRESET: Readonly<MeshSettings> = {
   collision_carve_radius: 0.35,
 };
 
+/**
+ * Default vertical tolerance (meters) within which a floor corner height is snapped
+ * to the dominant floor plane, so a flat floor triangulates as a single flat surface
+ * instead of a noisy set of stepped quads that Recast fragments into islands.
+ */
+export const DEFAULT_FLOOR_FLATTEN_TOLERANCE = 0.12;
+
+/**
+ * Largest enclosed gap (in cells) that {@link buildFastFloorMesh} will bridge across
+ * when a void / low-confidence pocket is fully surrounded by accepted floor (seams,
+ * painted lines, reflective patches). Larger holes are treated as real openings.
+ */
+const MAX_BRIDGE_GAP_CELLS = 12;
+
 /** Why floor-field extraction failed (used to drive adaptive recovery). */
 export type FastNavFloorReason = 'no_component' | 'too_small' | 'empty_mesh';
 
@@ -484,6 +498,8 @@ export interface FastFloorMesh {
   componentCount: number;
   fallbackUsed: boolean;
   seedDistance: number;
+  /** Number of enclosed void/low-confidence cells bridged back into the floor. */
+  bridgedCellCount: number;
 }
 
 /**
@@ -498,7 +514,8 @@ export function buildFastFloorMesh(
   seed: number[] | null,
   minRoomFloorArea: number,
   log: FastNavLogger,
-  strayTrim?: StrayTrimOptions
+  strayTrim?: StrayTrimOptions,
+  floorFlattenTolerance: number = DEFAULT_FLOOR_FLATTEN_TOLERANCE
 ): FastFloorMesh {
   const width = field.width;
   const height = field.height;
@@ -626,7 +643,66 @@ export function buildFastFloorMesh(
   const areaOfSelection = (sel: { selected: { cells: number[] } }): number =>
     sel.selected.cells.length * field.cell_size * field.cell_size;
 
+  // Bridge small enclosed gaps (seams, painted lines, reflective patches that read
+  // as void / low_confidence) that are fully surrounded by accepted floor, so they
+  // do not split an otherwise-continuous flat floor into separate fragments. Gaps
+  // touching the grid border or adjacent to a real obstacle/discontinuity are left
+  // alone, as are holes larger than MAX_BRIDGE_GAP_CELLS (treated as real openings).
+  const bridgeEnclosedGaps = (mask: boolean[]): number => {
+    const isBridgeable = (state: string): boolean =>
+      state === 'void' || state === 'low_confidence';
+    const visited = new Uint8Array(field.cells.length);
+    let bridged = 0;
+    for (let start = 0; start < field.cells.length; start++) {
+      if (mask[start] || visited[start]) continue;
+      visited[start] = 1;
+      if (!isBridgeable(field.cells[start].state)) continue;
+
+      const queue = [start];
+      const run: number[] = [];
+      let enclosedByFloor = true;
+      let touchesBorder = false;
+      while (queue.length > 0) {
+        const idx = queue.shift()!;
+        run.push(idx);
+        const row = Math.floor(idx / width);
+        const col = idx % width;
+        if (row === 0 || col === 0 || row + 1 === height || col + 1 === width) {
+          touchesBorder = true;
+        }
+        const neighbors = [
+          row > 0 ? idx - width : -1,
+          row + 1 < height ? idx + width : -1,
+          col > 0 ? idx - 1 : -1,
+          col + 1 < width ? idx + 1 : -1,
+        ];
+        for (const next of neighbors) {
+          if (next < 0) continue;
+          if (mask[next]) continue; // accepted floor: a valid hole boundary
+          if (isBridgeable(field.cells[next].state)) {
+            if (!visited[next]) {
+              visited[next] = 1;
+              queue.push(next);
+            }
+          } else {
+            // adjacent to a real obstacle/discontinuity: not a floor-enclosed hole
+            enclosedByFloor = false;
+          }
+        }
+      }
+
+      if (enclosedByFloor && !touchesBorder && run.length <= MAX_BRIDGE_GAP_CELLS) {
+        for (const idx of run) {
+          mask[idx] = true;
+        }
+        bridged += run.length;
+      }
+    }
+    return bridged;
+  };
+
   const strictMask = buildMask(false);
+  const bridgedCellCount = bridgeEnclosedGaps(strictMask);
   const acceptedCellCount = strictMask.filter(Boolean).length;
   const rejectedCellCount = field.cells.length - acceptedCellCount;
   const strictComponents = collectComponents(strictMask);
@@ -637,6 +713,7 @@ export function buildFastFloorMesh(
 
   if (!selection || areaOfSelection(selection) < minRoomFloorArea) {
     const relaxedMask = buildMask(true);
+    bridgeEnclosedGaps(relaxedMask);
     const relaxedComponents = collectComponents(relaxedMask);
     const relaxedSelection = selectComponent(relaxedComponents);
     if (relaxedSelection && (!selection || areaOfSelection(relaxedSelection) > areaOfSelection(selection))) {
@@ -715,27 +792,73 @@ export function buildFastFloorMesh(
     );
   }
 
+  // Emit a single connected, shared-vertex surface instead of one independent quad
+  // per cell. Each grid corner gets ONE vertex whose height is the average of the
+  // accepted cells touching it, then snapped to the dominant floor plane when within
+  // `floorFlattenTolerance`. This keeps neighbouring cells C0-continuous so Recast
+  // does not shatter a flat floor on per-cell height noise / vertical cracks.
+  const floorSet = new Set(floorCells);
+  const floorPlaneHeight = field.diagnostics.floor_plane_height;
+  const planeUsable = Number.isFinite(floorPlaneHeight);
+  const cornerCols = width + 1;
+  const cornerKey = (cc: number, rr: number): number => rr * cornerCols + cc;
+  const cornerHeights = new Map<number, number>();
+  const cornerHeightAt = (cc: number, rr: number): number => {
+    const key = cornerKey(cc, rr);
+    const cached = cornerHeights.get(key);
+    if (cached !== undefined) return cached;
+    let sum = 0;
+    let count = 0;
+    for (let dr = -1; dr <= 0; dr++) {
+      for (let dc = -1; dc <= 0; dc++) {
+        const col = cc + dc;
+        const row = rr + dr;
+        if (col < 0 || row < 0 || col >= width || row >= height) continue;
+        const cidx = row * width + col;
+        if (!floorSet.has(cidx)) continue;
+        const ch = field.cells[cidx]?.height;
+        if (Number.isFinite(ch)) {
+          sum += ch as number;
+          count += 1;
+        }
+      }
+    }
+    let h = count > 0 ? sum / count : planeUsable ? (floorPlaneHeight as number) : 0;
+    if (planeUsable && Math.abs(h - (floorPlaneHeight as number)) <= floorFlattenTolerance) {
+      h = floorPlaneHeight as number;
+    }
+    cornerHeights.set(key, h);
+    return h;
+  };
+
   const positions: number[] = [];
   const indices: number[] = [];
+  const cornerVertices = new Map<number, number>();
+  const cornerVertex = (cc: number, rr: number): number => {
+    const key = cornerKey(cc, rr);
+    const existing = cornerVertices.get(key);
+    if (existing !== undefined) return existing;
+    const p = pointAt(cc, rr, cornerHeightAt(cc, rr));
+    const vi = positions.length / 3;
+    positions.push(p[0], p[1], p[2]);
+    cornerVertices.set(key, vi);
+    return vi;
+  };
   for (const idx of floorCells) {
     const row = Math.floor(idx / width);
     const col = idx % width;
-    const cell = field.cells[idx];
-    const h = Number.isFinite(cell.height) ? cell.height : 0;
-    const base = positions.length / 3;
-    const p00 = pointAt(col, row, h);
-    const p01 = pointAt(col, row + 1, h);
-    const p11 = pointAt(col + 1, row + 1, h);
-    const p10 = pointAt(col + 1, row, h);
-    positions.push(...p00, ...p01, ...p11, ...p10);
-    indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    const v00 = cornerVertex(col, row);
+    const v01 = cornerVertex(col, row + 1);
+    const v11 = cornerVertex(col + 1, row + 1);
+    const v10 = cornerVertex(col + 1, row);
+    indices.push(v00, v01, v11, v00, v11, v10);
   }
 
   log(
     `[INFO] Fast floor field: accepted=${acceptedCellCount}, obstacles=${obstacleCellCount}, ` +
-      `rejected=${rejectedCellCount}, components=${components.length}, ` +
+      `rejected=${rejectedCellCount}, bridged=${bridgedCellCount}, components=${components.length}, ` +
       `selectedCells=${floorCells.length}, selectedArea=${selectedArea.toFixed(2)}, ` +
-      `maskCells=${selectedMask.filter(Boolean).length}`
+      `vertices=${positions.length / 3}, maskCells=${selectedMask.filter(Boolean).length}`
   );
 
   return {
@@ -750,6 +873,7 @@ export function buildFastFloorMesh(
     componentCount: components.length,
     fallbackUsed,
     seedDistance: selected.distanceToSeed,
+    bridgedCellCount,
   };
 }
 

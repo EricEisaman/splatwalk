@@ -1022,6 +1022,8 @@ fn build_field(
         width,
         height,
         sdf_smoothing_radius,
+        floor_height,
+        continuity_threshold,
     );
 
     let mut cells: Vec<GroundFieldCell> = Vec::with_capacity(num_cells);
@@ -1038,7 +1040,7 @@ fn build_field(
 
     for idx in 0..num_cells {
         let surface = surfaces[idx];
-        let primary_height = surface_heights[idx].unwrap_or(floor_height);
+        let mut primary_height = surface_heights[idx].unwrap_or(floor_height);
         if surface.primary_height.is_some() {
             cells_with_surface += 1;
         }
@@ -1090,7 +1092,23 @@ fn build_field(
             if neighbor_heights.len() >= 3 {
                 neighbor_heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 let median = neighbor_heights[neighbor_heights.len() / 2];
-                (primary_height - median).abs() > continuity_threshold
+                let delta = (primary_height - median).abs();
+                if delta > continuity_threshold {
+                    // Only genuine ledges (>= reject_band) are rejected as a discontinuity.
+                    // A small departure on an otherwise-flat floor is snapped to the neighbour
+                    // median and kept walkable, instead of punching a hole that fragments the
+                    // floor into separate Recast islands.
+                    let reject_band = (continuity_threshold * 2.5).max(0.6);
+                    if delta < reject_band {
+                        primary_height = median;
+                        surface_heights[idx] = Some(median);
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    false
+                }
             } else {
                 false
             }
@@ -1227,7 +1245,7 @@ fn fill_low_confidence_holes(cells: &mut [GroundFieldCell], width: usize, height
     for row in 0..height {
         for col in 0..width {
             let start_idx = row * width + col;
-            if visited[start_idx] || !matches!(original[start_idx].state, GroundFieldCellState::LowConfidence) {
+            if visited[start_idx] || !is_fillable_hole(&original[start_idx].state) {
                 continue;
             }
 
@@ -1248,7 +1266,7 @@ fn fill_low_confidence_holes(cells: &mut [GroundFieldCell], width: usize, height
                     let nidx = nr * width + nc;
                     let neighbor = &original[nidx];
 
-                    if matches!(neighbor.state, GroundFieldCellState::LowConfidence) {
+                    if is_fillable_hole(&neighbor.state) {
                         if !visited[nidx] {
                             visited[nidx] = true;
                             queue.push_back((nr, nc));
@@ -1479,18 +1497,30 @@ fn smooth_surface_heights(
     width: usize,
     height: usize,
     radius: usize,
+    floor_height: f64,
+    near_floor_band: f64,
 ) -> usize {
     if radius == 0 || width == 0 || height == 0 {
         return 0;
     }
 
     let original = heights.to_vec();
+    // A cell participates in smoothing when it is single-layer OR when its (multi-layer)
+    // surface sits close to the dominant floor plane. Multi-layer floor cells near shelving
+    // / overhead used to be excluded entirely, so their raw, noisy heights produced vertical
+    // cracks that fragmented an otherwise-flat floor.
+    let is_smoothable = |idx: usize| -> bool {
+        if surfaces[idx].layer_count <= 1 {
+            return true;
+        }
+        matches!(original[idx], Some(h) if (h - floor_height).abs() <= near_floor_band)
+    };
     let mut updates = Vec::<(usize, f64)>::new();
 
     for row in 0..height {
         for col in 0..width {
             let idx = row * width + col;
-            if original[idx].is_none() || surfaces[idx].layer_count > 1 {
+            if original[idx].is_none() || !is_smoothable(idx) {
                 continue;
             }
 
@@ -1504,7 +1534,7 @@ fn smooth_surface_heights(
             for rr in row_min..=row_max {
                 for cc in col_min..=col_max {
                     let nidx = rr * width + cc;
-                    if surfaces[nidx].layer_count <= 1 {
+                    if is_smoothable(nidx) {
                         if let Some(h) = original[nidx] {
                             sum += h;
                             count += 1;
@@ -1553,6 +1583,17 @@ fn apply_gradients(cells: &mut [GroundFieldCell], heights: &[Option<f64>], width
 
 fn is_accepted_state(state: &GroundFieldCellState) -> bool {
     matches!(state, GroundFieldCellState::Walkable | GroundFieldCellState::Filled)
+}
+
+/// Cell states that may be closed by [`fill_low_confidence_holes`] when they form a
+/// small pocket fully enclosed by accepted floor: low-confidence cells and density
+/// voids (seams, painted lines, reflective patches) that would otherwise fragment a
+/// continuous floor.
+fn is_fillable_hole(state: &GroundFieldCellState) -> bool {
+    matches!(
+        state,
+        GroundFieldCellState::LowConfidence | GroundFieldCellState::Void
+    )
 }
 
 fn is_blocking_state(state: &GroundFieldCellState) -> bool {
