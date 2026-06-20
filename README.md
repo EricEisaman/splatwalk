@@ -69,6 +69,11 @@ const field = splatwalk.buildWalkableGroundField(bytes, settings);
 //    triangulate it, and feed that floor mesh to Recast (see src/pages/splatwalk.ts).
 ```
 
+> When you build the Recast config yourself, pass the agent dimensions
+> (`walkableHeight`/`walkableClimb`/`walkableRadius`) in **voxel units**, not metres:
+> Recast truncates them to integers, so sub-metre metre values collapse to `0` and
+> fragment the navmesh. See [Recast parameter units (metres vs voxels)](docs/wasm-api.md#recast-parameter-units-metres-vs-voxels).
+
 ### Coordinate alignment (read this first)
 
 The single most common integration bug is a navmesh that is mirrored or offset from the rendered splat. SplatWalk parses raw PLY/SPZ coordinates, but renderers usually flip Y on import. Resolve it once, at the boundary:

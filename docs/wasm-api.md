@@ -371,6 +371,28 @@ This is intentionally different from a collider-boundary bake. It avoids the fai
 
 Current results are not yet reliable. On furnished indoor scans (for example `Bedroom.ply`) the field can still fragment the floor and the fast path may relocate to a small off-center island or fail the room-floor minimum. The clearance-band and neighbor-continuity classification above is the in-progress fix for that failure mode; see "Project Status, Philosophy, and Goals".
 
+### Recast parameter units (metres vs voxels)
+
+When you hand the triangulated floor mesh to Recast yourself (the binary-only / non-Babylon path), the single most consequential detail is the **unit of the agent dimensions**. SplatWalk states them in **metres**, but Recast's native `rcConfig.walkableHeight`, `rcConfig.walkableClimb`, and `rcConfig.walkableRadius` are **integer voxel counts**. The `@recast-navigation` `createRcConfig` helper assigns your values straight into those native `int` fields, so a sub-metre metre value is silently **truncated to an integer** before Recast ever runs.
+
+Convert metres to voxels first, using the standard Recast convention (`ch` is the cell height, `cs` the cell size, both in metres):
+
+```ts
+const walkableHeight = Math.max(1, Math.ceil(agentHeightMeters / ch));   // round UP
+const walkableClimb  = Math.max(0, Math.floor(agentClimbMeters  / ch));  // round DOWN
+const walkableRadius = Math.max(0, Math.ceil(agentRadiusMeters  / cs));  // round UP
+```
+
+Failure mode if you skip this: at `cs = 0.12, ch = 0.1`, a `0.25 m` climb and a `0.2 m` radius both truncate to `0` voxels. With `walkableClimb = 0` every height step (even one voxel) becomes an impassable wall, so a single terraced level is split into disjoint islands; with `walkableRadius = 0` no erosion is applied. `1.7 m` height truncates to `1` voxel (`0.1 m` of clearance), defeating the height filter. These three values then appear completely inert to tuning — changing the metres does nothing because they all collapse to the same integer.
+
+Headroom is the matching gotcha. The floor field is a **thin, open-sky sheet** (no real ceiling geometry), and Recast's `filterWalkableLowHeightSpans` culls any floor span lacking `walkableHeight` of clearance above it. Pad the Recast bounds so the clearance above the **highest** floor cell is at least `walkableHeight`, e.g. `bmax.y = maxY + agentHeightMeters + 0.5`. Padding only the sheet's own thickness leaves the top deck level under-cleared and silently dropped.
+
+Reference FAST NAV agent defaults (metres) used by the browser path:
+
+```ts
+{ cs: 0.12, ch: 0.1, walkableHeight: 1.7, walkableRadius: 0.12, walkableClimb: 0.25, walkableSlopeAngle: 40 }
+```
+
 ### Advanced Collider Nav
 
 The manual collider workflow follows the same broad collider model used by the PlayCanvas/SuperSplat ecosystem:
@@ -459,6 +481,7 @@ Some integrators consume only the generated `pkg/wasm_splatwalk/wasm_splatwalk.j
 - Treat `space`, `up_axis`, and `handedness` as part of the binary contract. If your engine uses a different handedness or up axis, convert once at your application boundary.
 - Use `get_splat_bounds` for UI framing and `build_walkable_ground_field` for 2.5D SDF column diagnostics. Avoid deriving floor height from renderer meshes, lower-envelope debug surfaces, global planes, or mesh vertices after reconstruction.
 - For one-button room navigation, mirror the browser `FAST NAV` path: call `build_walkable_ground_field`, keep only `walkable` and `filled` cells, select the seed-nearest connected component, triangulate that floor component, then pass it to Recast.
+- When handing that floor mesh to Recast, convert the agent dimensions from metres to **integer voxel units** (`walkableHeight = ceil(h/ch)`, `walkableClimb = floor(climb/ch)`, `walkableRadius = ceil(r/cs)`) and pad the vertical bounds above the highest floor cell by at least `walkableHeight`. Passing sub-metre metre values directly truncates them to `0` voxels, which removes erosion, turns every height step into a wall, and fragments one walkable level into disjoint islands. See "Recast parameter units (metres vs voxels)" above.
 - For advanced collision workflows, treat the production target as PlayCanvas-style voxel collision: voxel occupancy, seed-based cluster/fill/carve, then a watertight collision mesh.
 - Use `convert_splat_to_navmesh_basis(bytes, settings)` for the generated voxel collision mesh when no imported collider GLB exists. It emits the collision basis, not the renderer mesh.
 - Treat `GroundFieldCell.state` as part of the fast-nav contract. Preserve `obstacle`, `height_variance`, `void`, unfilled `low_confidence`, `eroded`, and `discarded_component` as blocked/rejected states.
@@ -509,7 +532,7 @@ Legacy/debug 2.5D SDF settings remain available for overlay diagnostics:
 - `max_local_height_variance`: legacy intra-column variance bound. No longer used for fast-floor rejection (replaced by neighbor-median continuity); retained for backward compatibility.
 - `min_floor_confidence`: minimum accumulated floor evidence for a walkable cell.
 - `hole_fill_radius`: small-hole close/fill radius in field cells. Only small enclosed `low_confidence` components may be filled.
-- `agent_radius_erode`: optional upstream distance-field erosion radius in meters before connected-component selection. The UI default is `0` because Recast also applies `walkableRadius`; setting both can double-erode and fragment valid floor.
+- `agent_radius_erode`: optional upstream distance-field erosion radius in meters before connected-component selection. The UI default is `0` because Recast also applies `walkableRadius` (its metre value converted to `ceil(walkableRadius / cs)` voxels at navmesh time); setting both can double-erode and fragment valid floor. See "Recast parameter units (metres vs voxels)" for the conversion.
 - `component_mode`: `"largest"` or `"nearest_region_center"` selected component mode.
 
 Conservative defaults are intentionally used so real obstacles, exterior voids, and large missing regions are not filled as walkable floor. For Recast use, prefer leaving `agent_radius_erode` at `0` unless you intentionally want pre-Recast clearance baked into the collider.

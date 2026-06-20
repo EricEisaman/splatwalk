@@ -46,6 +46,20 @@ Every v2 result advertises a `capabilities` string array. Current flags:
 - **Documented contracts.** The `@progress` line protocol and a tightened
   coordinate/winding convention are now part of `docs/wasm-api.md`.
 
+### Fixed
+
+- **Recast agent dimensions are metres, converted to voxels at the hand-off.**
+  `walkableHeight`/`walkableClimb`/`walkableRadius` were passed to Recast in metres,
+  but Recast's `rcConfig` stores them as integer voxel counts, so sub-metre values
+  truncated to `0` (climb `0.25 m` -> `0`, radius `0.2 m` -> `0`, height `1.7 m` -> `1`).
+  That made climb/radius inert and split multi-level floors (e.g. terraced pool decks)
+  into disjoint navmesh islands. The floor hand-off now converts metres to voxels
+  (`ceil(h/ch)`, `floor(climb/ch)`, `ceil(r/cs)`) and pads vertical headroom above the
+  highest floor cell by at least `walkableHeight`, so terraced levels connect into one
+  navmesh while box tops and pools stay excluded. Integrators who run Recast themselves
+  must apply the same conversion; see "Recast parameter units (metres vs voxels)" in
+  `docs/wasm-api.md`.
+
 ### Notes
 
 - Adding `semver`/`capabilities` is additive; `api_version` stays `2`, so existing
