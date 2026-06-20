@@ -6,7 +6,17 @@ import { DEFAULT_AUTO_SLICE_THRESHOLD, type SliceSettings } from '../wasm/sogTyp
 import { Mesh, VertexData, StandardMaterial, Color3, Tools, Material } from '@babylonjs/core';
 /// <reference types="vite/client" />
 import NavWorker from '../navigation/navmesh.worker?worker';
-import { extractFloorFieldWithRecovery, resolveRecovery, estimateDenseFloorRegion } from '../navigation/fastNav';
+import {
+    extractFloorFieldWithRecovery,
+    resolveRecovery,
+    estimateDenseFloorRegion,
+    filterNavmeshIslandNearSeed,
+    validateFastNavIsland,
+    chooseNpcSpawnPoint,
+    FAST_NAV_RECAST_ATTEMPTS,
+    type RecastParams,
+    type NavIslandMetadata,
+} from '../navigation/fastNav';
 import { registerServiceWorker, setupOfflineHandling } from '../pwa/sw-register';
 
 async function main() {
@@ -607,238 +617,6 @@ async function main() {
                 };
             };
 
-            const triangleArea = (positions: Float32Array, i0: number, i1: number, i2: number): number => {
-                const ax = positions[i1] - positions[i0];
-                const ay = positions[i1 + 1] - positions[i0 + 1];
-                const az = positions[i1 + 2] - positions[i0 + 2];
-                const bx = positions[i2] - positions[i0];
-                const by = positions[i2 + 1] - positions[i0 + 1];
-                const bz = positions[i2 + 2] - positions[i0 + 2];
-                const cx = ay * bz - az * by;
-                const cy = az * bx - ax * bz;
-                const cz = ax * by - ay * bx;
-                return 0.5 * Math.sqrt(cx * cx + cy * cy + cz * cz);
-            };
-
-            type NavIslandMetadata = {
-                area: number;
-                centroid: [number, number, number];
-                distanceToSeed: number;
-                triangleCount: number;
-                islandCount: number;
-            };
-
-            const filterNavmeshIslandNearSeed = (
-                positions: Float32Array,
-                indices: Uint32Array,
-                seed: number[] | null
-            ): { positions: Float32Array, indices: Uint32Array, metadata: NavIslandMetadata | null } => {
-                const triangleCount = Math.floor(indices.length / 3);
-                if (!seed || triangleCount <= 1) {
-                    return { positions, indices, metadata: null };
-                }
-
-                const vertexToTriangles = new Map<string, number[]>();
-                const vertexKey = (vertexIndex: number): string => {
-                    const p = vertexIndex * 3;
-                    return `${positions[p].toFixed(3)},${positions[p + 1].toFixed(3)},${positions[p + 2].toFixed(3)}`;
-                };
-
-                for (let tri = 0; tri < triangleCount; tri++) {
-                    for (let corner = 0; corner < 3; corner++) {
-                        const key = vertexKey(indices[tri * 3 + corner]);
-                        const triangles = vertexToTriangles.get(key);
-                        if (triangles) {
-                            triangles.push(tri);
-                        } else {
-                            vertexToTriangles.set(key, [tri]);
-                        }
-                    }
-                }
-
-                const visited = new Uint8Array(triangleCount);
-                const components: Array<{ triangles: number[], area: number, centroid: [number, number, number], distanceToSeed: number }> = [];
-                for (let startTri = 0; startTri < triangleCount; startTri++) {
-                    if (visited[startTri]) continue;
-
-                    const stack = [startTri];
-                    const component: number[] = [];
-                    visited[startTri] = 1;
-                    let area = 0;
-                    let weightedX = 0;
-                    let weightedY = 0;
-                    let weightedZ = 0;
-
-                    while (stack.length > 0) {
-                        const tri = stack.pop()!;
-                        component.push(tri);
-                        const i0 = indices[tri * 3] * 3;
-                        const i1 = indices[tri * 3 + 1] * 3;
-                        const i2 = indices[tri * 3 + 2] * 3;
-                        const triArea = triangleArea(positions, i0, i1, i2);
-                        area += triArea;
-                        const cx = (positions[i0] + positions[i1] + positions[i2]) / 3;
-                        const cy = (positions[i0 + 1] + positions[i1 + 1] + positions[i2 + 1]) / 3;
-                        const cz = (positions[i0 + 2] + positions[i1 + 2] + positions[i2 + 2]) / 3;
-                        weightedX += cx * triArea;
-                        weightedY += cy * triArea;
-                        weightedZ += cz * triArea;
-
-                        for (let corner = 0; corner < 3; corner++) {
-                            const neighbors = vertexToTriangles.get(vertexKey(indices[tri * 3 + corner])) ?? [];
-                            for (const nextTri of neighbors) {
-                                if (!visited[nextTri]) {
-                                    visited[nextTri] = 1;
-                                    stack.push(nextTri);
-                                }
-                            }
-                        }
-                    }
-
-                    const invArea = area > 0 ? 1 / area : 0;
-                    const centroid: [number, number, number] = [
-                        weightedX * invArea,
-                        weightedY * invArea,
-                        weightedZ * invArea,
-                    ];
-                    const dx = centroid[0] - seed[0];
-                    const dy = centroid[1] - seed[1];
-                    const dz = centroid[2] - seed[2];
-                    components.push({
-                        triangles: component,
-                        area,
-                        centroid,
-                        distanceToSeed: Math.sqrt(dx * dx + dy * dy + dz * dz),
-                    });
-                }
-
-                if (components.length <= 1) {
-                    const only = components[0];
-                    return {
-                        positions,
-                        indices,
-                        metadata: only ? {
-                            area: only.area,
-                            centroid: only.centroid,
-                            distanceToSeed: only.distanceToSeed,
-                            triangleCount,
-                            islandCount: 1,
-                        } : null,
-                    };
-                }
-
-                const largestArea = Math.max(...components.map((component) => component.area));
-                const viable = components.filter((component) => component.area >= largestArea * 0.08);
-                viable.sort((a, b) => a.distanceToSeed - b.distanceToSeed || b.area - a.area);
-                const selected = viable[0] ?? components.sort((a, b) => b.area - a.area)[0];
-
-                const remap = new Map<number, number>();
-                const filteredPositions: number[] = [];
-                const filteredIndices: number[] = [];
-                const addVertex = (oldIndex: number): number => {
-                    const existing = remap.get(oldIndex);
-                    if (existing !== undefined) return existing;
-                    const next = filteredPositions.length / 3;
-                    const p = oldIndex * 3;
-                    filteredPositions.push(positions[p], positions[p + 1], positions[p + 2]);
-                    remap.set(oldIndex, next);
-                    return next;
-                };
-
-                const orderedTriangles = [...selected.triangles].sort((a, b) => {
-                    const centroidDistance = (tri: number): number => {
-                        const i0 = indices[tri * 3] * 3;
-                        const i1 = indices[tri * 3 + 1] * 3;
-                        const i2 = indices[tri * 3 + 2] * 3;
-                        const cx = (positions[i0] + positions[i1] + positions[i2]) / 3;
-                        const cy = (positions[i0 + 1] + positions[i1 + 1] + positions[i2 + 1]) / 3;
-                        const cz = (positions[i0 + 2] + positions[i1 + 2] + positions[i2 + 2]) / 3;
-                        const dx = cx - seed[0];
-                        const dy = cy - seed[1];
-                        const dz = cz - seed[2];
-                        return Math.sqrt(dx * dx + dy * dy + dz * dz);
-                    };
-                    return centroidDistance(a) - centroidDistance(b);
-                });
-
-                for (const tri of orderedTriangles) {
-                    filteredIndices.push(
-                        addVertex(indices[tri * 3]),
-                        addVertex(indices[tri * 3 + 1]),
-                        addVertex(indices[tri * 3 + 2])
-                    );
-                }
-
-                console.log(
-                    `[INFO] Fast nav island filter: kept ${selected.triangles.length}/${triangleCount} triangles ` +
-                    `across ${components.length} islands, area=${selected.area.toFixed(2)}, seedDistance=${selected.distanceToSeed.toFixed(2)}`
-                );
-
-                return {
-                    positions: new Float32Array(filteredPositions),
-                    indices: new Uint32Array(filteredIndices),
-                    metadata: {
-                        area: selected.area,
-                        centroid: selected.centroid,
-                        distanceToSeed: selected.distanceToSeed,
-                        triangleCount: selected.triangles.length,
-                        islandCount: components.length,
-                    },
-                };
-            };
-
-            const validateFastNavIsland = (metadata: NavIslandMetadata | null, seed: number[] | null, expectedFloorY: number | null): void => {
-                if (!metadata) {
-                    console.warn("[WARN] Fast nav island validation skipped because no seed island metadata was available.");
-                    return;
-                }
-
-                const floorDelta = expectedFloorY !== null ? metadata.centroid[1] - expectedFloorY : 0;
-                console.log(
-                    `[INFO] Fast nav selected island: triangles=${metadata.triangleCount}, area=${metadata.area.toFixed(2)}, ` +
-                    `centroid=${metadata.centroid.map((v) => v.toFixed(3)).join(', ')}, seedDistance=${metadata.distanceToSeed.toFixed(2)}, ` +
-                    `floorDelta=${expectedFloorY !== null ? floorDelta.toFixed(2) : 'n/a'}`
-                );
-
-                if (metadata.area < 0.35 || metadata.triangleCount < 2) {
-                    throw new Error("Fast nav rejected a tiny navmesh island. The floor field did not produce a usable room-floor region. Try defining a region seed on the floor or importing a Collider GLB for manual nav.");
-                }
-                if (seed && metadata.distanceToSeed > 6.0) {
-                    throw new Error("Fast nav rejected an island too far from the seed. Move the seed onto the room floor or define a tighter region.");
-                }
-                if (expectedFloorY !== null && floorDelta < -0.7) {
-                    throw new Error("Fast nav rejected a navmesh below the expected floor. Define a region seed on the visible room floor or import a Collider GLB for manual nav.");
-                }
-            };
-
-            const chooseNpcSpawnPoint = (positions: Float32Array, indices: Uint32Array, playerSpawn: { x: number, y: number, z: number } | null): [number, number, number] | null => {
-                if (!playerSpawn || indices.length < 3) return null;
-
-                let best: [number, number, number] | null = null;
-                let bestScore = -Infinity;
-                for (let i = 0; i + 2 < indices.length; i += 3) {
-                    const i0 = indices[i] * 3;
-                    const i1 = indices[i + 1] * 3;
-                    const i2 = indices[i + 2] * 3;
-                    const candidate: [number, number, number] = [
-                        (positions[i0] + positions[i1] + positions[i2]) / 3,
-                        (positions[i0 + 1] + positions[i1 + 1] + positions[i2 + 1]) / 3,
-                        (positions[i0 + 2] + positions[i1 + 2] + positions[i2 + 2]) / 3,
-                    ];
-                    const dx = candidate[0] - playerSpawn.x;
-                    const dz = candidate[2] - playerSpawn.z;
-                    const horizontalDistance = Math.sqrt(dx * dx + dz * dz);
-                    const yPenalty = Math.abs(candidate[1] - playerSpawn.y);
-                    const score = horizontalDistance - yPenalty * 2;
-                    if (horizontalDistance >= 0.75 && score > bestScore) {
-                        best = candidate;
-                        bestScore = score;
-                    }
-                }
-
-                return best;
-            };
-
             const runNavmeshFromCollider = async (autoSpawnNpc = false): Promise<void> => {
                 console.log(autoSpawnNpc ? "[WAIT] Fast path: splat -> collider -> navmesh -> NPC..." : "[WAIT] Building navmesh from dedicated collider source...");
                 const bytes = await readSplatBytes();
@@ -959,56 +737,28 @@ async function main() {
                     throw new Error(`Collider mesh is empty. Import a Collider GLB or adjust seed, scene type, voxel size, opacity, or carve capsule.`);
                 }
 
-                const params = {
-                    cs: autoSpawnNpc ? 0.12 : parseFloat((document.getElementById('paramNavCS') as HTMLInputElement).value),
-                    ch: autoSpawnNpc ? 0.10 : parseFloat((document.getElementById('paramNavCH') as HTMLInputElement).value),
-                    walkableHeight: autoSpawnNpc ? 1.7 : parseFloat((document.getElementById('paramNavHeight') as HTMLInputElement).value),
-                    walkableRadius: autoSpawnNpc ? 0.45 : parseFloat((document.getElementById('paramNavRadius') as HTMLInputElement).value),
-                    walkableClimb: autoSpawnNpc ? 0.25 : parseFloat((document.getElementById('paramNavClimb') as HTMLInputElement).value),
-                    walkableSlopeAngle: autoSpawnNpc ? 28 : parseFloat((document.getElementById('paramNavSlope') as HTMLInputElement).value),
+                // Manual (GENERATE NAVMESH) params come from the Advanced Settings
+                // inputs. The FAST NAV path uses the single shared source of truth in
+                // fastNav.ts (FAST_NAV_RECAST_ATTEMPTS) so there is exactly one place
+                // that defines the fast-nav Recast tuning.
+                const params: RecastParams = {
+                    cs: parseFloat((document.getElementById('paramNavCS') as HTMLInputElement).value),
+                    ch: parseFloat((document.getElementById('paramNavCH') as HTMLInputElement).value),
+                    walkableHeight: parseFloat((document.getElementById('paramNavHeight') as HTMLInputElement).value),
+                    walkableRadius: parseFloat((document.getElementById('paramNavRadius') as HTMLInputElement).value),
+                    walkableClimb: parseFloat((document.getElementById('paramNavClimb') as HTMLInputElement).value),
+                    walkableSlopeAngle: parseFloat((document.getElementById('paramNavSlope') as HTMLInputElement).value),
                     maxEdgeLen: 12,
-                    maxSimplificationError: autoSpawnNpc ? 0.5 : 0.8,
-                    minRegionArea: autoSpawnNpc ? 24 : 2,
-                    mergeRegionArea: autoSpawnNpc ? 36 : 12,
+                    maxSimplificationError: 0.8,
+                    minRegionArea: 2,
+                    mergeRegionArea: 12,
                     maxVertsPerPoly: 6,
                     detailSampleDist: 6,
                     detailSampleMaxError: 1
                 };
 
-                const fastAttempts = [
-                    { label: 'strict', params },
-                    {
-                        label: 'balanced',
-                        params: {
-                            ...params,
-                            cs: 0.15,
-                            ch: 0.12,
-                            walkableHeight: 1.4,
-                            walkableRadius: 0.32,
-                            walkableClimb: 0.4,
-                            walkableSlopeAngle: 38,
-                            maxSimplificationError: 0.8,
-                            minRegionArea: 8,
-                            mergeRegionArea: 16,
-                        }
-                    },
-                    {
-                        label: 'recovery',
-                        params: {
-                            ...params,
-                            cs: 0.18,
-                            ch: 0.14,
-                            walkableHeight: 1.2,
-                            walkableRadius: 0.25,
-                            walkableClimb: 0.55,
-                            walkableSlopeAngle: 45,
-                            maxSimplificationError: 1.0,
-                            minRegionArea: 2,
-                            mergeRegionArea: 8,
-                        }
-                    },
-                ];
-                const attempts = autoSpawnNpc ? fastAttempts : [{ label: 'manual', params }];
+                const attempts: ReadonlyArray<{ label: string; params: RecastParams }> =
+                    autoSpawnNpc ? FAST_NAV_RECAST_ATTEMPTS : [{ label: 'manual', params }];
 
                 let result: { navMeshData: Uint8Array, debugPositions: Float32Array, debugIndices: Uint32Array, report: any } | null = null;
                 let lastError: unknown = null;

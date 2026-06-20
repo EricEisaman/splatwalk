@@ -103,14 +103,17 @@ ctx.onmessage = async (e: MessageEvent) => {
             }
 
             // 2. Vertical Headroom Padding
-            // Recast needs vertical space to check agent height. If the mesh is too shallow,
-            // we must pad the bounding box upwards.
-            let paddedMaxY = maxY;
-            if (height < params.walkableHeight + 0.5) {
-                const padding = (params.walkableHeight + 0.5) - height;
-                paddedMaxY += padding;
-                console.log(`[WORKER] Applying vertical headroom padding: +${padding.toFixed(2)}m`);
-            }
+            // Recast culls any floor span that lacks `walkableHeight` of clear space
+            // above it (filterWalkableLowHeightSpans). The floor-field mesh is an
+            // open-sky sheet with no real overhead geometry, so we add headroom above
+            // the HIGHEST floor cell (maxY), not just enough to make the sheet thickness
+            // exceed walkableHeight. Padding above maxY guarantees every cell - including
+            // the top deck level - keeps its clearance once walkableHeight is enforced
+            // in voxels (see below). `params.walkableHeight` here is still in metres.
+            const requiredHeadroom = params.walkableHeight + 0.5;
+            const padding = requiredHeadroom;
+            const paddedMaxY = maxY + padding;
+            console.log(`[WORKER] Applying vertical headroom padding: +${padding.toFixed(2)}m above maxY`);
 
             // 3. Smart Cell Size Override
             // If the grid is too coarse (e.g. < 40 cells), Recast fails opaquely.
@@ -129,6 +132,31 @@ ctx.onmessage = async (e: MessageEvent) => {
             const gridH = Math.ceil((paddedMaxY - minY) / params.ch);
 
             const activeParams = { ...params, cs: finalCS };
+
+            // Recast's rcConfig stores walkableHeight/Climb/Radius as INTEGER VOXEL
+            // COUNTS, not world-space metres (see @recast-navigation createRcConfig: it
+            // assigns these straight into the native rcConfig int fields). The rest of
+            // SplatWalk specifies them in metres, so we MUST convert here using the
+            // standard Recast convention. Without this, sub-1.0m values silently
+            // truncate to 0 voxels: walkableClimb 0.25->0 (every step becomes an
+            // impassable wall, splitting one level into disjoint islands) and
+            // walkableRadius 0.45->0 (no erosion at all). This made slope/climb/radius
+            // appear completely inert and was the true cause of the tropical
+            // fragmentation. walkableHeight 1.7m -> ceil(1.7/0.1)=17 voxels.
+            const chSafe = activeParams.ch > 0 ? activeParams.ch : 0.1;
+            const csSafe = finalCS > 0 ? finalCS : 0.12;
+            const voxelParams = {
+                ...activeParams,
+                walkableHeight: Math.max(1, Math.ceil(activeParams.walkableHeight / chSafe)),
+                walkableClimb: Math.max(0, Math.floor(activeParams.walkableClimb / chSafe)),
+                walkableRadius: Math.max(0, Math.ceil(activeParams.walkableRadius / csSafe)),
+            };
+            console.log(
+                `[WORKER] Recast voxel params (from metres): walkableHeight=${voxelParams.walkableHeight}vx ` +
+                `(${activeParams.walkableHeight}m), walkableClimb=${voxelParams.walkableClimb}vx ` +
+                `(${activeParams.walkableClimb}m), walkableRadius=${voxelParams.walkableRadius}vx ` +
+                `(${activeParams.walkableRadius}m) @ cs=${csSafe},ch=${chSafe}`
+            );
 
             console.log(`[WORKER] Collider Pre-flight Diagnostics:`);
             console.log(`[WORKER]   - Source: ${sourceLabel ?? 'collider_mesh'}`);
@@ -212,7 +240,7 @@ ctx.onmessage = async (e: MessageEvent) => {
             const { success, navMesh, intermediates } = generateSoloNavMesh(
                 positions,
                 finalIndices,
-                { ...activeParams, bmin, bmax },
+                { ...voxelParams, bmin, bmax },
                 true // keepIntermediates
             );
 

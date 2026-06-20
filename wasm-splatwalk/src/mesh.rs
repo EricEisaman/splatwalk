@@ -1011,6 +1011,7 @@ fn build_field(
         sdf_max_layers,
         obstacle_clearance_min,
         obstacle_clearance_max,
+        floor_y,
     );
     let mut surface_heights = surfaces
         .iter()
@@ -1339,6 +1340,7 @@ fn extract_density_surfaces(
     max_layers: usize,
     clearance_lo: f64,
     clearance_hi: f64,
+    floor_y_hint: f64,
 ) -> Vec<DensitySurface> {
     let mut surfaces = vec![empty_density_surface(); cell_count];
 
@@ -1397,14 +1399,54 @@ fn extract_density_surfaces(
         all_layers.push(layers);
     }
 
-    // The global floor plane is the centroid of the heaviest histogram bin. Columns then
-    // anchor their floor to this plane rather than to their own lowest layer.
-    let global_floor_height = floor_histogram
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .filter(|(_, &weight)| weight > 0.0)
-        .map(|(b, _)| min_y + (b as f64 + 0.5) * vertical_cell_size);
+    // The global floor plane is the LOWEST sufficiently-dominant horizontal accumulation
+    // (a gravity prior), not merely the single heaviest bin. In enclosed scenes such as
+    // warehouses the large continuous flat roof forms a density peak that can rival or
+    // exceed the floor's, so a plain global argmax latches onto the roof and drags every
+    // column's floor (and the navmesh, seed, and region) up onto it. To avoid that we:
+    //   1. Smooth the histogram so a floor whose weight straddles adjacent bins is not
+    //      out-voted by a roof concentrated in a single bin.
+    //   2. Keep only peaks that are both significant and not below the floater-robust
+    //      percentile floor `floor_y_hint` (rejecting sub-floor slivers/reflections).
+    //   3. Pick the LOWEST such peak (the floor sits beneath shelving, mezzanines, roof).
+    let global_floor_height = {
+        let n = floor_histogram.len();
+        let smooth_radius = ((0.15 / vertical_cell_size).round() as usize).clamp(1, 6);
+        let mut smoothed = vec![0.0_f64; n];
+        for b in 0..n {
+            let lo = b.saturating_sub(smooth_radius);
+            let hi = (b + smooth_radius + 1).min(n);
+            smoothed[b] = floor_histogram[lo..hi].iter().sum();
+        }
+        let max_weight = smoothed.iter().copied().fold(0.0_f64, f64::max);
+        if max_weight <= 0.0 {
+            None
+        } else {
+            let significance = 0.25 * max_weight;
+            // Do not accept a "floor" appreciably below the percentile floor: that is
+            // sub-floor noise, not the walkable surface.
+            let lower_bound = floor_y_hint - (vertical_cell_size * 4.0).max(0.5);
+            let bin_height = |b: usize| min_y + (b as f64 + 0.5) * vertical_cell_size;
+            let qualifies = |b: usize| smoothed[b] >= significance && bin_height(b) >= lower_bound;
+            // Prefer the lowest significant local maximum (a real plane, not a skirt).
+            let lowest_peak = (0..n).find(|&b| {
+                qualifies(b)
+                    && (b == 0 || smoothed[b] >= smoothed[b - 1])
+                    && (b + 1 >= n || smoothed[b] >= smoothed[b + 1])
+            });
+            // Fallbacks: lowest qualifying bin, then the global argmax (legacy behavior).
+            let chosen = lowest_peak
+                .or_else(|| (0..n).find(|&b| qualifies(b)))
+                .or_else(|| {
+                    smoothed
+                        .iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                        .map(|(b, _)| b)
+                });
+            chosen.map(bin_height)
+        }
+    };
 
     // PASS 2 -- classify each column against the scene-wide floor plane.
     for cell_idx in 0..cell_count {

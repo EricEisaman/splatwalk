@@ -96,7 +96,7 @@ interface NavWorkerResult {
   readonly report: NavReport;
 }
 
-interface RecastParams {
+export interface RecastParams {
   cs: number;
   ch: number;
   walkableHeight: number;
@@ -112,7 +112,63 @@ interface RecastParams {
   detailSampleMaxError: number;
 }
 
-interface NavIslandMetadata {
+/**
+ * Single source of truth for the FAST NAV Recast parameters and the adaptive
+ * relaxation ladder (strict -> balanced -> recovery). Both the library entry
+ * point ({@link runFastNav}) and the workbench page consume this so the fast-nav
+ * navmesh behaviour is defined in exactly one place.
+ */
+export const FAST_NAV_BASE_PARAMS: RecastParams = {
+  cs: 0.12,
+  ch: 0.1,
+  walkableHeight: 1.7,
+  walkableRadius: 0.12,
+  walkableClimb: 0.25,
+  walkableSlopeAngle: 40,
+  maxEdgeLen: 12,
+  maxSimplificationError: 0.5,
+  minRegionArea: 24,
+  mergeRegionArea: 36,
+  maxVertsPerPoly: 6,
+  detailSampleDist: 6,
+  detailSampleMaxError: 1,
+};
+
+export const FAST_NAV_RECAST_ATTEMPTS: ReadonlyArray<{ label: string; params: RecastParams }> = [
+  { label: 'strict', params: FAST_NAV_BASE_PARAMS },
+  {
+    label: 'balanced',
+    params: {
+      ...FAST_NAV_BASE_PARAMS,
+      cs: 0.15,
+      ch: 0.12,
+      walkableHeight: 1.4,
+      walkableRadius: 0.32,
+      walkableClimb: 0.4,
+      walkableSlopeAngle: 42,
+      maxSimplificationError: 0.8,
+      minRegionArea: 8,
+      mergeRegionArea: 16,
+    },
+  },
+  {
+    label: 'recovery',
+    params: {
+      ...FAST_NAV_BASE_PARAMS,
+      cs: 0.18,
+      ch: 0.14,
+      walkableHeight: 1.2,
+      walkableRadius: 0.25,
+      walkableClimb: 0.55,
+      walkableSlopeAngle: 48,
+      maxSimplificationError: 1.0,
+      minRegionArea: 2,
+      mergeRegionArea: 8,
+    },
+  },
+];
+
+export interface NavIslandMetadata {
   readonly area: number;
   readonly centroid: [number, number, number];
   readonly distanceToSeed: number;
@@ -241,7 +297,7 @@ async function ensureFastCollisionSeed(
   return seed;
 }
 
-function triangleArea(positions: Float32Array, i0: number, i1: number, i2: number): number {
+export function triangleArea(positions: Float32Array, i0: number, i1: number, i2: number): number {
   const ax = positions[i1] - positions[i0];
   const ay = positions[i1 + 1] - positions[i0 + 1];
   const az = positions[i1 + 2] - positions[i0 + 2];
@@ -254,11 +310,11 @@ function triangleArea(positions: Float32Array, i0: number, i1: number, i2: numbe
   return 0.5 * Math.sqrt(cx * cx + cy * cy + cz * cz);
 }
 
-function filterNavmeshIslandNearSeed(
+export function filterNavmeshIslandNearSeed(
   positions: Float32Array,
   indices: Uint32Array,
   seed: number[] | null,
-  log: FastNavLogger
+  log: FastNavLogger = (message: string): void => console.log(message)
 ): { positions: Float32Array; indices: Uint32Array; metadata: NavIslandMetadata | null } {
   const triangleCount = Math.floor(indices.length / 3);
   if (!seed || triangleCount <= 1) {
@@ -289,6 +345,8 @@ function filterNavmeshIslandNearSeed(
     area: number;
     centroid: [number, number, number];
     distanceToSeed: number;
+    ymin: number;
+    ymax: number;
   }> = [];
   for (let startTri = 0; startTri < triangleCount; startTri++) {
     if (visited[startTri]) continue;
@@ -300,6 +358,8 @@ function filterNavmeshIslandNearSeed(
     let weightedX = 0;
     let weightedY = 0;
     let weightedZ = 0;
+    let ymin = Infinity;
+    let ymax = -Infinity;
 
     while (stack.length > 0) {
       const tri = stack.pop()!;
@@ -315,6 +375,10 @@ function filterNavmeshIslandNearSeed(
       weightedX += cx * triArea;
       weightedY += cy * triArea;
       weightedZ += cz * triArea;
+      for (const vy of [positions[i0 + 1], positions[i1 + 1], positions[i2 + 1]]) {
+        if (vy < ymin) ymin = vy;
+        if (vy > ymax) ymax = vy;
+      }
 
       for (let corner = 0; corner < 3; corner++) {
         const neighbors = vertexToTriangles.get(vertexKey(indices[tri * 3 + corner])) ?? [];
@@ -337,8 +401,20 @@ function filterNavmeshIslandNearSeed(
       area,
       centroid,
       distanceToSeed: Math.sqrt(dx * dx + dy * dy + dz * dz),
+      ymin,
+      ymax,
     });
   }
+
+  // Honest, single-place per-island summary of the FULL navmesh that actually gets
+  // displayed/walked (not just the seed island), so connectivity can be verified by
+  // island count + each island's area and Y-range instead of one aggregate line.
+  const islandSummary = [...components]
+    .sort((a, b) => b.area - a.area)
+    .slice(0, 8)
+    .map((c) => `{a=${c.area.toFixed(1)} y=[${c.ymin.toFixed(2)},${c.ymax.toFixed(2)}]}`)
+    .join(' ');
+  log(`[INFO] Fast nav navmesh islands=${components.length}: ${islandSummary}`);
 
   if (components.length <= 1) {
     const only = components[0];
@@ -418,11 +494,11 @@ function filterNavmeshIslandNearSeed(
   };
 }
 
-function validateFastNavIsland(
+export function validateFastNavIsland(
   metadata: NavIslandMetadata | null,
   seed: number[] | null,
   expectedFloorY: number | null,
-  log: FastNavLogger
+  log: FastNavLogger = (message: string): void => console.log(message)
 ): void {
   if (!metadata) {
     log('[WARN] Fast nav island validation skipped because no seed island metadata was available.');
@@ -449,7 +525,7 @@ function validateFastNavIsland(
   }
 }
 
-function chooseNpcSpawnPoint(
+export function chooseNpcSpawnPoint(
   positions: Float32Array,
   indices: Uint32Array,
   playerSpawn: { x: number; y: number; z: number } | null
@@ -569,55 +645,7 @@ export async function runFastNav(options: FastNavOptions): Promise<FastNavResult
     ? { min: splatBoundsVec.min.asArray(), max: splatBoundsVec.max.asArray() }
     : null;
 
-  const baseParams: RecastParams = {
-    cs: 0.12,
-    ch: 0.1,
-    walkableHeight: 1.7,
-    walkableRadius: 0.45,
-    walkableClimb: 0.25,
-    walkableSlopeAngle: 28,
-    maxEdgeLen: 12,
-    maxSimplificationError: 0.5,
-    minRegionArea: 24,
-    mergeRegionArea: 36,
-    maxVertsPerPoly: 6,
-    detailSampleDist: 6,
-    detailSampleMaxError: 1,
-  };
-
-  const attempts: ReadonlyArray<{ label: string; params: RecastParams }> = [
-    { label: 'strict', params: baseParams },
-    {
-      label: 'balanced',
-      params: {
-        ...baseParams,
-        cs: 0.15,
-        ch: 0.12,
-        walkableHeight: 1.4,
-        walkableRadius: 0.32,
-        walkableClimb: 0.4,
-        walkableSlopeAngle: 38,
-        maxSimplificationError: 0.8,
-        minRegionArea: 8,
-        mergeRegionArea: 16,
-      },
-    },
-    {
-      label: 'recovery',
-      params: {
-        ...baseParams,
-        cs: 0.18,
-        ch: 0.14,
-        walkableHeight: 1.2,
-        walkableRadius: 0.25,
-        walkableClimb: 0.55,
-        walkableSlopeAngle: 45,
-        maxSimplificationError: 1.0,
-        minRegionArea: 2,
-        mergeRegionArea: 8,
-      },
-    },
-  ];
+  const attempts = FAST_NAV_RECAST_ATTEMPTS;
 
   let result: NavWorkerResult | null = null;
   let lastError: unknown = null;

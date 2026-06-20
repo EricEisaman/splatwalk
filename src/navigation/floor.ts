@@ -514,7 +514,10 @@ export function buildFastFloorMesh(
   seed: number[] | null,
   minRoomFloorArea: number,
   log: FastNavLogger,
-  strayTrim?: StrayTrimOptions,
+  // Retained for signature/call-site stability. The merged same-level emission now
+  // bounds heights via the per-component height gate + local median leveling, so the
+  // old global stray-trim is intentionally not applied here.
+  _strayTrim?: StrayTrimOptions,
   floorFlattenTolerance: number = DEFAULT_FLOOR_FLATTEN_TOLERANCE
 ): FastFloorMesh {
   const width = field.width;
@@ -534,11 +537,21 @@ export function buildFastFloorMesh(
     origin[1] + tangent[1] * col * field.cell_size + bitangent[1] * row * field.cell_size + up[1] * cellHeight,
     origin[2] + tangent[2] * col * field.cell_size + bitangent[2] * row * field.cell_size + up[2] * cellHeight,
   ];
+  // Cells filled by the morphological close (bridging thin void seams between floor
+  // patches at the SAME level) carry no WASM height, so we track an interpolated
+  // height for them here.
+  const bridgeHeight = new Map<number, number>();
+  const heightOf = (idx: number): number => {
+    const h = field.cells[idx]?.height;
+    if (Number.isFinite(h)) return h as number;
+    const b = bridgeHeight.get(idx);
+    return b !== undefined ? b : Number.NaN;
+  };
   const cellCenter = (idx: number): [number, number, number] => {
     const row = Math.floor(idx / width);
     const col = idx % width;
-    const cell = field.cells[idx];
-    return pointAt(col + 0.5, row + 0.5, Number.isFinite(cell.height) ? cell.height : 0);
+    const h = heightOf(idx);
+    return pointAt(col + 0.5, row + 0.5, Number.isFinite(h) ? h : 0);
   };
 
   const buildMask = (relaxed: boolean): boolean[] =>
@@ -701,8 +714,61 @@ export function buildFastFloorMesh(
     return bridged;
   };
 
+  // Bounded, height-aware morphological close: bridge THIN void/low-confidence seams
+  // that fragment an otherwise-continuous SAME-LEVEL floor (sparse outdoor ground
+  // capture reads as void, splitting a lawn/deck into many tiny components). A gap
+  // cell is filled only when accepted floor is found within `maxGap` on at least two
+  // of four cardinal sides AND those floor heights agree within `heightTol`. This can
+  // NEVER bridge across a pool (gap >> maxGap, and the pool bottom height disagrees)
+  // or onto a box top (separated by obstacle sides, height disagrees); obstacle and
+  // height_variance cells are skipped so real blockers/ledges stay rejected.
+  const closeFloorSeams = (mask: boolean[], maxGap: number, heightTol: number): number => {
+    if (maxGap < 1) return 0;
+    const dirs: Array<[number, number]> = [
+      [-1, 0],
+      [1, 0],
+      [0, -1],
+      [0, 1],
+    ];
+    const additions: Array<[number, number]> = [];
+    for (let idx = 0; idx < field.cells.length; idx++) {
+      if (mask[idx]) continue;
+      const state = field.cells[idx]?.state;
+      if (state === 'obstacle' || state === 'height_variance') continue;
+      const row = Math.floor(idx / width);
+      const col = idx % width;
+      const hits: number[] = [];
+      for (const [dr, dc] of dirs) {
+        for (let step = 1; step <= maxGap; step++) {
+          const nr = row + dr * step;
+          const nc = col + dc * step;
+          if (nr < 0 || nc < 0 || nr >= height || nc >= width) break;
+          const nidx = nr * width + nc;
+          if (mask[nidx]) {
+            const h = heightOf(nidx);
+            if (Number.isFinite(h)) hits.push(h);
+            break;
+          }
+        }
+      }
+      if (hits.length >= 2) {
+        const mn = Math.min(...hits);
+        const mx = Math.max(...hits);
+        if (mx - mn <= heightTol) additions.push([idx, (mn + mx) / 2]);
+      }
+    }
+    for (const [idx, h] of additions) {
+      mask[idx] = true;
+      bridgeHeight.set(idx, h);
+    }
+    return additions.length;
+  };
+  const maxSeamGapCells = Math.max(1, Math.round(0.6 / field.cell_size));
+  const seamHeightTolerance = 0.35;
+
   const strictMask = buildMask(false);
   const bridgedCellCount = bridgeEnclosedGaps(strictMask);
+  const closedCellCount = closeFloorSeams(strictMask, maxSeamGapCells, seamHeightTolerance);
   const acceptedCellCount = strictMask.filter(Boolean).length;
   const rejectedCellCount = field.cells.length - acceptedCellCount;
   const strictComponents = collectComponents(strictMask);
@@ -714,6 +780,7 @@ export function buildFastFloorMesh(
   if (!selection || areaOfSelection(selection) < minRoomFloorArea) {
     const relaxedMask = buildMask(true);
     bridgeEnclosedGaps(relaxedMask);
+    closeFloorSeams(relaxedMask, maxSeamGapCells, seamHeightTolerance);
     const relaxedComponents = collectComponents(relaxedMask);
     const relaxedSelection = selectComponent(relaxedComponents);
     if (relaxedSelection && (!selection || areaOfSelection(relaxedSelection) > areaOfSelection(selection))) {
@@ -743,17 +810,93 @@ export function buildFastFloorMesh(
 
   const selected = selection.selected;
 
-  // Ignore a small number of stray peripheral cells/floaters so the floor stays a
-  // clean, contiguous plane that Recast won't shatter into tiny islands.
-  const trimmed = trimStrayFloorCells(field, selected.cells, strayTrim);
-  const floorCells = trimmed.cells;
-  if (trimmed.changed) {
-    log(
-      `[INFO] Fast floor stray trim: dropped ${trimmed.droppedHeightOutliers} height-outlier + ` +
-        `${trimmed.droppedPeripheral} peripheral cell(s), kept ${floorCells.length} ` +
-        `(median floor y=${trimmed.medianHeight.toFixed(3)}).`
-    );
+  const medianHeightOf = (cells: number[]): number => {
+    const hs = cells
+      .map((i) => heightOf(i))
+      .filter((h) => Number.isFinite(h))
+      .sort((a, b) => a - b);
+    return hs.length ? hs[Math.floor(hs.length / 2)] : Number.NaN;
+  };
+
+  // Emit EVERY SAME-LEVEL viable floor component for full coverage of the walkable
+  // level - not just the seed component - so a floor split into separate patches by a
+  // wide seam (a central walkway, a pool, sparse capture) is covered rather than left
+  // as one disjoint area. The height gate keeps only components whose median height is
+  // in the floor band [ref-0.25, ref+0.30]; this EXCLUDES sunken surfaces (pool
+  // bottoms, below the floor) and elevated surfaces (box tops / shelves, above the
+  // floor), so it can neither fill pools nor climb boxes. Genuinely different
+  // elevation levels fall outside the band and remain their own regions, and because
+  // walkableClimb is unchanged (0.25) nothing is stitched across a real step.
+  const refHeight = medianHeightOf(selected.cells);
+  const sameLevelLow = Number.isFinite(refHeight) ? refHeight - 0.25 : -Infinity;
+  const sameLevelHigh = Number.isFinite(refHeight) ? refHeight + 0.3 : Infinity;
+  // Per-cell band: even within an accepted same-level component, individual cells far
+  // below the floor (pool-edge spill, capture noise) must not be emitted or they drag
+  // the surface underground. Slightly wider than the component-median gate to keep
+  // genuine gentle slope.
+  const cellBandLow = Number.isFinite(refHeight) ? refHeight - 0.5 : -Infinity;
+  const cellBandHigh = Number.isFinite(refHeight) ? refHeight + 0.45 : Infinity;
+  const minComponentCells = 20;
+  const minComponentArea = 1.2;
+  const cellArea = field.cell_size * field.cell_size;
+  const floorCells: number[] = [];
+  let emittedComponentCount = 0;
+  for (const component of components) {
+    if (component.cells.length < minComponentCells) continue;
+    if (component.cells.length * cellArea < minComponentArea) continue;
+    if (Number.isFinite(refHeight)) {
+      const med = medianHeightOf(component.cells);
+      if (!Number.isFinite(med) || med < sameLevelLow || med > sameLevelHigh) continue;
+    }
+    let pushed = 0;
+    for (const idx of component.cells) {
+      const h = heightOf(idx);
+      if (Number.isFinite(h) && (h < cellBandLow || h > cellBandHigh)) continue;
+      floorCells.push(idx);
+      pushed += 1;
+    }
+    if (pushed > 0) emittedComponentCount += 1;
   }
+  if (floorCells.length === 0) {
+    for (const idx of selected.cells) floorCells.push(idx);
+    emittedComponentCount = 1;
+  }
+
+  // Local median leveling, scoped STRICTLY to the emitted floor cells: replace each
+  // floor cell's height with the median of finite floor-cell heights in a small
+  // neighborhood. Merging same-level patches (and the interpolated close cells) leaves
+  // per-cell sensor noise that tilts otherwise-flat ground past Recast's walkable
+  // slope limit, so Recast culls it (the merged floor reads as only ~42% up-facing).
+  // Median leveling removes that noise while preserving genuine large-scale slope, and
+  // because it only samples cells already in the floor set it can never pull a pool
+  // bottom or box top into the surface.
+  const floorSetForLeveling = new Set(floorCells);
+  const levelRadius = 3;
+  const leveledHeight = new Map<number, number>();
+  for (const idx of floorCells) {
+    const row = Math.floor(idx / width);
+    const col = idx % width;
+    const samples: number[] = [];
+    for (let dr = -levelRadius; dr <= levelRadius; dr++) {
+      for (let dc = -levelRadius; dc <= levelRadius; dc++) {
+        const nr = row + dr;
+        const nc = col + dc;
+        if (nr < 0 || nc < 0 || nr >= height || nc >= width) continue;
+        const nidx = nr * width + nc;
+        if (!floorSetForLeveling.has(nidx)) continue;
+        const h = heightOf(nidx);
+        if (Number.isFinite(h)) samples.push(h);
+      }
+    }
+    if (samples.length > 0) {
+      samples.sort((a, b) => a - b);
+      leveledHeight.set(idx, samples[Math.floor(samples.length / 2)]);
+    }
+  }
+  const surfaceHeightOf = (idx: number): number => {
+    const lv = leveledHeight.get(idx);
+    return lv !== undefined ? lv : heightOf(idx);
+  };
 
   let cx = 0;
   let cy = 0;
@@ -798,7 +941,23 @@ export function buildFastFloorMesh(
   // `floorFlattenTolerance`. This keeps neighbouring cells C0-continuous so Recast
   // does not shatter a flat floor on per-cell height noise / vertical cracks.
   const floorSet = new Set(floorCells);
-  const floorPlaneHeight = field.diagnostics.floor_plane_height;
+  // Anchor flattening/fallback to a height that actually belongs to THIS floor level.
+  // `floor_plane_height` is a global estimate that, on scenes with a large pool/sunken
+  // area, lands well below the deck (e.g. -3.120 vs a real floor of -1.972). Snapping or
+  // filling corners to that out-of-band value injects deep spikes into the emitted sheet
+  // (cornerY reaching -3.120) and balloons the mesh's vertical extent. Only trust the
+  // WASM plane when it sits inside the gated per-cell band; otherwise use the in-band
+  // component median (refHeight). This preserves real terrain height (no flattening) and
+  // simply stops corners from being dragged to the pool plane.
+  const rawFloorPlaneHeight = field.diagnostics.floor_plane_height;
+  const floorPlaneHeight =
+    Number.isFinite(rawFloorPlaneHeight) &&
+    (rawFloorPlaneHeight as number) >= cellBandLow &&
+    (rawFloorPlaneHeight as number) <= cellBandHigh
+      ? (rawFloorPlaneHeight as number)
+      : Number.isFinite(refHeight)
+        ? refHeight
+        : rawFloorPlaneHeight;
   const planeUsable = Number.isFinite(floorPlaneHeight);
   const cornerCols = width + 1;
   const cornerKey = (cc: number, rr: number): number => rr * cornerCols + cc;
@@ -816,9 +975,9 @@ export function buildFastFloorMesh(
         if (col < 0 || row < 0 || col >= width || row >= height) continue;
         const cidx = row * width + col;
         if (!floorSet.has(cidx)) continue;
-        const ch = field.cells[cidx]?.height;
+        const ch = surfaceHeightOf(cidx);
         if (Number.isFinite(ch)) {
-          sum += ch as number;
+          sum += ch;
           count += 1;
         }
       }
@@ -856,7 +1015,9 @@ export function buildFastFloorMesh(
 
   log(
     `[INFO] Fast floor field: accepted=${acceptedCellCount}, obstacles=${obstacleCellCount}, ` +
-      `rejected=${rejectedCellCount}, bridged=${bridgedCellCount}, components=${components.length}, ` +
+      `rejected=${rejectedCellCount}, bridged=${bridgedCellCount}, closed=${closedCellCount}, ` +
+      `components=${components.length}, emittedComponents=${emittedComponentCount}, ` +
+      `floorBand=[${Number.isFinite(refHeight) ? sameLevelLow.toFixed(2) : 'n/a'},${Number.isFinite(refHeight) ? sameLevelHigh.toFixed(2) : 'n/a'}], ` +
       `selectedCells=${floorCells.length}, selectedArea=${selectedArea.toFixed(2)}, ` +
       `vertices=${positions.length / 3}, maskCells=${selectedMask.filter(Boolean).length}`
   );
