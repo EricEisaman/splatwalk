@@ -2,6 +2,7 @@ import type { Vector3 } from '@babylonjs/core';
 
 import NavWorker from '@/navigation/navmesh.worker?worker';
 import type { Viewer } from '@/scene/Viewer';
+import { buildNavmeshKey, getNavmesh, putNavmesh } from '@/navigation/navmeshCache';
 import { splatwalk, type MeshSettings } from '@/wasm/bridge';
 import {
   extractFloorFieldWithRecovery,
@@ -110,6 +111,15 @@ export interface RecastParams {
   maxVertsPerPoly: number;
   detailSampleDist: number;
   detailSampleMaxError: number;
+  /**
+   * When true (the default), the Recast worker auto-sizes `cs` from the mesh
+   * extent + agent radius (Recast guideline `cs in [radius/3, radius/2]`) and the
+   * `maxNavCells` budget, instead of using the literal `cs` above. Set false to
+   * force the literal `cs`.
+   */
+  autoCellSize?: boolean;
+  /** Ceiling on total navmesh voxel columns when `autoCellSize` is on. */
+  maxNavCells?: number;
 }
 
 /**
@@ -119,11 +129,25 @@ export interface RecastParams {
  * navmesh behaviour is defined in exactly one place.
  */
 export const FAST_NAV_BASE_PARAMS: RecastParams = {
-  cs: 0.12,
+  // `cs` here is only a fallback: with `autoCellSize` on (default), the worker
+  // derives cs from the mesh extent + agent radius (cs in [radius/3, radius/2])
+  // bounded by `maxNavCells`, so a large warehouse is covered completely instead
+  // of being limited by a fixed cell size.
+  cs: 0.2,
   ch: 0.1,
   walkableHeight: 1.7,
-  walkableRadius: 0.12,
-  walkableClimb: 0.25,
+  // Agent bounding-cylinder radius, in metres. 0.5m is the Recast/Unity gaming
+  // standard; cell size is auto-derived from it (cs in [radius/3, radius/2]).
+  walkableRadius: 0.5,
+  autoCellSize: true,
+  maxNavCells: 1_000_000,
+  // Max climbable step, in metres. Must MATCH the floor field's same-level band
+  // (~0.5m): the field accepts cells within that band into one continuous region
+  // and median-levels them, so any smaller value lets Recast re-sever a floor the
+  // field already treats as continuous wherever capture noise leaves a crease
+  // between two scan patches - that is the navmesh "break" on a wide, flat passage.
+  // 0.5m is also within the Unity (0.4m) / Recast-demo (0.9m) step-height standard.
+  walkableClimb: 0.5,
   walkableSlopeAngle: 40,
   maxEdgeLen: 12,
   maxSimplificationError: 0.5,
@@ -143,8 +167,6 @@ export const FAST_NAV_RECAST_ATTEMPTS: ReadonlyArray<{ label: string; params: Re
       cs: 0.15,
       ch: 0.12,
       walkableHeight: 1.4,
-      walkableRadius: 0.32,
-      walkableClimb: 0.4,
       walkableSlopeAngle: 42,
       maxSimplificationError: 0.8,
       minRegionArea: 8,
@@ -158,8 +180,6 @@ export const FAST_NAV_RECAST_ATTEMPTS: ReadonlyArray<{ label: string; params: Re
       cs: 0.18,
       ch: 0.14,
       walkableHeight: 1.2,
-      walkableRadius: 0.25,
-      walkableClimb: 0.55,
       walkableSlopeAngle: 48,
       maxSimplificationError: 1.0,
       minRegionArea: 2,
@@ -604,12 +624,30 @@ export async function runFastNav(options: FastNavOptions): Promise<FastNavResult
     if (options.prune.k !== undefined) base.prune_floaters_k = options.prune.k;
     if (options.prune.stdRatio !== undefined) base.prune_floaters_std_ratio = options.prune.stdRatio;
   }
+  const recovery = resolveRecovery(options.recovery);
+
+  // Cross-visit cache: if this exact splat + settings produced a navmesh before,
+  // restore it and skip parse+prune+field+floor+Recast entirely. The seed and
+  // orientation are deterministic functions of the bytes plus these settings, so
+  // the key omits them (computing the seed is part of the work we want to skip).
+  const cacheKey = buildNavmeshKey(bytes, {
+    base,
+    recovery,
+    strayTrim: options.strayTrim ?? null,
+    denseSeed: options.denseSeed ?? null,
+    recastAttempts: FAST_NAV_RECAST_ATTEMPTS,
+  });
+  const cached = await getNavmesh(cacheKey);
+  if (cached) {
+    log('[INFO] FAST NAV navmesh restored from cache (skipping recompute).');
+    phase('navmesh');
+    return finishFastNav(viewer, cached, log);
+  }
 
   // First touch of the splat bytes parses + prunes floaters in the worker.
   phase('prune');
   const fastSeed = await ensureFastCollisionSeed(viewer, bytes, base, log);
   const navSettings = buildFastFieldSettings(base, fastSeed);
-  const recovery = resolveRecovery(options.recovery);
 
   phase('floor');
   const extracted = await extractFloorFieldWithRecovery({
@@ -676,18 +714,41 @@ export async function runFastNav(options: FastNavOptions): Promise<FastNavResult
   const safety = filterNavmeshIslandNearSeed(result.debugPositions, result.debugIndices, effectiveFastSeed, log);
   validateFastNavIsland(safety.metadata, effectiveFastSeed, expectedFloorY, log);
 
+  // Persist the validated artifact so an unchanged revisit restores it instead of
+  // recomputing. Best-effort: a storage failure never blocks the pipeline, and we
+  // only cache results that passed validation so we never persist a bad navmesh.
+  await putNavmesh(cacheKey, {
+    navMeshData: result.navMeshData,
+    debugPositions: result.debugPositions,
+    debugIndices: result.debugIndices,
+  });
+
+  return finishFastNav(viewer, result, log);
+}
+
+/**
+ * Shared post-worker tail used by both a fresh navmesh build and a cache hit:
+ * render the overlay, choose spawn points, initialize the crowd, and spawn the
+ * NPC. Deterministic in its inputs, so a restored artifact reproduces the same
+ * player/NPC setup as the original run.
+ */
+async function finishFastNav(
+  viewer: Viewer,
+  artifact: { navMeshData: Uint8Array; debugPositions: Float32Array; debugIndices: Uint32Array },
+  log: FastNavLogger
+): Promise<FastNavResult> {
   log('[WAIT] Rendering NavMesh overlay...');
-  const spawnPoint = await viewer.displayNavMesh(result.debugPositions, result.debugIndices, 0);
+  const spawnPoint = await viewer.displayNavMesh(artifact.debugPositions, artifact.debugIndices, 0);
   if (spawnPoint) {
-    const npcSpawn = chooseNpcSpawnPoint(result.debugPositions, result.debugIndices, spawnPoint);
+    const npcSpawn = chooseNpcSpawnPoint(artifact.debugPositions, artifact.debugIndices, spawnPoint);
     viewer.setPreferredNavSpawnPoints([spawnPoint.x, spawnPoint.y, spawnPoint.z], npcSpawn);
     log(`[INFO] Player agent spawn: ${spawnPoint.x.toFixed(3)}, ${spawnPoint.y.toFixed(3)}, ${spawnPoint.z.toFixed(3)}`);
   }
 
   log('[WAIT] Initializing NPC crowd simulation...');
-  await viewer.initCrowd(result.navMeshData, spawnPoint);
+  await viewer.initCrowd(artifact.navMeshData, spawnPoint);
   viewer.addNPC();
   log('[SUCCESS] Fast path complete: navmesh ready, NPC spawned.');
 
-  return { navMeshData: result.navMeshData, playerSpawn: spawnPoint };
+  return { navMeshData: artifact.navMeshData, playerSpawn: spawnPoint };
 }

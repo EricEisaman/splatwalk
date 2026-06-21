@@ -1,4 +1,4 @@
-# splatwalk-core
+# @splatwalk/core
 
 The SplatWalk WASM core as a single, versioned, binary-friendly package. It bundles:
 
@@ -17,8 +17,11 @@ TypeScript bridge and Babylon UI live in the main SplatWalk repository.
 ## Install
 
 ```bash
-npm install splatwalk-core
+npm install @splatwalk/core
 ```
+
+MIT-licensed and free forever, including for commercial and proprietary use.
+See [`LICENSING.md`](https://github.com/EricEisaman/splatwalk/blob/main/LICENSING.md).
 
 ## Use the binary directly
 
@@ -28,7 +31,7 @@ import init, {
   build_walkable_ground_field,
   build_room_floor_mesh,
   mesh_to_glb,
-} from 'splatwalk-core';
+} from '@splatwalk/core';
 
 await init();          // always init before calling named exports
 init_splatwalk();
@@ -51,7 +54,7 @@ import {
   FAST_NAV_PRESET,
   extractFloorFieldWithRecovery,
   resolveRecovery,
-} from 'splatwalk-core/floor';
+} from '@splatwalk/core/floor';
 
 const result = await extractFloorFieldWithRecovery({
   bytes: splatBytes,
@@ -64,5 +67,7 @@ const result = await extractFloorFieldWithRecovery({
 });
 ```
 
-See `docs/wasm-api.md` in the main repository for the full settings reference,
-the coordinate + winding contract, and the progress line protocol.
+See the [Integration Guide](https://github.com/EricEisaman/splatwalk/blob/main/docs/INTEGRATION.md)
+for a task-oriented walkthrough, and `docs/wasm-api.md` in the main repository for
+the full settings reference, the coordinate + winding contract, and the progress
+line protocol.

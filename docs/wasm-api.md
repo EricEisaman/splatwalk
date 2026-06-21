@@ -23,7 +23,23 @@ The target convention is fixed and is part of the binary contract:
 Because the contract is fixed, converting to a specific engine's handedness/up-axis is the integrator's responsibility and should be done **once, at your application boundary** — not by mutating settings per call. Two concrete consequences:
 
 - **A `flip_y` bake is a mirror (negative scale), and a mirror flips winding/orientation.** When `flip_y` is set, every parsed splat's Y (position and normal) is negated before any other stage. A single-axis negation has determinant `-1`, so the effective basis is mirrored. The returned mesh is still internally consistent in `splatwalk_oriented` space, but if your renderer applies its own additional negative-axis bake (the common Gaussian-splat import path), be aware that composing two mirrors restores a right-handed, CCW result, while composing an odd number of mirrors yields a left-handed, CW result. Track the parity of negative-scale bakes between SplatWalk space and your engine and apply a single winding/normal correction at the boundary if the parity is odd.
-- **Do not bake any single engine's root transform into the core.** Handedness/up-axis/winding conversion to a particular engine's root node is engine-specific and does not generalize; keep it in your integration layer. (A future release may add an optional output-handedness setting; until then, convert at the boundary.)
+- **Do not bake any single engine's root transform into the core.** A specific engine's root-node transform is engine-specific and does not generalize; keep that in your integration layer. For the common, generalizable conversions, however, you can now ask the core to emit results directly (see "Output coordinate space" below) instead of mirroring/flipping at the boundary.
+
+### Output coordinate space (`settings.output_space`)
+
+By default every result is emitted in `splatwalk_oriented` space. As an opt-in, set `settings.output_space` to have the core convert all geometric outputs into your engine's convention (capability flag `output_space`):
+
+```ts
+output_space?: {
+  up_axis?: 'y' | 'z';          // 'y' (default) or 'z' (rotate +Y-up into +Z-up about X)
+  handedness?: 'right' | 'left'; // 'right' (default) or 'left' (mirror the Z axis)
+  winding?: 'auto' | 'ccw' | 'cw'; // 'auto' (default) flips winding only when the basis is mirrored
+}
+```
+
+When set, the core applies a single linear map (plus an optional winding flip) to the mesh vertices, the `FieldBasis` vectors, and the `FloorPlane` normal, and recomputes the top-level oriented bounds / region corners. The reported `space` becomes `engine_output` with your requested `up_axis` / `handedness`. **Per-cell ground-field scalars (`cells[]`) and the `diagnostics` bag stay in `splatwalk_oriented` space** — convert those at the boundary if you need them in engine space. Omitting `output_space` leaves all outputs byte-for-byte identical to prior releases.
+
+The same parity rule as `flip_y` applies: requesting `handedness: 'left'` (or `winding: 'cw'`) reverses triangle winding so faces stay front-facing in the new space. If your engine also applies its own negative-axis bake, track the combined parity and apply at most one winding correction.
 
 ### Versioning and capability flags
 
@@ -31,7 +47,9 @@ Every v2 result carries three compatibility fields:
 
 - `api_version` (currently `2`) — the **hard** data contract. Treat a mismatch as a fatal, fail-fast condition.
 - `semver` (e.g. `"0.2.0"`) — the semantic version of the WASM core build, tracking the crate version. Use it for logging, cache keys, and human-facing diagnostics.
-- `capabilities` — an additive `string[]` of supported features (e.g. `progress_protocol_v1`, `glb_export`, `room_floor_mesh`, `sog_export`, `streamed_sog`). Feature-detect against this list so additive changes (new entry points / fields) do not force a hard failure. Never assume a capability is present without checking; never fail solely because an unknown capability appears.
+- `capabilities` — an additive `string[]` of supported features (`progress_protocol_v1`, `glb_export`, `room_floor_mesh`, `sog_export`, `streamed_sog`, `fast_nav_preset`, `output_space`, `recast_config`, `progress_callback`). Feature-detect against this list so additive changes (new entry points / fields) do not force a hard failure. Never assume a capability is present without checking; never fail solely because an unknown capability appears.
+
+For cheap **pre-flight** feature detection (before parsing any bytes), call the standalone exports `splatwalk_version()`, `splatwalk_api_version()`, and `splatwalk_capabilities()` — they return the same values that appear on a full result, without the cost of a parse/field build.
 
 ## Entry Points
 
@@ -163,6 +181,31 @@ Walkable continuity is judged against neighbors, not intra-column layer spread: 
 
 The browser `FAST NAV` workflow uses this field directly: it snaps the start seed onto the detected floor plane, keeps only `walkable` and `filled` cells (with a relaxed fallback mask for noisy scans), rejects obstacle/discontinuity/void/low-confidence/eroded/discarded cells, selects the connected floor component nearest the seed, triangulates that floor component, and sends that floor mesh to Recast. This keeps the one-button path focused on visible room floors instead of collider boundary artifacts.
 
+### Standalone helpers and introspection
+
+These exports take no splat bytes and do no parsing, so they are cheap to call up front.
+
+- `splatwalk_version() -> string`, `splatwalk_api_version() -> number`, `splatwalk_capabilities() -> string[]` — pre-flight feature detection. Same values as the corresponding fields on a full result, without the parse/field-build cost.
+- `fast_nav_preset() -> MeshSettings` — the canonical FAST NAV floor-field preset as a settings object (capability `fast_nav_preset`). Merge it with your per-scene `rotation` / `flip_y` / `collision_seed` / `region_*` and pass it to `build_walkable_ground_field`. `build_room_floor_mesh` already applies this preset as its base layer automatically, so you no longer need to reconstruct the values.
+- `recast_agent_defaults() -> { cs, ch, walkableHeight, walkableRadius, walkableClimb, walkableSlopeAngle }` — the reference FAST NAV agent dimensions in **metres**.
+- `recast_config(settings) -> { cs, ch, walkableHeight, walkableClimb, walkableRadius, walkableSlopeAngle, bmaxYPadding, suggestedBmaxY }` (capability `recast_config`) — converts metre-valued agent dimensions into Recast's integer voxel counts (`walkableHeight = ceil(h/ch)`, `walkableClimb = floor(climb/ch)`, `walkableRadius = ceil(r/cs)`) and returns the suggested vertical-bounds padding (`bmaxYPadding = walkableHeight_m + 0.5`, and `suggestedBmaxY = maxFloorY + bmaxYPadding` when you pass `maxFloorY`). Inputs default to `recast_agent_defaults()` when omitted. This removes the "navmesh collapses to a slab / fragments into islands" class of bugs described in "Recast parameter units (metres vs voxels)".
+
+### `build_room_floor_mesh(bytes, settings)` failure shape
+
+On success it returns a `RoomFloorMeshResult` (capability `room_floor_mesh`). On failure it throws/rejects with a **structured** object (not a string), so you branch on a stable code instead of parsing prose:
+
+```ts
+{
+  api_version: 2;
+  reason: 'no_component' | 'too_small' | 'empty_mesh' | 'no_steps';
+  message: string;          // human-readable summary across attempts
+  attempted: string[];      // each step formatted as `label(reason)`
+  selected_area: number;    // largest usable floor area (m^2)
+  component_count: number;
+  steps: number;
+}
+```
+
 ## Progress Line Protocol
 
 Long-running WASM calls report coarse progress by emitting a specially-prefixed
@@ -173,6 +216,19 @@ the binary contract**, advertised by the `progress_protocol_v1` capability flag.
 A batched log-line protocol is used deliberately: a per-iteration callback from
 WASM into JS would be a measurable performance regression for no real accuracy
 gain, so progress is emitted at stage boundaries only.
+
+For integrators who prefer not to intercept the global console, register an
+opt-in callback (capability flag `progress_callback`):
+
+```ts
+set_progress_callback((stage, fraction) => updateBar(stage, fraction));
+// ...later, to stop receiving events:
+set_progress_callback(undefined);
+```
+
+The callback fires at the same stage boundaries with `(stage: string, fraction?:
+number)`, and the `@progress` console lines are still emitted as a fallback, so
+both mechanisms can coexist.
 
 ### Format
 
@@ -390,8 +446,23 @@ Headroom is the matching gotcha. The floor field is a **thin, open-sky sheet** (
 Reference FAST NAV agent defaults (metres) used by the browser path:
 
 ```ts
-{ cs: 0.12, ch: 0.1, walkableHeight: 1.7, walkableRadius: 0.12, walkableClimb: 0.25, walkableSlopeAngle: 40 }
+{ cs: 0.2, ch: 0.1, walkableHeight: 1.7, walkableRadius: 0.5, walkableClimb: 0.5, walkableSlopeAngle: 40 }
 ```
+
+`walkableRadius` is the gaming-standard `0.5 m` agent cylinder. `walkableClimb` is
+deliberately `0.5 m` to **match the floor field's same-level band**: the field
+merges cells within ~`0.5 m` of each other into one continuous, median-leveled
+region, so a smaller climb lets Recast re-sever that region at capture-noise
+creases (the navmesh "break" that strands the player and NPC on opposite sides of
+a wide, flat passage). Keep the two stages' tolerances aligned.
+
+`cs` should not be a fixed literal. Follow the Recast guideline `cs in
+[walkableRadius / 3, walkableRadius / 2]` (so `[0.167, 0.25]` for a `0.5 m`
+agent), and within that window pick the finest cell size whose grid
+(`width/cs * depth/cs`) still fits a total-cell budget — that keeps a large scene
+covered completely instead of being limited by a single hand-picked `cs`. The
+browser FAST NAV path does this automatically via `floor.autoNavCellSize(widthM,
+depthM, agentRadiusM, maxCells)`; binary integrators should apply the same rule.
 
 ### Advanced Collider Nav
 

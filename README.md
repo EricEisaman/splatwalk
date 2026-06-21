@@ -38,10 +38,12 @@ One `FAST NAV` click takes a raw splat to a walkable navmesh with a spawned, cli
 
 > SplatWalk is early software. The WASM core is the product — the browser UI is a reference harness around it. Treat the WASM result shapes as a versioned contract (every result carries `api_version`).
 
+> **New here?** Start with the [Integration Guide](docs/INTEGRATION.md) and the runnable [`examples/`](examples/). Install the published core with `npm install @splatwalk/core` (MIT, free forever).
+
 There are two supported integration levels:
 
-1. **TypeScript bridge** (`src/wasm/bridge.ts`): a thin typed wrapper around the WASM exports. Easiest path if you already use a bundler.
-2. **Raw WASM binary** (`pkg/wasm_splatwalk/wasm_splatwalk.js` + `wasm_splatwalk_bg.wasm`): consume the generated glue and binary directly from any engine. Always pin the glue and `.wasm` from the same build.
+1. **Published core** (`@splatwalk/core`): the wasm binary, wasm-bindgen glue, hand-authored types, and the framework-agnostic `floor` module, versioned together. `npm install @splatwalk/core`.
+2. **TypeScript bridge** (`src/wasm/bridge.ts`): a thin typed wrapper around the WASM exports if you build from this repo with a bundler.
 
 ### Minimal one-button floor-nav flow
 
@@ -208,4 +210,13 @@ SplatWalk ships a service worker (`public/sw.js`) whose cache id is derived from
 
 ## License
 
-This project is licensed under the **AGPLv3**.
+SplatWalk follows an open-core model. The core - the WASM binary, the
+wasm-bindgen glue, the hand-authored TypeScript types, and the
+framework-agnostic `floor` module published as **`@splatwalk/core`** - is
+licensed under the **MIT License** and is free forever, including for
+commercial and proprietary use. Anything released under MIT stays MIT.
+
+Advanced, opt-in capabilities are reserved for a future commercial tier
+(`@splatwalk/core-pro`) under a separate license; the core never requires it.
+See [`LICENSING.md`](LICENSING.md) for the package-to-license map and
+[`CONTRIBUTING.md`](CONTRIBUTING.md) for the contributor sign-off.

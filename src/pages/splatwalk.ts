@@ -17,6 +17,7 @@ import {
     type RecastParams,
     type NavIslandMetadata,
 } from '../navigation/fastNav';
+import { buildNavmeshKey, getNavmesh, putNavmesh } from '../navigation/navmeshCache';
 import { registerServiceWorker, setupOfflineHandling } from '../pwa/sw-register';
 
 async function main() {
@@ -617,9 +618,97 @@ async function main() {
                 };
             };
 
+            // Shared post-worker tail: render the navmesh overlay, validate the
+            // fast-path island, choose spawns, init the crowd and spawn the NPC. Used
+            // identically by a fresh Recast build and by a cache hit so the two paths
+            // can never drift. Deterministic in its inputs.
+            const finishFastNavTail = async (
+                artifact: { navMeshData: Uint8Array; debugPositions: Float32Array; debugIndices: Uint32Array },
+                effectiveFastSeed: number[] | null,
+                expectedFloorY: number | null,
+                autoSpawnNpc: boolean,
+            ): Promise<void> => {
+                generatedNavData = artifact.navMeshData;
+                navHasBeenGenerated = true;
+                lastNavUsedFastPath = autoSpawnNpc;
+
+                console.log("[WAIT] Rendering NavMesh visual overlay...");
+                const visualNavmesh = { positions: artifact.debugPositions, indices: artifact.debugIndices, metadata: null as NavIslandMetadata | null };
+                if (autoSpawnNpc) {
+                    const safety = filterNavmeshIslandNearSeed(artifact.debugPositions, artifact.debugIndices, effectiveFastSeed);
+                    validateFastNavIsland(safety.metadata, effectiveFastSeed, expectedFloorY);
+                    if (safety.metadata && safety.metadata.islandCount > 1) {
+                        console.warn(`[WARN] Fast floor Recast returned ${safety.metadata.islandCount} islands; display/crowd will still use the full field-derived Recast result.`);
+                    }
+                }
+                const spawnPoint = await viewer.displayNavMesh(visualNavmesh.positions, visualNavmesh.indices, 0);
+                applyNavMeshDisplayState();
+                if (autoSpawnNpc && spawnPoint) {
+                    const npcSpawn = chooseNpcSpawnPoint(visualNavmesh.positions, visualNavmesh.indices, spawnPoint);
+                    viewer.setPreferredNavSpawnPoints(
+                        [spawnPoint.x, spawnPoint.y, spawnPoint.z],
+                        npcSpawn
+                    );
+                    console.log(`[INFO] Player agent spawn: ${spawnPoint.x.toFixed(3)}, ${spawnPoint.y.toFixed(3)}, ${spawnPoint.z.toFixed(3)}`);
+                    if (npcSpawn) {
+                        console.log(`[INFO] NPC preferred spawn: ${npcSpawn.map((v) => v.toFixed(3)).join(', ')}`);
+                    } else {
+                        console.warn("[WARN] No separated NPC spawn point found on the visible navmesh island.");
+                    }
+                }
+                (document.getElementById('resultSection') as HTMLElement | null)!.style.display = 'block';
+                const downloadNavBtn = document.getElementById('downloadNavBtn') as HTMLButtonElement | null;
+                if (downloadNavBtn) downloadNavBtn.style.display = 'block';
+
+                console.log("[WAIT] Initializing NPC Crowd Simulation...");
+                await viewer.initCrowd(artifact.navMeshData, spawnPoint);
+                const simulationSection = document.getElementById('simulationSection') as HTMLDivElement | null;
+                if (simulationSection) simulationSection.style.display = 'block';
+
+                if (autoSpawnNpc) {
+                    viewer.addNPC();
+                    const framing = viewer.focusOnPlayer();
+                    if (framing) {
+                        console.log(`[INFO] Top-down view set above player at ${framing.player.map((v) => v.toFixed(2)).join(', ')}.`);
+                    } else {
+                        console.warn("[WARN] No player agent found to frame for the top-down view.");
+                    }
+                    console.log("[SUCCESS] Fast path complete: navmesh ready, NPC spawned, click navmesh to move.");
+                } else {
+                    console.log("[SUCCESS] Simulation ready.");
+                }
+            };
+
             const runNavmeshFromCollider = async (autoSpawnNpc = false): Promise<void> => {
                 console.log(autoSpawnNpc ? "[WAIT] Fast path: splat -> collider -> navmesh -> NPC..." : "[WAIT] Building navmesh from dedicated collider source...");
                 const bytes = await readSplatBytes();
+
+                // Cross-visit cache (FAST NAV only): a revisit of the same splat with
+                // unchanged parameters restores the prior navmesh and skips the whole
+                // parse/prune/field/Recast pipeline. The collision seed is a derived
+                // output here (ensureFastCollisionSeed writes it back to the DOM), not
+                // an input, so it is excluded from the key; everything else that steers
+                // the result (mesh/prune/field params, rotation/flip, region, Recast
+                // ladder) is captured via buildMeshSettings.
+                let navCacheKey: string | null = null;
+                if (autoSpawnNpc) {
+                    try {
+                        const sig: Record<string, unknown> = { ...buildMeshSettings(true) };
+                        delete sig.collision_seed;
+                        navCacheKey = buildNavmeshKey(bytes, { settings: sig, recast: FAST_NAV_RECAST_ATTEMPTS, preset: 'fast-nav-v1' });
+                        const cached = await getNavmesh(navCacheKey);
+                        if (cached) {
+                            console.log("[SUCCESS] FAST NAV restored from cache — skipping parse/prune/field/Recast.");
+                            if (cached.effectiveSeed) viewer.displaySeedMarker(cached.effectiveSeed);
+                            await finishFastNavTail(cached, cached.effectiveSeed ?? null, cached.expectedFloorY ?? null, true);
+                            return;
+                        }
+                        console.log("[INFO] No cached navmesh for this splat + settings; computing fresh.");
+                    } catch (error) {
+                        console.warn(`[WARN] Navmesh cache lookup skipped: ${error}`);
+                    }
+                }
+
                 let fastSeed: number[] | null = null;
                 if (autoSpawnNpc) {
                     fastSeed = await ensureFastCollisionSeed(bytes);
@@ -754,7 +843,9 @@ async function main() {
                     mergeRegionArea: 12,
                     maxVertsPerPoly: 6,
                     detailSampleDist: 6,
-                    detailSampleMaxError: 1
+                    detailSampleMaxError: 1,
+                    // Manual path honours the operator's literal Cell Size input.
+                    autoCellSize: false,
                 };
 
                 const attempts: ReadonlyArray<{ label: string; params: RecastParams }> =
@@ -810,9 +901,6 @@ async function main() {
                     throw lastError instanceof Error ? lastError : new Error(String(lastError));
                 }
 
-                generatedNavData = result.navMeshData;
-                navHasBeenGenerated = true;
-                lastNavUsedFastPath = autoSpawnNpc;
                 console.log("[SUCCESS] NavMesh generated successfully!");
 
                 const { report } = result;
@@ -841,53 +929,23 @@ async function main() {
                     }
                 }
 
-                console.log("[WAIT] Rendering NavMesh visual overlay...");
                 const expectedFloorY = autoSpawnNpc && effectiveFastSeed && navSettings.collision_carve_height
                     ? effectiveFastSeed[1] - navSettings.collision_carve_height * 0.5
                     : null;
-                const visualNavmesh = { positions: result.debugPositions, indices: result.debugIndices, metadata: null as NavIslandMetadata | null };
-                if (autoSpawnNpc) {
-                    const safety = filterNavmeshIslandNearSeed(result.debugPositions, result.debugIndices, effectiveFastSeed);
-                    validateFastNavIsland(safety.metadata, effectiveFastSeed, expectedFloorY);
-                    if (safety.metadata && safety.metadata.islandCount > 1) {
-                        console.warn(`[WARN] Fast floor Recast returned ${safety.metadata.islandCount} islands; display/crowd will still use the full field-derived Recast result.`);
-                    }
-                }
-                const spawnPoint = await viewer.displayNavMesh(visualNavmesh.positions, visualNavmesh.indices, 0);
-                applyNavMeshDisplayState();
-                if (autoSpawnNpc && spawnPoint) {
-                    const npcSpawn = chooseNpcSpawnPoint(visualNavmesh.positions, visualNavmesh.indices, spawnPoint);
-                    viewer.setPreferredNavSpawnPoints(
-                        [spawnPoint.x, spawnPoint.y, spawnPoint.z],
-                        npcSpawn
-                    );
-                    console.log(`[INFO] Player agent spawn: ${spawnPoint.x.toFixed(3)}, ${spawnPoint.y.toFixed(3)}, ${spawnPoint.z.toFixed(3)}`);
-                    if (npcSpawn) {
-                        console.log(`[INFO] NPC preferred spawn: ${npcSpawn.map((v) => v.toFixed(3)).join(', ')}`);
-                    } else {
-                        console.warn("[WARN] No separated NPC spawn point found on the visible navmesh island.");
-                    }
-                }
-                (document.getElementById('resultSection') as HTMLElement | null)!.style.display = 'block';
-                const downloadNavBtn = document.getElementById('downloadNavBtn') as HTMLButtonElement | null;
-                if (downloadNavBtn) downloadNavBtn.style.display = 'block';
+                await finishFastNavTail(result, effectiveFastSeed ?? null, expectedFloorY, autoSpawnNpc);
 
-                console.log("[WAIT] Initializing NPC Crowd Simulation...");
-                await viewer.initCrowd(result.navMeshData, spawnPoint);
-                const simulationSection = document.getElementById('simulationSection') as HTMLDivElement | null;
-                if (simulationSection) simulationSection.style.display = 'block';
-
-                if (autoSpawnNpc) {
-                    viewer.addNPC();
-                    const framing = viewer.focusOnPlayer();
-                    if (framing) {
-                        console.log(`[INFO] Top-down view set above player at ${framing.player.map((v) => v.toFixed(2)).join(', ')}.`);
-                    } else {
-                        console.warn("[WARN] No player agent found to frame for the top-down view.");
-                    }
-                    console.log("[SUCCESS] Fast path complete: navmesh ready, NPC spawned, click navmesh to move.");
-                } else {
-                    console.log("[SUCCESS] Simulation ready.");
+                // Persist the validated fast-path artifact so an unchanged revisit of
+                // this exact splat + settings restores it instead of recomputing the
+                // multi-minute pipeline. Best-effort and only after the tail (incl.
+                // island validation) succeeded, so a bad navmesh is never cached.
+                if (autoSpawnNpc && navCacheKey) {
+                    await putNavmesh(navCacheKey, {
+                        navMeshData: result.navMeshData,
+                        debugPositions: result.debugPositions,
+                        debugIndices: result.debugIndices,
+                        effectiveSeed: effectiveFastSeed ?? null,
+                        expectedFloorY,
+                    });
                 }
             };
 

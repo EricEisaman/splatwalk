@@ -119,7 +119,7 @@ pub fn get_splat_bounds(points: &[PointNormal], settings: &MeshSettings) -> Resu
     let floor_y = context.diagnostics.floor_y_percentile_02.unwrap_or(min[1]);
 
     Ok(SplatBounds {
-        api_version: 2,
+        api_version: crate::API_VERSION,
         semver: crate::core_semver(),
         capabilities: crate::capabilities(),
         point_count: context.oriented_points.len(),
@@ -139,7 +139,7 @@ pub fn suggest_region(points: &[PointNormal], settings: &MeshSettings) -> Result
     let region_min_y = bounds.oriented_min[1].min(floor_y);
 
     Ok(SuggestedRegion {
-        api_version: 2,
+        api_version: crate::API_VERSION,
         semver: crate::core_semver(),
         capabilities: crate::capabilities(),
         region_min: [bounds.oriented_min[0], region_min_y, bounds.oriented_min[2]],
@@ -173,7 +173,7 @@ pub fn reconstruct_mesh(points: &[PointNormal], settings: &MeshSettings) -> Reco
     };
 
     ReconstructionResult {
-        api_version: 2,
+        api_version: crate::API_VERSION,
         semver: crate::core_semver(),
         capabilities: crate::capabilities(),
         mesh: MeshBuffers::new(mesh.vertices, mesh.indices),
@@ -198,7 +198,7 @@ pub fn convert_splat_to_navmesh_basis(points: &[PointNormal], settings: &MeshSet
     };
 
     NavmeshBasisResult {
-        api_version: 2,
+        api_version: crate::API_VERSION,
         semver: crate::core_semver(),
         capabilities: crate::capabilities(),
         mesh: MeshBuffers::new(mesh.vertices, mesh.indices),
@@ -219,7 +219,7 @@ pub fn build_walkable_ground_field(
         .ok_or_else(|| wasm_bindgen::JsValue::from_str("Unable to build walkable ground field"))?;
 
     Ok(WalkableGroundFieldResult {
-        api_version: 2,
+        api_version: crate::API_VERSION,
         semver: crate::core_semver(),
         capabilities: crate::capabilities(),
         cells: field.cells,

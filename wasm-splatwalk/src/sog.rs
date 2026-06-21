@@ -569,7 +569,7 @@ fn kmeans(vectors: &[f32], dim: usize, clusters: usize, iterations: usize) -> (V
     let report_every = (count / 50).max(1);
     for i in 0..count {
         if i % report_every == 0 {
-            web_sys::console::log_1(&format!("@progress sh {:.4}", i as f64 / count as f64).into());
+            crate::emit_progress("sh", Some(i as f64 / count as f64));
         }
         let v = &vectors[i * dim..(i + 1) * dim];
         labels[i] = nearest_centroid(&centroids, dim, clusters, v);

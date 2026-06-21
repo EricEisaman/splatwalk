@@ -1,22 +1,38 @@
 name: Release
 
-# Build the WASM core, assemble the `splatwalk-core` package, attach the
-# artifacts to a GitHub release, and (optionally) publish to npm. Triggered by a
-# semver tag like `v0.2.0`.
+# Build the WASM core, assemble the `@splatwalk/core` package, attach the
+# artifacts to a GitHub release, and publish to npm via Trusted Publishing
+# (OIDC) - no long-lived NPM_TOKEN, with automatic provenance. Triggered by a
+# semver tag like `v0.3.0`.
+#
+# One-time setup on npmjs.com (see RELEASING.md): create the `@splatwalk` org,
+# bootstrap the first publish, then add a Trusted Publisher for this repo +
+# workflow filename `release.yml`.
 on:
   push:
     tags:
       - 'v*'
 
 permissions:
-  contents: write
+  contents: write   # create the GitHub release
+  id-token: write   # mint the OIDC token for npm Trusted Publishing
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest    # Trusted Publishing requires a cloud-hosted runner
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Verify tag matches package version
+        run: |
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} (${TAG_VERSION}) does not match package.json version ${PKG_VERSION}" >&2
+            exit 1
+          fi
+          echo "Version OK: ${PKG_VERSION}"
 
       - name: Install Rust + wasm32 target
         uses: dtolnay/rust-toolchain@stable
@@ -40,20 +56,36 @@ jobs:
       - name: Install binaryen (wasm-opt)
         run: sudo apt-get update && sudo apt-get install -y binaryen
 
+      # Node 24 + npm 11.5.1+ is required for the OIDC publishing flow. Do NOT set
+      # NODE_AUTH_TOKEN / a token-based .npmrc here: a stored token short-circuits
+      # the OIDC handshake.
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           registry-url: 'https://registry.npmjs.org'
+
+      - name: Upgrade npm (OIDC support)
+        run: npm install -g npm@latest
 
       - name: Build WASM core
         run: ./scripts/build.sh
 
-      - name: Assemble splatwalk-core package
+      - name: Assemble @splatwalk/core package
         run: ./scripts/build-package.sh
 
       - name: Package tarball
         run: cd dist-pkg && npm pack && mv *.tgz ..
+
+      - name: Select release notes
+        id: notes
+        run: |
+          NOTES="docs/releases/${GITHUB_REF_NAME}.md"
+          if [ -f "$NOTES" ]; then
+            echo "path=${NOTES}" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=CHANGELOG.md" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Create GitHub release with artifacts
         uses: softprops/action-gh-release@v2
@@ -63,12 +95,12 @@ jobs:
             pkg/wasm_splatwalk/wasm_splatwalk_bg.wasm
             package/wasm_splatwalk.d.ts
             splatwalk-core-*.tgz
-          body_path: CHANGELOG.md
+          body_path: ${{ steps.notes.outputs.path }}
 
-      # Publishes only when an NPM_TOKEN secret is configured.
-      - name: Publish to npm
-        if: ${{ env.NPM_TOKEN != '' }}
+      # Trusted Publishing: npm authenticates via the OIDC token (no secret) and
+      # generates a provenance attestation automatically. `access: public` and
+      # `provenance: true` come from the generated package.json's publishConfig.
+      - name: Publish to npm (Trusted Publishing)
+        run: cd dist-pkg && npm publish
         env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: cd dist-pkg && npm publish --access public
+          NPM_CONFIG_PROVENANCE: true

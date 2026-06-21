@@ -28,6 +28,10 @@ export type FastNavLogger = (message: string) => void;
  *
  * It intentionally omits per-scene fields (`rotation`, `flip_y`, `collision_seed`,
  * `region_*`) so callers supply those for their own splat orientation and seed.
+ *
+ * Keep this in sync with the Rust `fast_nav_preset_json()` in
+ * `wasm-splatwalk/src/lib.rs`, which the WASM core exports via `fast_nav_preset()`
+ * and bakes into `build_room_floor_mesh`.
  */
 export const FAST_NAV_PRESET: Readonly<MeshSettings> = {
   mode: 2,
@@ -72,6 +76,38 @@ export const DEFAULT_FLOOR_FLATTEN_TOLERANCE = 0.12;
  * painted lines, reflective patches). Larger holes are treated as real openings.
  */
 const MAX_BRIDGE_GAP_CELLS = 12;
+
+/** Default ceiling on total navmesh voxel columns when auto-sizing the cell size. */
+export const DEFAULT_MAX_NAV_CELLS = 1_000_000;
+
+/**
+ * Auto-size the Recast cell size (`cs`) for a floor/collider mesh of the given
+ * horizontal extent.
+ *
+ * Follows the standard Recast guideline that `cs` belongs in
+ * `[agentRadius / 3, agentRadius / 2]`, and within that window picks the FINEST
+ * cell size whose grid (`width/cs * depth/cs`) still fits under `maxCells`. This
+ * keeps coverage of a large scene complete (the grid is bounded by a cell budget
+ * instead of a fixed small `cs` that either truncates the area or explodes the
+ * voxel count) while never going finer/coarser than the agent radius warrants.
+ *
+ * `agentRadiusM` is the agent radius in metres; with the gaming-standard 0.5 m
+ * agent this yields `cs` in `[0.167, 0.25]`.
+ */
+export function autoNavCellSize(
+  widthM: number,
+  depthM: number,
+  agentRadiusM: number,
+  maxCells: number = DEFAULT_MAX_NAV_CELLS
+): number {
+  const r = agentRadiusM > 0 ? agentRadiusM : 0.5;
+  const finest = r / 3;
+  const coarsest = r / 2;
+  const area = Math.max(0, widthM) * Math.max(0, depthM);
+  // cs such that (width/cs) * (depth/cs) <= maxCells  =>  cs >= sqrt(area / maxCells)
+  const budgetCs = maxCells > 0 && area > 0 ? Math.sqrt(area / maxCells) : finest;
+  return Math.min(coarsest, Math.max(finest, budgetCs));
+}
 
 /** Why floor-field extraction failed (used to drive adaptive recovery). */
 export type FastNavFloorReason = 'no_component' | 'too_small' | 'empty_mesh';

@@ -20,9 +20,29 @@
 // ---------------------------------------------------------------------------
 
 export interface CoordinateSpace {
-  space: 'splatwalk_oriented' | string;
-  up_axis: 'y' | string;
+  /** `splatwalk_oriented` for default output, `engine_output` when an `output_space` conversion was applied. */
+  space: 'splatwalk_oriented' | 'engine_output' | string;
+  up_axis: 'y' | 'z' | string;
   handedness: 'right' | 'left' | string;
+}
+
+/**
+ * Opt-in output coordinate convention for {@link MeshSettings.output_space}.
+ *
+ * When set, every mesh/basis/floor-plane result is converted from the default
+ * `splatwalk_oriented` space (right-handed, `+Y` up, CCW winding) into the
+ * requested convention and the reported `space` is updated to `engine_output`.
+ * Omitting it leaves all outputs in `splatwalk_oriented` space, unchanged.
+ * Per-cell ground-field scalars and `diagnostics` always stay in
+ * `splatwalk_oriented` space.
+ */
+export interface OutputSpaceSettings {
+  /** `"y"` (default) or `"z"` (rotates `+Y`-up into `+Z`-up about X). */
+  up_axis?: 'y' | 'z';
+  /** `"right"` (default) or `"left"` (mirrors the Z axis). */
+  handedness?: 'right' | 'left';
+  /** `"auto"` (default; flips only when the basis is mirrored), `"ccw"`, or `"cw"`. */
+  winding?: 'auto' | 'ccw' | 'cw';
 }
 
 export interface MeshBuffers {
@@ -184,6 +204,11 @@ export interface MeshSettings {
   /** Keep splats within `mean + std_ratio * stddev` (default 2.0). Lower = more aggressive. */
   prune_floaters_std_ratio?: number;
   rotation?: number[];
+  /**
+   * Opt-in output coordinate convention. Absent = default `splatwalk_oriented`
+   * output (right-handed, `+Y` up, CCW). See {@link OutputSpaceSettings}.
+   */
+  output_space?: OutputSpaceSettings;
   flip_y?: boolean;
 }
 
@@ -288,6 +313,27 @@ export interface RoomFloorMeshResult extends ResultContract {
   diagnostics: ReconstructionDiagnostics;
 }
 
+/**
+ * Structured failure value rejected/thrown by {@link build_room_floor_mesh} when
+ * no recovery step yields a usable room floor. Branch on the stable `reason` code
+ * rather than string-matching `message`.
+ */
+export interface RoomFloorFailure {
+  api_version: 2;
+  /** Stable machine code: the reason the last attempt failed. */
+  reason: 'no_component' | 'too_small' | 'empty_mesh' | 'no_steps' | string;
+  /** Human-readable summary across all attempted recovery steps. */
+  message: string;
+  /** Each attempted recovery step formatted as `label(reason)`. */
+  attempted: string[];
+  /** Largest usable floor area found, in square meters. */
+  selected_area: number;
+  /** Number of connected floor components considered. */
+  component_count: number;
+  /** Number of recovery steps attempted. */
+  steps: number;
+}
+
 /** Raw streamed-SOG / SOG manifest returned by {@link slice_splat} / {@link convert_to_sog}. */
 export interface SliceManifest {
   lodMetaPath: string;
@@ -304,6 +350,74 @@ export interface SliceManifest {
 
 export function init_splatwalk(): string;
 
+// ---------------------------------------------------------------------------
+// Cheap pre-flight introspection (no parse / field build required)
+// ---------------------------------------------------------------------------
+
+/** Semantic version of the WASM core build (tracks the crate version). */
+export function splatwalk_version(): string;
+
+/** Integer data-contract version (same value as every result's `api_version`). */
+export function splatwalk_api_version(): number;
+
+/** Additive capability flags advertised by this build. */
+export function splatwalk_capabilities(): string[];
+
+/**
+ * Register (or, with `undefined`, clear) an opt-in progress callback invoked as
+ * `callback(stage, fraction)` at the same boundaries as the `@progress` line
+ * protocol. The line protocol is still emitted as a fallback.
+ */
+export function set_progress_callback(
+  callback?: (stage: string, fraction?: number) => void
+): void;
+
+/**
+ * The canonical FAST NAV floor-field preset as a settings object. Pass it
+ * (merged with per-scene `rotation` / `flip_y` / `collision_seed` / `region_*`)
+ * to {@link build_walkable_ground_field} / {@link build_room_floor_mesh};
+ * the latter already applies it as a base layer automatically.
+ */
+export function fast_nav_preset(): MeshSettings;
+
+/** Reference FAST NAV agent dimensions (metres). */
+export function recast_agent_defaults(): {
+  cs: number;
+  ch: number;
+  walkableHeight: number;
+  walkableRadius: number;
+  walkableClimb: number;
+  walkableSlopeAngle: number;
+};
+
+/**
+ * Convert metre-valued agent dimensions into Recast's integer voxel counts
+ * (`walkableHeight = ceil(h/ch)`, `walkableClimb = floor(climb/ch)`,
+ * `walkableRadius = ceil(r/cs)`) and suggest vertical-bounds padding. Inputs
+ * (all metres) default to {@link recast_agent_defaults} when omitted.
+ */
+export function recast_config(settings?: {
+  cs?: number;
+  ch?: number;
+  walkableHeight?: number;
+  walkableClimb?: number;
+  walkableRadius?: number;
+  walkableSlopeAngle?: number;
+  /** Highest floor-cell Y (metres); when given, `suggestedBmaxY` is returned. */
+  maxFloorY?: number;
+}): {
+  cs: number;
+  ch: number;
+  walkableHeight: number;
+  walkableClimb: number;
+  walkableRadius: number;
+  walkableSlopeAngle: number;
+  /** Suggested padding to add above the highest floor cell, in metres. */
+  bmaxYPadding: number;
+  /** `maxFloorY + bmaxYPadding`, or `null` when `maxFloorY` was omitted. */
+  suggestedBmaxY: number | null;
+};
+
 export function get_splat_bounds(data: Uint8Array, settings: MeshSettings): SplatBounds;
 
 export function suggest_region(data: Uint8Array, settings: MeshSettings): SuggestedRegion;
@@ -316,8 +430,12 @@ export function build_walkable_ground_field(data: Uint8Array, settings: MeshSett
 
 /**
  * Extract a triangulated room-floor mesh directly in WASM (the binary-side
- * equivalent of the TypeScript FAST NAV floor path). Throws on failure with a
- * message containing the failure reason (`no_component` / `too_small` / `empty_mesh`).
+ * equivalent of the TypeScript FAST NAV floor path). The canonical FAST NAV
+ * preset is applied as a base layer automatically (your settings and the
+ * per-step recovery patch override it).
+ *
+ * On failure it throws/rejects with a structured {@link RoomFloorFailure} object
+ * (not a string): branch on `err.reason` for control flow and telemetry.
  */
 export function build_room_floor_mesh(data: Uint8Array, settings: RoomFloorSettings): RoomFloorMeshResult;
 

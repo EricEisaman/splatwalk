@@ -2,8 +2,12 @@
 members = ["wasm-splatwalk"]
 resolver = "2"
 
+# Single source of truth for the crate version. Keep this in lockstep with
+# `package.json` (npm) so the WASM `semver` field and the published npm package
+# never drift. Per SemVer 2.0.0 (https://semver.org/spec/v2.0.0.html): bump MINOR
+# for additive changes, PATCH for fixes, MAJOR for breaking changes.
 [workspace.package]
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 
 [profile.release]

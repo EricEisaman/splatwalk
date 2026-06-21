@@ -162,7 +162,7 @@ pub fn prune_floaters(
 
     for i in 0..n {
         if i % report_every == 0 {
-            console::log_1(&format!("@progress prune {:.4}", i as f64 / n as f64).into());
+            crate::emit_progress("prune", Some(i as f64 / n as f64));
         }
         let p = &points[i];
         if !p.point.x.is_finite() || !p.point.y.is_finite() || !p.point.z.is_finite() {

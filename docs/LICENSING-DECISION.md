@@ -1,10 +1,25 @@
-# Licensing Decision (Owner TODO)
+# Licensing Decision
 
-> **Not legal advice.** This document captures the licensing analysis from the
-> integrator feedback reflection (Sections 6 and 8) as an open decision for the
-> project owner. Obtain qualified legal counsel before adopting any option here.
-> No license change has been made: the repository remains under **AGPL-3.0** (see
-> [`LICENSE`](../LICENSE)).
+> **Resolved (v0.3.0).** The project adopted the **open-core model** proven at
+> scale by MUI X: an **MIT-licensed core that is free forever** (published as
+> `@splatwalk/core`) plus a reserved commercial tier (`@splatwalk/core-pro`) for
+> advanced, opt-in capabilities. The repository `LICENSE` is now **MIT** (it was
+> AGPL-3.0). See [`LICENSING.md`](../LICENSING.md) for the package-to-license map
+> and the stewardship commitment, and [`CONTRIBUTING.md`](../CONTRIBUTING.md) for
+> the DCO. The analysis below is retained as the rationale for that choice.
+>
+> **Not legal advice.** This document captures the original licensing analysis
+> from the integrator feedback reflection (Sections 6 and 8). Obtain qualified
+> legal counsel before adapting it.
+
+## Guiding principle
+
+Everyone deserves a free start. The core is MIT and free forever, so anyone -
+hobbyist, startup, or enterprise - can get up and running, ship to production,
+and embed SplatWalk in a commercial product without a fee, a license key, or a
+permission slip. When a team needs the extra splat juice - the advanced, opt-in
+capabilities of the Pro tier - they can buy into those paid features to support
+the project's continued development. Free to start, pay only for the extras.
 
 ## Goal
 
@@ -76,17 +91,20 @@ case without taxing large embedders.
   the source-available license forbids others from re-hosting the core as a
   competing service.
 
-## Open decisions for the owner (Section 8)
+## Decisions (Section 8)
 
-- [ ] **Licensing axis:** behavior-based (resell-as-a-service) vs. size-based
-      (company threshold).
-- [ ] **Open-core split:** adopt a permissive integration layer + source-available
-      core, or keep a single license?
-- [ ] **Contributor agreement:** adopt a CLA or DCO and consolidate copyright?
-- [ ] **Trademark:** register the SplatWalk mark?
-- [ ] **Monetization shape:** stand up an official hosted conversion service as the
-      commercial offering?
-
-Once the owner decides, follow up with the concrete `LICENSE` change (and, for an
-open-core split, a permissive license file scoped to the integration layer) plus
-`CONTRIBUTING` / CLA-or-DCO scaffolding.
+- [x] **Licensing axis:** resolved as **open-core, MUI X model** - an MIT core
+      that is free for everyone (including commercial embedding) with monetization
+      reserved for a commercial Pro feature tier, rather than a behavior- or
+      size-based restriction on the core.
+- [x] **Open-core split:** adopted. The published `@splatwalk/core` (binary +
+      glue + types + `floor` module) is MIT; the commercial `@splatwalk/core-pro`
+      tier is reserved for advanced features and is not yet published.
+- [x] **Contributor agreement:** adopted a **DCO** sign-off (see
+      [`CONTRIBUTING.md`](../CONTRIBUTING.md)) so the project retains the right to
+      offer contributions under the future commercial Pro tier.
+- [ ] **Trademark:** register the SplatWalk mark (still open; the most practically
+      enforceable lever for a client-side library).
+- [ ] **Monetization shape:** the streaming splat-storage adapter generator (on
+      the road to 1.0) is the planned first `@splatwalk/core-pro` feature; an
+      official hosted conversion service remains an open option.

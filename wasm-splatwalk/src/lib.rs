@@ -7,6 +7,9 @@ mod mesh;
 mod sog;
 mod slice;
 mod glb;
+mod output_space;
+
+use output_space::OutputSpaceSettings;
 
 #[wasm_bindgen]
 extern "C" {
@@ -21,6 +24,11 @@ pub fn init_splatwalk() -> String {
     "Ready".to_string()
 }
 
+/// The integer data-contract version carried on every result. Bumped only on a
+/// breaking change to a result shape; additive change is advertised via
+/// `capabilities` instead. Kept in one place so every result agrees.
+pub const API_VERSION: u8 = 2;
+
 /// Additive capability flags advertised on every result. The integer
 /// `api_version` remains the hard data contract; these flags let integrators
 /// tolerate additive changes (new entry points / fields) instead of hard-failing
@@ -31,6 +39,10 @@ pub const CAPABILITIES: &[&str] = &[
     "room_floor_mesh",
     "sog_export",
     "streamed_sog",
+    "fast_nav_preset",
+    "output_space",
+    "recast_config",
+    "progress_callback",
 ];
 
 /// Semantic version of the WASM core build. Tracks `Cargo.toml`'s `version` so a
@@ -42,6 +54,188 @@ pub fn core_semver() -> String {
 /// Capability flags as owned strings, ready to serialize into a result.
 pub fn capabilities() -> Vec<String> {
     CAPABILITIES.iter().map(|s| s.to_string()).collect()
+}
+
+/// JS-reachable semantic version of the core build. Lets an integrator do cheap
+/// pre-flight feature detection (and fail fast on a stale binary) before doing
+/// any parse/field work, instead of reading `semver` off an expensive result.
+#[wasm_bindgen]
+pub fn splatwalk_version() -> String {
+    core_semver()
+}
+
+/// JS-reachable integer data-contract version (the same value carried on every
+/// result's `api_version`).
+#[wasm_bindgen]
+pub fn splatwalk_api_version() -> u8 {
+    API_VERSION
+}
+
+/// JS-reachable capability flags advertised by this build, as a string array.
+#[wasm_bindgen]
+pub fn splatwalk_capabilities() -> Result<JsValue, JsValue> {
+    Ok(serde_wasm_bindgen::to_value(&capabilities())?)
+}
+
+thread_local! {
+    static PROGRESS_CALLBACK: RefCell<Option<js_sys::Function>> = RefCell::new(None);
+}
+
+/// Register (or, with `None`/`undefined`, clear) an opt-in JS progress callback.
+/// It is invoked as `callback(stage: string, fraction: number | undefined)` at
+/// the same stage boundaries as the `@progress` line protocol. The line protocol
+/// is still emitted as a fallback, so `progress_protocol_v1` consumers keep
+/// working and integrators no longer need to monkey-patch the global console.
+#[wasm_bindgen]
+pub fn set_progress_callback(callback: Option<js_sys::Function>) {
+    PROGRESS_CALLBACK.with(|cb| {
+        *cb.borrow_mut() = callback;
+    });
+}
+
+/// Emit a progress event to the registered JS callback (if any) AND to the
+/// `@progress <stage> [<fraction>]` console line protocol (the documented
+/// `progress_protocol_v1` fallback). `fraction` is an optional 0..1 completion
+/// ratio for the stage.
+pub(crate) fn emit_progress(stage: &str, fraction: Option<f64>) {
+    PROGRESS_CALLBACK.with(|cb| {
+        if let Some(func) = cb.borrow().as_ref() {
+            let stage_val = JsValue::from_str(stage);
+            let frac_val = match fraction {
+                Some(f) => JsValue::from_f64(f),
+                None => JsValue::UNDEFINED,
+            };
+            let _ = func.call2(&JsValue::NULL, &stage_val, &frac_val);
+        }
+    });
+    match fraction {
+        Some(f) => log(&format!("@progress {} {:.4}", stage, f)),
+        None => log(&format!("@progress {}", stage)),
+    }
+}
+
+/// Canonical FAST NAV floor-field preset, baked into the core so binary-only
+/// integrators don't reverse-engineer the TypeScript constant. Mirrors
+/// `FAST_NAV_PRESET` in `src/navigation/floor.ts` — keep the two in sync. It
+/// intentionally omits per-scene fields (`rotation`, `flip_y`, `collision_seed`,
+/// `region_*`, `output_space`) so callers supply those for their own splat.
+fn fast_nav_preset_json() -> serde_json::Value {
+    serde_json::json!({
+        "mode": 2,
+        "voxel_target": 9000,
+        "min_alpha": 0.08,
+        "max_scale": 3.5,
+        "sdf_cell_size": 0.14,
+        "sdf_vertical_cell_size": 0.05,
+        "sdf_density_threshold": 0.06,
+        "sdf_max_layers": 2,
+        "sdf_smoothing_radius": 2,
+        "sdf_influence_radius_scale": 2.6,
+        "prune_floaters": true,
+        "prune_floaters_k": 16,
+        "prune_floaters_std_ratio": 2.0,
+        "normal_align": 0.3,
+        "ransac_thresh": 0.16,
+        "floor_projection_epsilon": 0.2,
+        "height_projection_epsilon": 0.16,
+        "obstacle_height_epsilon": 0.34,
+        "obstacle_clearance_min": 0.18,
+        "obstacle_clearance_max": 1.7,
+        "max_local_height_variance": 0.14,
+        "min_floor_confidence": 0.005,
+        "hole_fill_radius": 2,
+        "agent_radius_erode": 0,
+        "component_mode": "all",
+        "collision_carve_height": 1.7,
+        "collision_carve_radius": 0.35
+    })
+}
+
+/// Export the canonical FAST NAV floor-field preset as a settings object so a
+/// binary-only integrator can pass it straight to `build_walkable_ground_field`
+/// / `build_room_floor_mesh` (merged with their own per-scene `rotation`,
+/// `flip_y`, `collision_seed`, and optional `region_*`) instead of copying a
+/// TypeScript-only constant. `build_room_floor_mesh` already applies this preset
+/// as its base layer automatically.
+#[wasm_bindgen]
+pub fn fast_nav_preset() -> Result<JsValue, JsValue> {
+    Ok(serde_wasm_bindgen::to_value(&fast_nav_preset_json())?)
+}
+
+/// Agent / cell-size inputs (all in metres) for `recast_config`.
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct RecastConfigInput {
+    cs: Option<f64>,
+    ch: Option<f64>,
+    walkable_height: Option<f64>,
+    walkable_climb: Option<f64>,
+    walkable_radius: Option<f64>,
+    walkable_slope_angle: Option<f64>,
+    /// Optional highest floor-cell Y (metres) so the helper can suggest a padded
+    /// `bmax.y` that keeps the open-sky floor sheet above Recast's low-height cull.
+    max_floor_y: Option<f64>,
+}
+
+/// Reference FAST NAV agent defaults (metres) used by the browser path. Exposed
+/// so binary-only integrators don't transcribe them from the docs.
+#[wasm_bindgen]
+pub fn recast_agent_defaults() -> Result<JsValue, JsValue> {
+    let defaults = serde_json::json!({
+        // cs is the FALLBACK; prefer auto-sizing it from the mesh extent + agent
+        // radius (Recast guideline cs in [radius/3, radius/2]) bounded by a total
+        // cell budget, so large scenes are covered completely. For radius 0.5 the
+        // window is [0.167, 0.25]; 0.2 is a sane mid-range default.
+        "cs": 0.2,
+        "ch": 0.1,
+        "walkableHeight": 1.7,
+        // 0.5 m agent cylinder (gaming standard). walkableClimb is 0.5 m to match
+        // the floor field's same-level band so Recast does not re-sever a continuous
+        // floor at a capture-noise crease.
+        "walkableRadius": 0.5,
+        "walkableClimb": 0.5,
+        "walkableSlopeAngle": 40
+    });
+    Ok(serde_wasm_bindgen::to_value(&defaults)?)
+}
+
+/// Convert metre-valued agent dimensions into Recast's integer voxel counts
+/// (`walkableHeight = ceil(h/ch)`, `walkableClimb = floor(climb/ch)`,
+/// `walkableRadius = ceil(r/cs)`) and suggest vertical-bounds padding. Skipping
+/// this conversion silently truncates sub-metre climb/radius to `0` voxels,
+/// which removes erosion and fragments one walkable level into disjoint islands.
+/// Inputs (metres) default to the FAST NAV reference values when omitted.
+#[wasm_bindgen]
+pub fn recast_config(settings: JsValue) -> Result<JsValue, JsValue> {
+    let input: RecastConfigInput = if settings.is_undefined() || settings.is_null() {
+        RecastConfigInput::default()
+    } else {
+        serde_wasm_bindgen::from_value(settings).map_err(|e| JsValue::from_str(&e.to_string()))?
+    };
+
+    let cs = input.cs.unwrap_or(0.12);
+    let ch = input.ch.unwrap_or(0.1);
+    let walkable_height_m = input.walkable_height.unwrap_or(1.7);
+    let walkable_climb_m = input.walkable_climb.unwrap_or(0.5);
+    let walkable_radius_m = input.walkable_radius.unwrap_or(0.5);
+    let walkable_slope_angle = input.walkable_slope_angle.unwrap_or(40.0);
+
+    let walkable_height = ((walkable_height_m / ch).ceil() as i64).max(1);
+    let walkable_climb = ((walkable_climb_m / ch).floor() as i64).max(0);
+    let walkable_radius = ((walkable_radius_m / cs).ceil() as i64).max(0);
+    let bmax_y_padding = walkable_height_m + 0.5;
+
+    let out = serde_json::json!({
+        "cs": cs,
+        "ch": ch,
+        "walkableHeight": walkable_height,
+        "walkableClimb": walkable_climb,
+        "walkableRadius": walkable_radius,
+        "walkableSlopeAngle": walkable_slope_angle,
+        "bmaxYPadding": bmax_y_padding,
+        "suggestedBmaxY": input.max_floor_y.map(|y| y + bmax_y_padding)
+    });
+    Ok(serde_wasm_bindgen::to_value(&out)?)
 }
 
 #[derive(Deserialize)]
@@ -89,6 +283,13 @@ pub struct MeshSettings {
     /// `mean + std_ratio * stddev` (default 2.0). Lower = more aggressive.
     pub prune_floaters_std_ratio: Option<f64>,
     pub rotation: Option<Vec<f64>>,
+    /// Opt-in output coordinate convention. When set, every mesh/basis/floor-plane
+    /// result is converted from the default `splatwalk_oriented` space (right-handed,
+    /// +Y up, CCW winding) into the requested `up_axis`/`handedness`/`winding` and the
+    /// reported `space` metadata is updated. Absent (the default) leaves all outputs
+    /// in `splatwalk_oriented` space, byte-for-byte unchanged. Per-cell ground-field
+    /// scalars and `diagnostics` stay in `splatwalk_oriented` space.
+    pub output_space: Option<OutputSpaceSettings>,
     /// When true, negate the Y axis of every parsed splat (position and normal) so that
     /// WASM operates in the same world space the renderer displays. Gaussian-splat loaders
     /// (e.g. Babylon) flip Y on import; passing that flip here keeps the navmesh, basis,
@@ -239,7 +440,7 @@ pub struct ReconstructionDiagnostics {
 impl ReconstructionDiagnostics {
     pub fn empty(points_total: usize) -> Self {
         Self {
-            api_version: 2,
+            api_version: API_VERSION,
             region_min: None,
             region_max: None,
             oriented_min: None,
@@ -522,7 +723,7 @@ fn parse_splats(data: &[u8], settings: &MeshSettings) -> Result<Vec<splat::Point
         return Ok(points);
     }
 
-    log("@progress parse 0");
+    emit_progress("parse", Some(0.0));
     let mut splats = splat::parse_ply(data).map_err(|e| JsValue::from_str(&e))?;
 
     // Prune stray floater splats at the single ingest chokepoint so every
@@ -571,7 +772,8 @@ fn parse_splats(data: &[u8], settings: &MeshSettings) -> Result<Vec<splat::Point
 pub fn get_splat_bounds(data: &[u8], settings: JsValue) -> Result<JsValue, JsValue> {
     let settings = parse_settings(settings)?;
     let splats = parse_splats(data, &settings)?;
-    let result = mesh::get_splat_bounds(&splats, &settings)?;
+    let mut result = mesh::get_splat_bounds(&splats, &settings)?;
+    output_space::apply_bounds(&settings, &mut result);
     Ok(serde_wasm_bindgen::to_value(&result)?)
 }
 
@@ -579,7 +781,8 @@ pub fn get_splat_bounds(data: &[u8], settings: JsValue) -> Result<JsValue, JsVal
 pub fn suggest_region(data: &[u8], settings: JsValue) -> Result<JsValue, JsValue> {
     let settings = parse_settings(settings)?;
     let splats = parse_splats(data, &settings)?;
-    let result = mesh::suggest_region(&splats, &settings)?;
+    let mut result = mesh::suggest_region(&splats, &settings)?;
+    output_space::apply_region(&settings, &mut result);
     Ok(serde_wasm_bindgen::to_value(&result)?)
 }
 
@@ -591,8 +794,9 @@ pub fn convert_splat_to_mesh(data: &[u8], settings: JsValue) -> Result<JsValue, 
     log(&format!("Received {} bytes (Mode: {})", data.len(), mode));
     
     let splats = parse_splats(data, &settings)?;
-    let result = mesh::reconstruct_mesh(&splats, &settings);
+    let mut result = mesh::reconstruct_mesh(&splats, &settings);
     log(&format!("Reconstructed mesh with {} vertices", result.mesh.vertex_count));
+    output_space::apply_reconstruction(&settings, &mut result);
     
     Ok(serde_wasm_bindgen::to_value(&result)?)
 }
@@ -601,7 +805,8 @@ pub fn convert_splat_to_mesh(data: &[u8], settings: JsValue) -> Result<JsValue, 
 pub fn convert_splat_to_navmesh_basis(data: &[u8], settings: JsValue) -> Result<JsValue, JsValue> {
     let settings = parse_settings(settings)?;
     let splats = parse_splats(data, &settings)?;
-    let result = mesh::convert_splat_to_navmesh_basis(&splats, &settings);
+    let mut result = mesh::convert_splat_to_navmesh_basis(&splats, &settings);
+    output_space::apply_navmesh_basis(&settings, &mut result);
     Ok(serde_wasm_bindgen::to_value(&result)?)
 }
 
@@ -609,7 +814,8 @@ pub fn convert_splat_to_navmesh_basis(data: &[u8], settings: JsValue) -> Result<
 pub fn build_walkable_ground_field(data: &[u8], settings: JsValue) -> Result<JsValue, JsValue> {
     let settings = parse_settings(settings)?;
     let splats = parse_splats(data, &settings)?;
-    let result = mesh::build_walkable_ground_field(&splats, &settings)?;
+    let mut result = mesh::build_walkable_ground_field(&splats, &settings)?;
+    output_space::apply_ground_field(&settings, &mut result);
     Ok(serde_wasm_bindgen::to_value(&result)?)
 }
 
@@ -634,6 +840,11 @@ pub fn build_room_floor_mesh(data: &[u8], settings: JsValue) -> Result<JsValue, 
         _ => default_room_floor_recovery(),
     };
 
+    // Bake the canonical FAST NAV preset as the base layer so binary-only callers
+    // get upstream-correct floor extraction without copying the preset. Caller
+    // settings override the preset, and the per-step recovery patch overrides both
+    // (preset < caller settings < step patch).
+    let preset_obj = fast_nav_preset_json().as_object().cloned().unwrap_or_default();
     let base_obj = base_value.as_object().cloned().unwrap_or_default();
     let mut last_err: Option<mesh::RoomFloorError> = None;
     let mut attempted: Vec<String> = Vec::new();
@@ -642,7 +853,10 @@ pub fn build_room_floor_mesh(data: &[u8], settings: JsValue) -> Result<JsValue, 
         let label = step.label.clone().unwrap_or_else(|| format!("step{}", i));
         let min_area = step.min_room_floor_area.unwrap_or(base_min_area);
 
-        let mut merged = base_obj.clone();
+        let mut merged = preset_obj.clone();
+        for (k, v) in &base_obj {
+            merged.insert(k.clone(), v.clone());
+        }
         if let Some(serde_json::Value::Object(patch)) = &step.settings {
             for (k, v) in patch {
                 merged.insert(k.clone(), v.clone());
@@ -654,22 +868,35 @@ pub fn build_room_floor_mesh(data: &[u8], settings: JsValue) -> Result<JsValue, 
         let splats = parse_splats(data, &settings)?;
         match mesh::extract_room_floor(&splats, &settings, min_area, &label) {
             Ok(build) => {
+                // Convert geometry to the requested output space (if any) BEFORE
+                // generating the GLB, so both the mesh buffers and the GLB bytes
+                // agree on a single coordinate convention.
+                let mut mesh = MeshBuffers::new(build.positions, build.indices);
+                let mut basis = build.basis;
+                let mut floor_plane = build.floor_plane;
+                let mut space = CoordinateSpace::splatwalk_oriented();
+                if let Some(transform) = output_space::transform_for(&settings) {
+                    output_space::apply_mesh_buffers(&transform, &mut mesh);
+                    output_space::apply_basis(&transform, &mut basis);
+                    output_space::apply_floor_plane(&transform, &mut floor_plane);
+                    space = transform.coordinate_space();
+                }
                 let glb = if emit_glb {
-                    let bytes = glb::mesh_to_glb(&build.positions, &build.indices)
+                    let bytes = glb::mesh_to_glb(&mesh.vertices, &mesh.indices)
                         .map_err(|e| JsValue::from_str(&e))?;
                     Some(serde_bytes::ByteBuf::from(bytes))
                 } else {
                     None
                 };
                 let result = RoomFloorMeshResult {
-                    api_version: 2,
+                    api_version: API_VERSION,
                     semver: core_semver(),
                     capabilities: capabilities(),
-                    mesh: MeshBuffers::new(build.positions, build.indices),
+                    mesh,
                     glb,
-                    space: CoordinateSpace::splatwalk_oriented(),
-                    basis: build.basis,
-                    floor_plane: build.floor_plane,
+                    space,
+                    basis,
+                    floor_plane,
                     selected_area: build.selected_area,
                     component_count: build.component_count,
                     selected_cell_count: build.selected_cell_count,
@@ -689,17 +916,51 @@ pub fn build_room_floor_mesh(data: &[u8], settings: JsValue) -> Result<JsValue, 
         }
     }
 
+    // Reject with a structured failure object (not a bare string) so integrators
+    // branch on a stable `reason` code instead of string-matching prose.
     let summary = attempted.join(" -> ");
-    let msg = match last_err {
-        Some(e) => format!(
-            "FAST NAV floor extraction failed after {} step(s): {}. {}",
-            steps.len(),
-            summary,
-            e.message
-        ),
-        None => "FAST NAV recovery had no configured steps.".to_string(),
+    let failure = match last_err {
+        Some(e) => RoomFloorFailure {
+            api_version: API_VERSION,
+            reason: e.reason,
+            message: format!(
+                "FAST NAV floor extraction failed after {} step(s): {}. {}",
+                steps.len(),
+                summary,
+                e.message
+            ),
+            attempted,
+            selected_area: e.area,
+            component_count: e.components,
+            steps: steps.len(),
+        },
+        None => RoomFloorFailure {
+            api_version: API_VERSION,
+            reason: "no_steps".to_string(),
+            message: "FAST NAV recovery had no configured steps.".to_string(),
+            attempted,
+            selected_area: 0.0,
+            component_count: 0,
+            steps: 0,
+        },
     };
-    Err(JsValue::from_str(&msg))
+    Err(serde_wasm_bindgen::to_value(&failure)?)
+}
+
+/// Structured failure returned (as a rejected/thrown value) by
+/// `build_room_floor_mesh`. `reason` is a stable machine code
+/// (`no_component` / `too_small` / `empty_mesh` / `no_steps`); `message` is the
+/// human-readable summary; `attempted` lists each recovery step and the reason
+/// it failed.
+#[derive(Serialize)]
+struct RoomFloorFailure {
+    api_version: u8,
+    reason: String,
+    message: String,
+    attempted: Vec<String>,
+    selected_area: f64,
+    component_count: usize,
+    steps: usize,
 }
 
 /// Tunable parameters for SOG export and streamed-SOG slicing. All fields are

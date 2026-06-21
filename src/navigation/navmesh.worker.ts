@@ -1,5 +1,6 @@
 import { init, exportNavMesh, getNavMeshPositionsAndIndices } from 'recast-navigation';
 import { generateSoloNavMesh } from 'recast-navigation/generators';
+import { autoNavCellSize, DEFAULT_MAX_NAV_CELLS } from './floor';
 
 // Web worker context
 const ctx: Worker = self as any;
@@ -115,9 +116,22 @@ ctx.onmessage = async (e: MessageEvent) => {
             const paddedMaxY = maxY + padding;
             console.log(`[WORKER] Applying vertical headroom padding: +${padding.toFixed(2)}m above maxY`);
 
-            // 3. Smart Cell Size Override
-            // If the grid is too coarse (e.g. < 40 cells), Recast fails opaquely.
+            // 3. Cell Size
+            // Auto-size cs from the mesh extent + agent radius (Recast guideline
+            // cs in [radius/3, radius/2]) bounded by a total-cell budget, so a large
+            // scene is covered completely instead of being limited by a fixed cs.
+            // Disabled (params.autoCellSize === false) for the manual path, which
+            // honours the operator's literal cs input.
             let finalCS = params.cs;
+            if (params.autoCellSize !== false) {
+                const budget = params.maxNavCells && params.maxNavCells > 0 ? params.maxNavCells : DEFAULT_MAX_NAV_CELLS;
+                finalCS = autoNavCellSize(width, depth, params.walkableRadius, budget);
+                console.log(
+                    `[WORKER] Auto cell size: cs=${finalCS.toFixed(3)} ` +
+                    `(agentRadius=${params.walkableRadius}m -> [${(params.walkableRadius / 3).toFixed(3)}, ${(params.walkableRadius / 2).toFixed(3)}], ` +
+                    `budget=${budget} cells, bounds=${width.toFixed(1)}x${depth.toFixed(1)})`
+                );
+            }
             const maxDimension = Math.max(width, depth);
             const minResolution = 50; // We want at least 50 cells across the longest side
 

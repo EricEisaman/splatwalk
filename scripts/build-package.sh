@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# Assemble the publishable `splatwalk-core` package into `dist-pkg/`.
+# Assemble the publishable `@splatwalk/core` package into `dist-pkg/`.
 #
 # The package bundles, as a single versioned, binary-friendly artifact:
 #   - the wasm-bindgen glue + `_bg.wasm` binary (from `pkg/`, build it first),
@@ -21,7 +21,7 @@ OUT="dist-pkg"
 PKG_DIR="pkg/wasm_splatwalk"
 
 echo "==========================================================="
-echo "ASSEMBLING splatwalk-core PACKAGE -> $OUT/"
+echo "ASSEMBLING @splatwalk/core PACKAGE -> $OUT/"
 echo "==========================================================="
 
 if [ ! -f "$PKG_DIR/wasm_splatwalk.js" ] || [ ! -f "$PKG_DIR/wasm_splatwalk_bg.wasm" ]; then
@@ -60,16 +60,27 @@ npx --no-install tsc "$STAGE/floor.ts" \
     --strict \
     --outDir "$OUT"
 
-# 4) Generated package.json (version synced from the root package.json).
+# 4) License (MIT; open-core core is free forever - see LICENSING.md).
+cp "LICENSE" "$OUT/LICENSE"
+
+# 5) Generated package.json (version synced from the root package.json).
 VERSION="$(node -p "require('./package.json').version")"
 node -e "
 const fs = require('fs');
 const pkg = {
-  name: 'splatwalk-core',
+  name: '@splatwalk/core',
   version: '$VERSION',
   description: 'SplatWalk WASM core: binary, hand-authored types, canonical FAST NAV preset, and a framework-agnostic floor module.',
   type: 'module',
-  license: 'AGPL-3.0-only',
+  license: 'MIT',
+  author: 'Eric Eisaman',
+  homepage: 'https://github.com/EricEisaman/splatwalk#readme',
+  repository: { type: 'git', url: 'git+https://github.com/EricEisaman/splatwalk.git' },
+  bugs: { url: 'https://github.com/EricEisaman/splatwalk/issues' },
+  keywords: [
+    'gaussian-splatting', 'splat', 'wasm', 'webassembly', 'navmesh', 'navigation',
+    'recast', 'ply', 'spz', 'sog', 'glb', 'mesh', '3d', 'babylonjs', 'webgl',
+  ],
   main: './wasm_splatwalk.js',
   types: './wasm_splatwalk.d.ts',
   exports: {
@@ -84,13 +95,17 @@ const pkg = {
     'floor.js',
     'floor.d.ts',
     'README.md',
+    'LICENSE',
   ],
   sideEffects: false,
+  // Provenance is enabled in CI via NPM_CONFIG_PROVENANCE=true (see release.yml),
+  // not here: baking it into publishConfig breaks a local/non-OIDC `npm publish`.
+  publishConfig: { access: 'public' },
 };
 fs.writeFileSync('$OUT/package.json', JSON.stringify(pkg, null, 2) + '\n');
 "
 
-# 5) README.
+# 6) README.
 cp "package/README.md" "$OUT/README.md"
 
 echo "==========================================================="
