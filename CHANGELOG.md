@@ -25,6 +25,23 @@ Every v2 result advertises a `capabilities` string array. Current flags:
 | `recast_config` | exposes `recast_agent_defaults()` and `recast_config()` |
 | `progress_callback` | exposes `set_progress_callback()` (opt-in structured progress) |
 
+## [0.3.1] - 2026-06-21
+
+### Fixed
+
+- **Local/non-OIDC publish no longer fails on provenance.** The generated package
+  no longer bakes `provenance: true` into `publishConfig` (which aborted any
+  publish outside a supported OIDC CI provider with `EUSAGE: Automatic provenance
+  generation not supported`). Provenance is now enabled only in CI via
+  `NPM_CONFIG_PROVENANCE=true` in `.github/workflows/release.yml`, so tagged CI
+  releases still publish with provenance while a manual publish works too.
+
+### Added
+
+- **Reserved `@splatwalk/core-pro`.** Published a placeholder for the commercial
+  Pro tier (README only), releasing in conjunction with SplatWalk v1.0.0. The free
+  `@splatwalk/core` remains MIT and never depends on Pro.
+
 ## [0.3.0] - 2026-06-21
 
 First publicly consumable release: the integrator wishlist is fully addressed and
