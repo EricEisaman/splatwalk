@@ -1,42 +1,29 @@
 # Releasing SplatWalk
 
-SplatWalk publishes `@splatwalk/core` to npm from GitHub Actions using **npm
-Trusted Publishing (OIDC)** - no long-lived `NPM_TOKEN`, with automatic
-[provenance](https://docs.npmjs.com/generating-provenance-statements). This
-mirrors the [socket.io release process](https://socket.io/blog/npm-package-provenance/).
-A tag push is the only trigger; CI builds the WASM, assembles the package, and
-publishes.
+SplatWalk publishes `@splatwalk/core` to npm with a **manual `npm publish`**
+using your npm login + 2FA one-time code. A tag push runs
+[`release.yml`](.github/workflows/release.yml), which builds the WASM, assembles
+the package, and attaches the artifacts (including the `splatwalk-core-*.tgz`
+tarball) to a **GitHub release** - it does **not** publish to npm.
 
-## One-time setup on npmjs.com (owner only)
+> CI publishing via npm Trusted Publishing (OIDC) is not enabled: it was never
+> authorized for this package and only produced failing release runs. If you want
+> hands-off CI publishing later, see [Optional: CI publishing](#optional-ci-publishing).
 
-These require your npm login and cannot be automated from this repo:
+## Publishing to npm (manual)
 
-1. **Create the scope/org.** Create the `@splatwalk` org at
-   <https://www.npmjs.com/org/create> (free).
-2. **Bootstrap the first publish.** Trusted publishing is configured against an
-   existing package, so publish `@splatwalk/core` once manually to create it:
+From the repo root:
 
-   ```bash
-   npm login
-   npm run build:wasm        # ./scripts/build.sh  -> pkg/
-   npm run build:package     # ./scripts/build-package.sh -> dist-pkg/
-   cd dist-pkg && npm publish --access public
-   ```
+```bash
+npm login                              # your @splatwalk-org account (2FA)
+npm run build:wasm                     # ./scripts/build.sh         -> pkg/
+npm run build:package                  # ./scripts/build-package.sh -> dist-pkg/
+npm publish dist-pkg --access public --otp=XXXXXX   # XXXXXX = authenticator code
+```
 
-3. **Add the Trusted Publisher.** In the package settings on npmjs.com ->
-   **Trusted Publishing**, add a GitHub Actions publisher with these exact,
-   case-sensitive values:
-   - Organization or user: `EricEisaman`
-   - Repository: `splatwalk`
-   - Workflow filename: `release.yml`
-
-   After this, every tagged release publishes from CI with no token.
-
-> Requirements for the OIDC flow (handled by the workflow): a GitHub-hosted
-> runner, Node 24 + npm 11.5.1+, `id-token: write` permission, and a
-> `repository.url` in the published `package.json` that matches this repo (it
-> does). Do not add `NODE_AUTH_TOKEN` to the workflow - a stored token
-> short-circuits OIDC.
+Verify at <https://www.npmjs.com/package/@splatwalk/core>. (You can also publish
+the `splatwalk-core-*.tgz` attached to the matching GitHub release instead of
+rebuilding: `npm publish splatwalk-core-x.y.z.tgz --access public --otp=XXXXXX`.)
 
 ## Cutting a release
 
@@ -56,19 +43,24 @@ These require your npm login and cannot be automated from this repo:
    git push origin vX.Y.Z       # triggers .github/workflows/release.yml
    ```
 
-6. CI then verifies the tag matches `package.json`, rebuilds the WASM, assembles
-   `@splatwalk/core`, attaches artifacts to a GitHub release, and publishes to
-   npm with provenance. Verify at
-   <https://www.npmjs.com/package/@splatwalk/core> (the "Provenance" section
-   should show the signed attestation).
+6. CI verifies the tag matches `package.json`, rebuilds the WASM, assembles
+   `@splatwalk/core`, and attaches the artifacts to a GitHub release.
+7. **Publish to npm manually** (see [Publishing to npm](#publishing-to-npm-manual)
+   above), then verify at <https://www.npmjs.com/package/@splatwalk/core>.
 
-## Verifying provenance
+## Optional: CI publishing
 
-Consumers can confirm the published package is built from this repo:
+To publish from CI without a token, configure npm Trusted Publishing (OIDC) and
+re-add a publish step to `release.yml`:
 
-```bash
-npm audit signatures
-```
+1. In the package settings on npmjs.com -> **Trusted Publishing**, add a GitHub
+   Actions publisher with these exact, case-sensitive values:
+   - Organization or user: `EricEisaman`
+   - Repository: `splatwalk`
+   - Workflow filename: `release.yml`
+2. Re-add an `id-token: write` permission and a `npm publish` step (Node 24 +
+   npm 11.5.1+, `NPM_CONFIG_PROVENANCE=true`, no `NODE_AUTH_TOKEN`). Consumers
+   can then verify provenance with `npm audit signatures`.
 
 ## The Pro tier
 
