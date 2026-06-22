@@ -71,6 +71,12 @@ jobs:
       - name: Build WASM core
         run: ./scripts/build.sh
 
+      # build-package.sh compiles the framework-agnostic floor module with
+      # `npx --no-install tsc`, so the project's pinned TypeScript must be present
+      # locally (the release job otherwise installs no node deps).
+      - name: Install TypeScript (floor module compile)
+        run: npm install --no-save "typescript@$(node -p "require('./package.json').devDependencies.typescript")"
+
       - name: Assemble @splatwalk/core package
         run: ./scripts/build-package.sh
 
