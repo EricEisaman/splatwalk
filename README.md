@@ -1,42 +1,74 @@
+<div align="center">
+
 # SplatWalk
 
 ![SplatWalk Logo](public/splatwalk.png)
 
-**SplatWalk** is a convenient one-stop shop for generating optimized **.glb ground meshes** from **.spz** or **.ply** Gaussian splats as well as creating Recast-compatible navmesh binaries from either a fast floor-field path or a dedicated collision basis.
+### The render-engine-agnostic toolkit for Gaussian splats.
 
-The primary goal of SplatWalk is to provide high-quality Gaussian Splat utilities empowering engineers and designers in their quest to create useful 3D applications.
+**Splat bytes in. Walkable worlds out.**
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-success.svg)](LICENSING.md)
+[![npm @splatwalk/core](https://img.shields.io/npm/v/@splatwalk/core?label=%40splatwalk%2Fcore&color=cb3837)](https://www.npmjs.com/package/@splatwalk/core)
+[![Core: Rust + WASM](https://img.shields.io/badge/core-Rust%20%2B%20WASM-dea584.svg)](#technology-stack)
+[![Renderer agnostic](https://img.shields.io/badge/renderer-agnostic-blueviolet.svg)](#render-engine-agnostic-by-design)
+[![Reference integrations: Babylon.js + three.js / R3F](https://img.shields.io/badge/integrations-Babylon.js%20%7C%20three.js%20%2F%20R3F-1f6feb.svg)](#render-engine-agnostic-by-design)
+
+</div>
+
+**SplatWalk** turns raw **`.spz`** and **`.ply`** Gaussian splats into production-ready, *navigable* 3D: optimized **`.glb` ground meshes** and **Recast-compatible navmesh binaries** — built either from a one-click fast floor-field path or from a dedicated collision basis.
+
+At its heart is a single **Rust-to-WASM core** with **zero dependency on any 3D engine, renderer, or UI framework**. It takes splat bytes in and returns meshes, navmesh-ready geometry, bounds, and SOG/GLB out — in a coordinate space *you* control. The mission is simple: give engineers and designers high-performance Gaussian Splat tooling that empowers them to ship real 3D applications, on whatever stack they already love.
+
+## Render-Engine Agnostic by Design
+
+The engine-free WASM core is the product; renderers are just consumers. The **same** core powers every reference integration in this repo — only the rendering and crowd glue differ:
+
+- **Engine-free core, by contract** — pure Rust/WASM. No Babylon, no three.js, no bundler required. Splat bytes go in; meshes, navmesh geometry, bounds, and SOG/GLB come out.
+- **You own the coordinate space** — align to any renderer once, at the boundary, via `flip_y` / `output_space`. No per-output hacks.
+- **Proven on multiple stacks** — a **Babylon.js** showcase and a **React Three Fiber / three.js** demo call the *identical* WASM entry points and the shared, engine-free floor module.
+- **Binary-only friendly** — drive the whole pipeline headless, with **no 3D engine at all** (see [`examples/`](examples/)).
+
+```mermaid
+flowchart LR
+    splat["Splat bytes (.spz / .ply)"] --> core["SplatWalk WASM core (Rust)"]
+    core --> babylon["Babylon.js showcase"]
+    core --> three["three.js / R3F demo"]
+    core --> headless["Binary-only / headless"]
+```
+
+> Versioned contract: every WASM result carries `api_version` plus `capabilities`, so you can tolerate additive change instead of hard-failing on a bump. See the [Integration Guide](docs/INTEGRATION.md).
 
 ## Fast Floor Nav In Action
 
-One `FAST NAV` click takes a raw splat to a walkable navmesh with a spawned, click-to-move player. Here the player agent (blue cube) and seed probe (magenta sphere) are correctly placed on the room floor, on the same plane the splat renders:
+One **`FAST NAV`** click takes a raw splat all the way to a walkable navmesh with a spawned, click-to-move player. Below, the player agent (blue cube) and seed probe (magenta sphere) land precisely on the room floor — on the very same plane the splat renders:
 
 ![SplatWalk FAST NAV placing the player agent on the room floor](docs/images/fastnav-player-on-floor.png)
 
 ## Key Features
 
-- **Instant Visualization**: Load and view Gaussian Splat files immediately.
-- **Orientation Control**: Rotate and align splats visually before conversion (90° increments). Rotating a splat after a navmesh exists automatically re-runs the same generation path so the navmesh, spawn point, and agents stay aligned with the re-oriented splat.
-- **Fast Floor Nav Path**: One button can pick a seed, extract a walkable floor field, feed that floor mesh to Recast, initialize the crowd, spawn an NPC, and enable click-to-move.
-- **Floater Pruning (WASM)**: Built-in statistical outlier removal strips stray "floater" splats at ingest so bounds, region, seed, and floor detection lock onto the real scene. On by default and tunable (see *Built-in floater pruning* below).
-- **Advanced Collider NavMesh Basis**: Import a dedicated `.collision.glb` / World Labs Collider Mesh GLB or generate a fallback collider from the splat, then feed only that collider to Recast for manual tuning.
-- **PlayCanvas/SuperSplat Workflow**: Supports scene type, seed, voxel fill/seal, carve, and collider mesh diagnostics modeled after the PlayCanvas collision pipeline.
-- **Navigation Markers**: The scene labels explain the magenta seed marker, blue player agent, green NPC agent, and green walkable navmesh overlay.
-- **2.5D SDF Diagnostics**: Browser-side column fields power the fast floor path and remain available under experimental debug for inspecting accepted, obstacle, variance, and rejected cells.
-- **Mesh Reconstruction**: Integrated Poisson reconstruction for full geometry.
-- **Streamed SOG Export**: Convert a splat into a SOG bundle — a single `meta.json` set or a streamed, Morton-ordered multi-chunk `lod-meta.json` set with lossless WebP planes — decodable by Babylon's SOG loaders and aimed at the GS streaming loader (PR #18563). Full spherical harmonics (configurable degree); large scenes (>1M splats) default to streamed LOD. See [`docs/wasm-api.md`](docs/wasm-api.md) and [`MILESTONES.md`](MILESTONES.md).
-- **Basic `.spz` Support**: `.spz` is normalized to a full-fidelity `.ply` (`spz_to_ply`) so the viewer and nav pipeline only deal with PLY.
-- **One-Click Export**: Download production-ready `.glb` files.
-- **One-Click Export**: Download production-ready `Recast compatible navmesh binary` files.
+- **Instant Visualization** — Load and view Gaussian Splat files the moment they land.
+- **Orientation Control** — Rotate and align splats visually before conversion (90° increments). Rotate a splat *after* a navmesh exists and SplatWalk automatically re-runs the same generation path, so the navmesh, spawn point, and agents stay locked to the re-oriented splat.
+- **Fast Floor Nav Path** — One button picks a seed, extracts a walkable floor field, feeds that floor mesh to Recast, initializes the crowd, spawns an NPC, and enables click-to-move.
+- **Floater Pruning (WASM)** — Built-in statistical outlier removal strips stray "floater" splats at ingest so bounds, region, seed, and floor detection lock onto the real scene. On by default and fully tunable (see *Built-in floater pruning* below).
+- **Advanced Collider NavMesh Basis** — Import a dedicated `.collision.glb` / World Labs Collider Mesh GLB, or generate a fallback collider from the splat, then feed only that collider to Recast for hands-on tuning.
+- **PlayCanvas / SuperSplat Workflow** — Scene type, seed, voxel fill/seal, carve, and collider mesh diagnostics, modeled after the PlayCanvas collision pipeline.
+- **Navigation Markers** — The scene labels the magenta seed marker, blue player agent, green NPC agent, and green walkable navmesh overlay.
+- **2.5D SDF Diagnostics** — Browser-side column fields power the fast floor path and stay available under experimental debug for inspecting accepted, obstacle, variance, and rejected cells.
+- **Mesh Reconstruction** — Integrated Poisson reconstruction for full geometry.
+- **Streamed SOG Export** — Convert a splat into a SOG bundle — a single `meta.json` set or a streamed, Morton-ordered multi-chunk `lod-meta.json` set with lossless WebP planes — decodable by Babylon's SOG loaders and aimed at the GS streaming loader (PR #18563). Full spherical harmonics (configurable degree); large scenes (>1M splats) default to streamed LOD. See [`docs/wasm-api.md`](docs/wasm-api.md) and [`MILESTONES.md`](MILESTONES.md).
+- **Basic `.spz` Support** — `.spz` is normalized to a full-fidelity `.ply` (`spz_to_ply`) so the viewer and nav pipeline only ever deal with PLY.
+- **One-Click Export** — Download production-ready `.glb` meshes and Recast-compatible navmesh binaries.
 
 ## Technology Stack
 
-- **Core**: Rust (compiled to WASM) for heavy geometry processing.
-- **Rendering**: Babylon.js for high-performance 3D visualization.
-- **Frontend**: TypeScript + Vite for a modern, responsive web experience.
+- **Core (the product)** — Rust, compiled to WASM, for high-performance geometry processing. Engine-free and renderer-agnostic by contract.
+- **Reference integrations** — Babylon.js and React Three Fiber / three.js demos that *consume* the same core. They showcase the pipeline; they are not a rendering dependency of it.
+- **Frontend** — TypeScript + Vite for a modern, responsive reference web experience.
 
 ## Using SplatWalk In Your Project (Early Integrators)
 
-> SplatWalk is early software. The WASM core is the product — the browser UI is a reference harness around it. Treat the WASM result shapes as a versioned contract (every result carries `api_version`).
+> SplatWalk is early software, but the contract is intentional. The WASM core is the product — the browser UI is a reference harness around it. Treat the WASM result shapes as a versioned contract (every result carries `api_version`).
 
 > **New here?** Start with the [Integration Guide](docs/INTEGRATION.md) and the runnable [`examples/`](examples/). Install the published core with `npm install @splatwalk/core` (MIT, free forever).
 
@@ -200,7 +232,7 @@ The bundled `useSplatFastNav` composable already exposes this as reactive state 
 
 ## Service Worker and Caching
 
-SplatWalk ships a service worker (`public/sw.js`) whose cache id is derived from the wasm build:
+SplatWalk ships a service worker (`public/sw.js`) whose cache id is derived from the wasm build, so updates are seamless and stale code never lingers:
 
 - **Auto-versioned cache**: During `npm run build`, a Vite plugin hashes `pkg/wasm_splatwalk/wasm_splatwalk_bg.wasm` and writes that hash into the service worker's `CACHE_NAME` (replacing the `__SW_BUILD_ID__` placeholder). Every new wasm build therefore produces a new cache id.
 - **Clears on change**: On activation the service worker deletes every cache whose name is not the current `CACHE_NAME`, so previous builds are evicted automatically.
@@ -210,13 +242,9 @@ SplatWalk ships a service worker (`public/sw.js`) whose cache id is derived from
 
 ## License
 
-SplatWalk follows an open-core model. The core - the WASM binary, the
-wasm-bindgen glue, the hand-authored TypeScript types, and the
-framework-agnostic `floor` module published as **`@splatwalk/core`** - is
-licensed under the **MIT License** and is free forever, including for
-commercial and proprietary use. Anything released under MIT stays MIT.
+SplatWalk follows an **open-core** model.
 
-Advanced, opt-in capabilities are reserved for a future commercial tier
-(`@splatwalk/core-pro`) under a separate license; the core never requires it.
-See [`LICENSING.md`](LICENSING.md) for the package-to-license map and
-[`CONTRIBUTING.md`](CONTRIBUTING.md) for the contributor sign-off.
+- **The core is MIT — and free forever.** The WASM binary, the wasm-bindgen glue, the hand-authored TypeScript types, and the framework-agnostic `floor` module — published as **`@splatwalk/core`** — are licensed under the **MIT License**, including for commercial and proprietary use. Anything released under MIT stays MIT.
+- **Pro is opt-in, never required.** Advanced capabilities are reserved for a future commercial tier (`@splatwalk/core-pro`) under a separate license; the core never depends on it.
+
+See [`LICENSING.md`](LICENSING.md) for the package-to-license map and [`CONTRIBUTING.md`](CONTRIBUTING.md) for the contributor sign-off.
