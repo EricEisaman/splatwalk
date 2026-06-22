@@ -14,6 +14,16 @@ import SplatFastNavShowcase from '@/components/vuetify/SplatFastNavShowcase.vue'
         <v-btn href="/" prepend-icon="mdi-home" variant="text" color="primary">
           Home
         </v-btn>
+        <v-btn
+          href="https://github.com/EricEisaman/splatwalk"
+          target="_blank"
+          rel="noopener noreferrer"
+          prepend-icon="mdi-github"
+          variant="text"
+          color="secondary"
+        >
+          GitHub
+        </v-btn>
       </template>
     </v-app-bar>
 

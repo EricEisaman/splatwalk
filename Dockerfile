@@ -106,8 +106,10 @@ COPY --from=rust-builder /app/pkg ./pkg
 COPY src ./src
 COPY index.html ./
 COPY vuetify.html ./
+COPY react.html ./
 COPY vite.config.ts ./
 COPY tsconfig.json ./
+COPY tsconfig.react.json ./
 COPY public ./public
 
 # Build frontend

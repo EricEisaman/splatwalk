@@ -18,7 +18,9 @@ and proprietary use - see [`../LICENSING.md`](../LICENSING.md).
 6. [Progress reporting](#6-progress-reporting)
 7. [Handling failures](#7-handling-failures)
 8. [Framework-agnostic floor module](#8-framework-agnostic-floor-module)
-9. [Integrator ask status](#9-integrator-ask-status)
+9. [Babylon.js integration](#9-babylonjs-integration)
+10. [React Three Fiber (three.js) integration](#10-react-three-fiber-threejs-integration)
+11. [Integrator ask status](#11-integrator-ask-status)
 
 ## 1. Install and initialize
 
@@ -211,7 +213,124 @@ const result = await extractFloorFieldWithRecovery({
 });
 ```
 
-## 9. Integrator ask status
+For a complete, non-Babylon reference that renders the splat, extracts the floor,
+builds a Recast navmesh, and runs a click-to-move crowd, see the
+[React Three Fiber demo](../examples/r3f/README.md) (route `/react`, source under
+`src/react/`). It uses the same engine-agnostic floor module and
+`recast-navigation` crowd on a three.js scene.
+
+## 9. Babylon.js integration
+
+Babylon.js is the reference renderer for the SplatWalk showcase. The complete,
+working integration is `src/scene/Viewer.ts` (UI in `src/vuetify/`, route
+`/vuetify`); this section distills the engine-specific contract.
+
+**Live demo:** <a href="https://splatwalk.onrender.com/vuetify" target="_blank" rel="noopener noreferrer">splatwalk.onrender.com/vuetify</a>
+
+**Handedness.** Babylon is **left-handed** by default. The WASM core emits
+`splatwalk_oriented` space (right-handed, `+Y` up), and Recast/`recast-navigation`
+is right-handed — but because Babylon's splat loader flips the splat on import
+(below), the navmesh, crowd and rendered splat all coincide without any extra
+handedness conversion. Render directly; do **not** add a Z mirror.
+
+**The splat Y-flip → `flip_y: true`.** `SceneLoader.ImportMeshAsync` imports
+Gaussian splats with a **negative Y scale** (the Y-down source convention), so
+the rendered splat lives in a Y-flipped world relative to the raw PLY/SPZ bytes
+that WASM parses. Detect it from the mesh and feed it straight into every WASM
+call — never guess:
+
+```ts
+// src/scene/Viewer.ts — isSplatYFlipped()
+mesh.computeWorldMatrix(true);
+const flip_y = (mesh.scaling?.y ?? 1) < 0;   // true for a standard splat import
+
+const floor = build_room_floor_mesh(splatBytes, { mode: 2, flip_y, rotation });
+```
+
+For `.spz`, Niantic's convention is often rotated 180° on X relative to
+Babylon/PLY; apply that as a `rotation`, not as an output offset.
+
+**Crowd + click-to-move.** Build the navmesh with `recast-navigation`
+`importNavMesh`, then a `Crowd` with `CrowdAgent`s (player radius `0.5`,
+height `2.0`). Render the navmesh as a debug mesh and pick against it; the agent
+mesh (a `0.5` box) is offset up by half its height so it rests *on* the navmesh:
+
+```ts
+const { navMesh } = importNavMesh(navMeshData);
+this.crowd = new Crowd(navMesh, { maxAgents: 100, maxAgentRadius: 1.0 });
+this.userAgent = this.crowd.addAgent(spawn, { radius: 0.5, height: 2.0, maxAcceleration: 20, maxSpeed: 5 });
+
+// Pointer tap → pick the navmesh debug mesh → steer the agent.
+const pick = scene.pick(scene.pointerX, scene.pointerY, (m) => m === navMeshDebugMesh);
+if (pick?.hit && pick.pickedPoint) this.userAgent.requestMoveTarget(pick.pickedPoint.subtract(navMeshVisualOffset));
+```
+
+**Top-down framing.** `focusOnPlayer()` puts the `ArcRotateCamera` straight
+above the player (`beta ≈ 0`), targets the player, and sets
+`radius = cameraHeight - player.y`, where `cameraHeight` sits just below the
+splat ceiling, clamped between one player-height and 4 m above the player's head
+so the player stays framed in rooms of any height.
+
+## 10. React Three Fiber (three.js) integration
+
+A first-class three.js / React reference ships in-repo: route `/react`, source
+under `src/react/` (engine logic in `src/react/three/SplatNavController.ts`),
+documented in [`../examples/r3f/README.md`](../examples/r3f/README.md). It renders
+the splat with [`@mkkellogg/gaussian-splats-3d`](https://github.com/mkkellogg/GaussianSplats3D)
+and drives the same WASM floor module + `recast-navigation` crowd as Babylon.
+
+**Live demo:** <a href="https://splatwalk.onrender.com/react" target="_blank" rel="noopener noreferrer">splatwalk.onrender.com/react</a>
+
+**Handedness — the one extra step vs. Babylon.** three.js is **right-handed**
+while the Babylon reference is left-handed. If you render the splat naively in
+three.js, the scene comes out **mirrored** (text/signs read backwards). Fix it
+once at the scene root: parent everything in a group with `scale.z = -1`, and
+flip the splat itself on Y (matching Babylon's loader):
+
+```ts
+// root world — emulate Babylon's left-handed chirality
+const world = new THREE.Group();
+world.scale.z = -1;
+scene.add(world);
+
+// the splat — Y-flip the raw (Y-down) splat into +Y-up space
+const splatGroup = new THREE.Group();
+splatGroup.scale.set(1, -1, 1);
+world.add(splatGroup);
+```
+
+The net splat transform (`z = -1` ∘ `y = -1`) is a **proper 180° rotation about
+X** (determinant `+1`), so the splat is upright **and un-mirrored** — identical
+chirality to Babylon. Floor, navmesh overlay and agents are all children of
+`world`, so they share that space.
+
+**`flip_y: true`.** As with Babylon, build the WASM floor/navmesh with
+`flip_y: true` so the core's `+Y = up` heuristics match the rendered (Y-flipped)
+splat. No per-output Y offsets.
+
+**Click-to-move across the Z mirror.** A raycast hit is in **world** space (after
+the `scale.z = -1`), but Recast expects the navmesh's own coordinates. Convert
+back with `worldToLocal` before steering:
+
+```ts
+raycaster.setFromCamera(ndc, camera);
+const hit = raycaster.intersectObject(navMeshOverlay, false)[0];
+if (hit) {
+  const local = navMeshOverlay.worldToLocal(hit.point.clone());   // undo the Z mirror
+  playerAgent.requestMoveTarget({ x: local.x, y: local.y, z: local.z });
+}
+```
+
+Lift agent meshes by half their height (`userData.yOffset`) so they rest on the
+navmesh rather than sinking into it.
+
+**Top-down framing.** Place the perspective camera straight above the player at
+`cameraHeight = playerTopY + clamp(ceilingY - margin - playerTopY, playerHeight, 4)`,
+target the player, and use a vertical FOV of `~0.8 rad (45.84°)` to match
+Babylon's `ArcRotateCamera`. Use a ceiling `margin` of ~`0.65 m` so the camera
+keeps headroom below the ceiling instead of hugging it.
+
+## 11. Integrator ask status
 
 The community integration wishlist gathered against the pre-release core is fully
 addressed as of v0.3.0:

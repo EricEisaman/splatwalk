@@ -119,6 +119,12 @@ server {
         try_files /vuetify.html =404;
     }
 
+    # React Three Fiber FAST NAV demo (MPA entry built to /react.html at the dist root)
+    location = /react {
+        limit_req zone=general burst=20 nodelay;
+        try_files /react.html =404;
+    }
+
     # All other routes fall back to index.html for client-side routing.
     # Rate limiting is applied here (HTML navigations); static assets are matched by
     # the regex/wasm/pkg/worker locations above and bypass this block entirely.

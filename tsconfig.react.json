@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "types": ["react", "react-dom", "vite/client"]
+  },
+  "include": ["src/react/**/*", "src/vite-env.d.ts"],
+  "exclude": ["node_modules", "dist", "pkg"]
+}

@@ -368,6 +368,7 @@ canvas#renderCanvas.highlight {
   font-size: 0.9rem;
   font-weight: 600;
   letter-spacing: 0.5px;
+  white-space: nowrap;
   transition: all 0.15s ease;
 }
 

@@ -35,6 +35,7 @@ services:
         - scripts/**
         - index.html
         - vuetify.html
+        - react.html
       ignoredPaths:
         - README.md
         - .git/**

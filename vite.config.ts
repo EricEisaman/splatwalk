@@ -1,5 +1,6 @@
 import { defineConfig, type Plugin, type Connect } from 'vite';
 import vue from '@vitejs/plugin-vue';
+import react from '@vitejs/plugin-react';
 import vuetify from 'vite-plugin-vuetify';
 import { resolve } from 'path';
 import { copyFileSync, mkdirSync, readdirSync, existsSync, rmSync, readFileSync, writeFileSync, statSync } from 'fs';
@@ -28,6 +29,8 @@ function rewriteCleanUrls(req: Connect.IncomingMessage): void {
     req.url = '/index.html' + query;
   } else if (path === '/vuetify' || path === '/vuetify/') {
     req.url = '/vuetify.html' + query;
+  } else if (path === '/react' || path === '/react/') {
+    req.url = '/react.html' + query;
   }
 }
 
@@ -719,7 +722,7 @@ export default defineConfig({
     },
   },
   publicDir: 'public', // Explicitly enable public directory copying
-  plugins: [vue(), vuetify({ autoImport: true }), devServerRouting(), removeVitePreload(), rewriteWasmImports(), copyPublicAssets(), copyWasmModules(), injectServiceWorkerBuildId()],
+  plugins: [vue(), react(), vuetify({ autoImport: true }), devServerRouting(), removeVitePreload(), rewriteWasmImports(), copyPublicAssets(), copyWasmModules(), injectServiceWorkerBuildId()],
   worker: {
     format: 'es'  // Force ES modules for all workers (fixes IIFE error)
   },
@@ -731,6 +734,7 @@ export default defineConfig({
       input: {
         main: resolve(__dirname, 'index.html'),
         vuetify: resolve(__dirname, 'vuetify.html'),
+        react: resolve(__dirname, 'react.html'),
       },
       output: {
         format: 'es',
