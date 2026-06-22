@@ -1,13 +1,13 @@
 name: Release
 
-# Build the WASM core, assemble the `@splatwalk/core` package, attach the
-# artifacts to a GitHub release, and publish to npm via Trusted Publishing
-# (OIDC) - no long-lived NPM_TOKEN, with automatic provenance. Triggered by a
-# semver tag like `v0.3.0`.
+# Build the WASM core, assemble the `@splatwalk/core` package, and attach the
+# artifacts (wasm glue + binary, types, and the npm tarball) to a GitHub release.
+# Triggered by a semver tag like `v0.3.0`.
 #
-# One-time setup on npmjs.com (see RELEASING.md): create the `@splatwalk` org,
-# bootstrap the first publish, then add a Trusted Publisher for this repo +
-# workflow filename `release.yml`.
+# Publishing to npm is done MANUALLY (see RELEASING.md): download/build the
+# tarball and `npm publish` with your npm login + 2FA OTP. CI deliberately does
+# not publish to npm - the OIDC Trusted Publishing path was never authorized for
+# this package, so leaving it in only produced failing runs.
 on:
   push:
     tags:
@@ -15,7 +15,6 @@ on:
 
 permissions:
   contents: write   # create the GitHub release
-  id-token: write   # mint the OIDC token for npm Trusted Publishing
 
 jobs:
   release:
@@ -56,17 +55,10 @@ jobs:
       - name: Install binaryen (wasm-opt)
         run: sudo apt-get update && sudo apt-get install -y binaryen
 
-      # Node 24 + npm 11.5.1+ is required for the OIDC publishing flow. Do NOT set
-      # NODE_AUTH_TOKEN / a token-based .npmrc here: a stored token short-circuits
-      # the OIDC handshake.
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 24
-          registry-url: 'https://registry.npmjs.org'
-
-      - name: Upgrade npm (OIDC support)
-        run: npm install -g npm@latest
 
       - name: Build WASM core
         run: ./scripts/build.sh
@@ -103,10 +95,9 @@ jobs:
             splatwalk-core-*.tgz
           body_path: ${{ steps.notes.outputs.path }}
 
-      # Trusted Publishing: npm authenticates via the OIDC token (no secret) and
-      # generates a provenance attestation automatically. `access: public` and
-      # `provenance: true` come from the generated package.json's publishConfig.
-      - name: Publish to npm (Trusted Publishing)
-        run: cd dist-pkg && npm publish
-        env:
-          NPM_CONFIG_PROVENANCE: true
+      # npm publish is intentionally NOT done here - publish manually from the
+      # attached `splatwalk-core-*.tgz` (or a local `npm run build:package`):
+      #   npm login                       # 2FA account
+      #   npm publish dist-pkg --otp=XXXXXX
+      - name: Publish reminder
+        run: echo "Build + GitHub release done. Publish @splatwalk/core to npm manually (see RELEASING.md)."
