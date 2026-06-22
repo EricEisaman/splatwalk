@@ -7,7 +7,7 @@ resolver = "2"
 # never drift. Per SemVer 2.0.0 (https://semver.org/spec/v2.0.0.html): bump MINOR
 # for additive changes, PATCH for fixes, MAJOR for breaking changes.
 [workspace.package]
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 
 [profile.release]

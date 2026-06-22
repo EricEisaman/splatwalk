@@ -146,7 +146,7 @@ server {
     add_header Referrer-Policy "strict-origin-when-cross-origin" always;
     
     # Content Security Policy (adjust as needed for your app)
-    add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https: blob:; font-src 'self' data:; connect-src 'self' https: data:; worker-src 'self' blob:; child-src 'self' blob:; frame-ancestors 'self';" always;
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https: blob:; font-src 'self' data:; connect-src 'self' https: data: blob:; worker-src 'self' blob:; child-src 'self' blob:; frame-ancestors 'self';" always;
     
     # HSTS (only if using HTTPS - Render.com provides HTTPS)
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;

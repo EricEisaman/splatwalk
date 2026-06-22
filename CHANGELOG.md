@@ -25,6 +25,26 @@ Every v2 result advertises a `capabilities` string array. Current flags:
 | `recast_config` | exposes `recast_agent_defaults()` and `recast_config()` |
 | `progress_callback` | exposes `set_progress_callback()` (opt-in structured progress) |
 
+## [0.3.2] - 2026-06-22
+
+### Added
+
+- **React Three Fiber (three.js) reference integration.** A first-class R3F demo
+  (route `/react`, source under `src/react/`) renders real Gaussian splats and
+  runs the full FAST NAV pipeline (floor field -> navmesh -> crowd -> click-to-move)
+  on the same engine-agnostic WASM core and `recast-navigation` crowd as the
+  Babylon showcase, proving the core is rendering-engine-agnostic.
+- **Engine-specific integration guide sections.** `docs/INTEGRATION.md` now has
+  dedicated Babylon.js and React Three Fiber sections (handedness / `flip_y`
+  contract, crowd + click-to-move, top-down framing) with links to the live demos.
+
+### Changed
+
+- **R3F demo reuses the persistent navmesh cache.** The React pipeline now uses
+  the same IndexedDB navmesh artifact cache (`src/navigation/navmeshCache.ts`) as
+  the Babylon workbench and Vuetify demo, so revisiting a splat with unchanged
+  settings skips parse -> prune -> field -> Recast.
+
 ## [0.3.1] - 2026-06-21
 
 ### Fixed

@@ -5,6 +5,15 @@ into any engine or framework. For the exhaustive per-entry-point reference (unit
 ranges, cell states, coordinate contract), see [`wasm-api.md`](wasm-api.md). This
 guide shows the common paths end to end.
 
+**SplatWalk is rendering-engine-agnostic.** The core is a Rust/WASM library with
+**no dependency on any 3D engine, renderer, or UI framework** - it takes splat
+bytes in and returns meshes, navmesh-ready geometry, bounds, and SOG/GLB out, in
+a documented coordinate space you control via `flip_y` / `output_space`. The same
+core drives every reference integration in this repo: the **Babylon.js** showcase
+(section 9) and the **React Three Fiber / three.js** demo (section 10) call the
+identical WASM entry points and the shared, engine-free floor module - only the
+rendering and the `recast-navigation` crowd glue differ per engine.
+
 `@splatwalk/core` is **MIT-licensed and free forever**, including for commercial
 and proprietary use - see [`../LICENSING.md`](../LICENSING.md).
 
@@ -56,7 +65,7 @@ import {
 if (splatwalk_api_version() !== 2) throw new Error('Unsupported SplatWalk binary');
 
 const caps = splatwalk_capabilities();        // e.g. ['room_floor_mesh', 'recast_config', ...]
-const version = splatwalk_version();          // tracks the crate version, e.g. '0.3.0'
+const version = splatwalk_version();          // tracks the crate version, e.g. '0.3.2'
 
 if (!caps.includes('room_floor_mesh')) {
   // Fall back to the multi-step field path instead of the one-call entry point.

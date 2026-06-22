@@ -27,6 +27,7 @@ services:
         - package.json
         - vite.config.ts
         - tsconfig.json
+        - tsconfig.react.json
         - Dockerfile
         - nginx.conf
         - nginx.conf.template
