@@ -1,6 +1,7 @@
 import { Viewer } from '../scene/Viewer';
 import { DropZone } from '../components/DropZone';
 import { splatwalk, type GroundFieldCellState, type MeshSettings } from '../wasm/bridge';
+import { normalizeSplatToPly, isSupportedSplatFile } from '../wasm/normalize';
 import { SliceArchive } from '../wasm/sliceArchive';
 import { DEFAULT_AUTO_SLICE_THRESHOLD, type SliceSettings } from '../wasm/sogTypes';
 import { Mesh, VertexData, StandardMaterial, Color3, Tools, Material } from '@babylonjs/core';
@@ -376,8 +377,8 @@ async function main() {
         const handleFileLoad = async (file: File) => {
             console.log(`[INFO] Loading file: ${file.name} (${file.size} bytes)`);
 
-            if (!file.name.toLowerCase().endsWith('.ply') && !file.name.toLowerCase().endsWith('.spz')) {
-                logError("Only .ply and .spz files are supported.");
+            if (!isSupportedSplatFile(file.name)) {
+                logError("Only .ply, .spz, and .splat files are supported.");
                 return;
             }
 
@@ -390,47 +391,38 @@ async function main() {
 
             console.log("[WAIT] Processing file...");
 
-            // 1. Visualize input splat
-            await viewer.loadGaussianSplat(file);
+            // Normalize any supported splat (.ply/.spz/.splat) to full-fidelity PLY
+            // once, then reuse those bytes for both the viewer and the nav pipeline.
+            // This is the single ingest seam: Babylon only ever loads PLY (no
+            // CDN-backed .spz loader), and non-PLY formats are converted in WASM.
+            let splatBytesPromise: Promise<Uint8Array> | null = null;
+
+            const readSplatBytes = async (): Promise<Uint8Array> => {
+                if (!splatBytesPromise) {
+                    splatBytesPromise = (async () => {
+                        const ext = file.name.toLowerCase().match(/\.(spz|splat)$/)?.[1];
+                        if (ext) {
+                            console.log(`[INFO] Detected .${ext} file. Normalizing to .ply...`);
+                        }
+                        const ply = await normalizeSplatToPly(file);
+                        if (ext) {
+                            console.log(`[INFO] Normalized .${ext} to ${ply.byteLength}-byte .ply.`);
+                        }
+                        return ply;
+                    })();
+                }
+
+                return splatBytesPromise;
+            };
+
+            // 1. Visualize input splat (from the normalized PLY bytes).
+            await viewer.loadGaussianSplat(await readSplatBytes());
             currentMesh = null;
             currentMat = null;
             importedColliderGeometry = null;
             if (colliderGlbInput) colliderGlbInput.value = '';
             setColliderGlbLabel(null);
             console.log("[INFO] Input splat visualized. Ready for setup.");
-
-            let splatBytesPromise: Promise<Uint8Array> | null = null;
-
-            const readSplatBytes = async (): Promise<Uint8Array> => {
-                if (!splatBytesPromise) {
-                    splatBytesPromise = (async () => {
-                        let buffer: ArrayBuffer;
-
-                        if (file.name.toLowerCase().endsWith('.spz')) {
-                            console.log("[INFO] Detected .spz file. Decompressing...");
-                            if ('DecompressionStream' in window) {
-                                const ds = new DecompressionStream('gzip');
-                                const decompressedStream = file.stream().pipeThrough(ds);
-                                buffer = await new Response(decompressedStream).arrayBuffer();
-                                console.log(`[INFO] Decompressed .spz to ${buffer.byteLength} bytes.`);
-                            } else {
-                                throw new Error("Browser does not support DecompressionStream. Cannot read .spz files.");
-                            }
-                            // Normalize SPZ to a full-fidelity PLY so the entire nav pipeline
-                            // only ever deals with PLY (basic .spz support).
-                            console.log("[INFO] Converting .spz to .ply (preserving spherical harmonics)...");
-                            const ply = await splatwalk.spzToPly(new Uint8Array(buffer));
-                            console.log(`[INFO] Converted .spz to ${ply.byteLength}-byte .ply.`);
-                            return ply;
-                        }
-
-                        buffer = await file.arrayBuffer();
-                        return new Uint8Array(buffer);
-                    })();
-                }
-
-                return splatBytesPromise;
-            };
 
             // --- Streamed SOG export (per loaded file) ---------------------
             const sogStatus = document.getElementById('sogExportStatus');
@@ -457,7 +449,7 @@ async function main() {
                             ? await splatwalk.sliceSplat(bytes, settings)
                             : await splatwalk.convertToSog(bytes, settings);
                         const archive = new SliceArchive(result);
-                        const base = file.name.replace(/\.(ply|spz)$/i, '');
+                        const base = file.name.replace(/\.(ply|spz|splat)$/i, '');
                         archive.download(`${base}-sog`);
                         const mb = (archive.byteLength / 1e6).toFixed(1);
                         console.log(`[INFO] Exported ${archive.fileCount} file(s), ${archive.chunkCount} chunk(s), ${mb} MB.`);
@@ -987,7 +979,7 @@ async function main() {
                     const url = URL.createObjectURL(blob);
                     const a = document.createElement('a');
                     a.href = url;
-                    a.download = `${file.name.replace(/\.(ply|spz)$/i, "")}.nav`;
+                    a.download = `${file.name.replace(/\.(ply|spz|splat)$/i, "")}.nav`;
                     a.click();
                     URL.revokeObjectURL(url);
                     console.log("[Main] NavMesh binary download started.");
@@ -1291,7 +1283,7 @@ async function main() {
 
                             newBtn.addEventListener('click', async () => {
                                 console.log("[WAIT] Downloading GLB...");
-                                const name = file.name.replace(/\.(ply|spz)$/i, "");
+                                const name = file.name.replace(/\.(ply|spz|splat)$/i, "");
                                 try {
                                     await viewer.exportGLB(name);
                                     console.log("[INFO] Download started.");
@@ -1358,7 +1350,7 @@ async function main() {
                                 const url = URL.createObjectURL(blob);
                                 const a = document.createElement('a');
                                 a.href = url;
-                                a.download = `${file.name.replace(/\.(ply|spz)$/i, "")}.nav`;
+                                a.download = `${file.name.replace(/\.(ply|spz|splat)$/i, "")}.nav`;
                                 a.click();
                                 URL.revokeObjectURL(url);
                                 console.log("[Main] NavMesh binary download started.");

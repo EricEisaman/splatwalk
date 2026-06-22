@@ -79,7 +79,14 @@ export class Viewer {
     private splatMeshes: AbstractMesh[] = [];
     private rotation: { x: number, y: number, z: number } = { x: 0, y: 0, z: 0 };
 
-    public async loadGaussianSplat(file: File): Promise<void> {
+    /**
+     * Visualize a splat from full-fidelity binary 3DGS PLY bytes. Non-PLY formats
+     * (`.spz`, `.splat`) are normalized to PLY upstream (see `@/wasm/normalize`),
+     * so Babylon only ever drives its PLY loader here. This avoids Babylon's `.spz`
+     * loader, which fetches a third-party decoder from a CDN at runtime (blocked by
+     * the app CSP), and keeps splat orientation consistent across input formats.
+     */
+    public async loadGaussianSplat(plyBytes: Uint8Array): Promise<void> {
         try {
             this.disableRegionSelection();
             this.clearGroundFieldOverlay();
@@ -95,21 +102,15 @@ export class Viewer {
             this.splatMesh = null;
             this.splatMeshes = [];
 
-            // BabylonJS 7+ supports loading .ply and .spz directly via SceneLoader if correct loaders are imported
-            // We can use the file object directly
-            const result = await SceneLoader.ImportMeshAsync("", "", file, this.scene);
+            // Always load PLY: the normalized bytes are wrapped as a `.ply` File so
+            // Babylon selects its PLY loader (no CDN-backed loaders involved).
+            const plyFile = new File([plyBytes as BlobPart], 'scene.ply', { type: 'application/octet-stream' });
+            const result = await SceneLoader.ImportMeshAsync("", "", plyFile, this.scene);
 
             if (result.meshes.length > 0) {
                 // Usually the first mesh is the root or the splat
                 this.splatMesh = result.meshes[0];
                 this.splatMeshes = result.meshes;
-
-                // SPZ orientation correction (Niantic SPZ is often 180deg flipped on X relative to Babylon/PLY)
-                if (file.name.toLowerCase().endsWith('.spz')) {
-                    console.log("[Viewer] SPZ detected - applying auto-orientation flip (180deg X)");
-                    this.rotateSplat('x');
-                    this.rotateSplat('x'); // 90 + 90 = 180
-                }
 
                 // Auto-focus the camera
                 const worldExtends = this.scene.getWorldExtends();

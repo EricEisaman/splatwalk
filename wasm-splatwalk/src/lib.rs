@@ -43,6 +43,7 @@ pub const CAPABILITIES: &[&str] = &[
     "output_space",
     "recast_config",
     "progress_callback",
+    "splat_ingest",
 ];
 
 /// Semantic version of the WASM core build. Tracks `Cargo.toml`'s `version` so a
@@ -1042,6 +1043,15 @@ pub fn convert_to_sog(data: &[u8], settings: JsValue) -> Result<JsValue, JsValue
 #[wasm_bindgen]
 pub fn spz_to_ply(data: &[u8]) -> Result<Vec<u8>, JsValue> {
     let cloud = splat::parse_full_cloud(data).map_err(|e| JsValue::from_str(&e))?;
+    Ok(splat::write_ply(&cloud))
+}
+
+/// Convert an antimatter15 `.splat` buffer to a binary little-endian 3DGS `.ply`.
+/// The `.splat` format carries no spherical harmonics, so the output is SH degree
+/// 0. Normalizes `.splat` input to PLY for the viewer and nav pipeline.
+#[wasm_bindgen]
+pub fn splat_to_ply(data: &[u8]) -> Result<Vec<u8>, JsValue> {
+    let cloud = splat::parse_splat_buffer(data).map_err(|e| JsValue::from_str(&e))?;
     Ok(splat::write_ply(&cloud))
 }
 

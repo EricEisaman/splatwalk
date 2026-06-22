@@ -9,6 +9,7 @@ import init, {
     get_splat_bounds,
     mesh_to_glb,
     slice_splat,
+    splat_to_ply,
     spz_to_ply,
     suggest_region,
 } from '../../pkg/wasm_splatwalk/wasm_splatwalk.js';
@@ -135,6 +136,12 @@ ctx.onmessage = async (e: MessageEvent): Promise<void> => {
 
         if (type === 'spzToPly') {
             const ply = spz_to_ply(currentData);
+            ctx.postMessage({ kind: 'result', id, ok: true, result: ply }, [ply.buffer as ArrayBuffer]);
+            return;
+        }
+
+        if (type === 'splatToPly') {
+            const ply = splat_to_ply(currentData);
             ctx.postMessage({ kind: 'result', id, ok: true, result: ply }, [ply.buffer as ArrayBuffer]);
             return;
         }

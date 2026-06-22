@@ -4,6 +4,7 @@ import NavWorker from '@/navigation/navmesh.worker?worker';
 import type { Viewer } from '@/scene/Viewer';
 import { buildNavmeshKey, getNavmesh, putNavmesh } from '@/navigation/navmeshCache';
 import { splatwalk, type MeshSettings } from '@/wasm/bridge';
+import { normalizeSplatToPly } from '@/wasm/normalize';
 import {
   extractFloorFieldWithRecovery,
   resolveRecovery,
@@ -197,23 +198,12 @@ export interface NavIslandMetadata {
 }
 
 /**
- * Read splat bytes from a `.ply` or `.spz` file. `.spz` files are gzip-compressed
- * and decompressed in-browser via `DecompressionStream`, then normalized to a
- * full-fidelity `.ply` via the WASM `spzToPly` so the rest of the pipeline only
- * ever deals with PLY. Requires the WASM to be initialized for `.spz` input.
+ * Read splat bytes from a `.ply`, `.spz`, or `.splat` file, normalized to a
+ * full-fidelity `.ply` via the WASM ingest seam so the rest of the pipeline only
+ * ever deals with PLY. Requires the WASM to be initialized for non-PLY input.
  */
 export async function readSplatBytes(file: File): Promise<Uint8Array> {
-  if (file.name.toLowerCase().endsWith('.spz')) {
-    if (!('DecompressionStream' in window)) {
-      throw new Error('Browser does not support DecompressionStream. Cannot read .spz files.');
-    }
-    const ds = new DecompressionStream('gzip');
-    const decompressedStream = file.stream().pipeThrough(ds);
-    const decompressed = new Uint8Array(await new Response(decompressedStream).arrayBuffer());
-    return splatwalk.spzToPly(decompressed);
-  }
-
-  return new Uint8Array(await file.arrayBuffer());
+  return normalizeSplatToPly(file);
 }
 
 /**

@@ -24,6 +24,36 @@ Every v2 result advertises a `capabilities` string array. Current flags:
 | `output_space` | honours `settings.output_space` (opt-in handedness / up-axis / winding) |
 | `recast_config` | exposes `recast_agent_defaults()` and `recast_config()` |
 | `progress_callback` | exposes `set_progress_callback()` (opt-in structured progress) |
+| `splat_ingest` | exposes `splat_to_ply` (antimatter15 `.splat` -> PLY normalization) alongside `spz_to_ply` |
+
+## [Unreleased]
+
+### Added
+
+- **`.splat` (antimatter15) input support.** A new WASM `splat_to_ply` entry point
+  (capability `splat_ingest`) decodes the fixed 32-byte `.splat` record into a
+  full-fidelity 3DGS PLY (positions, log-space scale, SH0 DC color, opacity logit,
+  renormalized rotation; SH degree 0). `.splat` joins `.ply` and `.spz` everywhere
+  in the app and pipeline.
+
+### Changed
+
+- **Single splat ingest seam: everything is normalized to PLY first.** `.spz` and
+  `.splat` are now converted to PLY at one boundary (`src/wasm/normalize.ts`,
+  `normalizeSplatToPly`), and the Babylon viewer is fed those PLY bytes. The viewer
+  only ever drives Babylon's PLY loader, so a dropped splat no longer depends on the
+  source format's loader path.
+
+### Fixed
+
+- **`.spz` load no longer violates the Content Security Policy.** Babylon's `.spz`
+  loader fetches a third-party decoder from a CDN at runtime, which the app CSP
+  (`script-src 'self' ...`) blocks. Normalizing `.spz` to PLY in WASM before
+  visualization removes the CDN dependency entirely, so `.spz` files load and render.
+- **Removed the `.spz`-only 180°-X visual rotation hack.** Because `.spz` is now
+  loaded as a normalized PLY (same convention as a native PLY), the special-case
+  rotation is gone and splat orientation is consistent across `.ply` / `.spz` /
+  `.splat`.
 
 ## [0.3.2] - 2026-06-22
 

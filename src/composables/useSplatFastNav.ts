@@ -11,6 +11,7 @@ import {
   type FastNavPhase,
 } from '@/navigation/fastNav';
 import { splatwalk, type MeshSettings } from '@/wasm/bridge';
+import { SUPPORTED_SPLAT_EXTENSIONS } from '@/wasm/normalize';
 import { SliceArchive } from '@/wasm/sliceArchive';
 import type { SliceSettings } from '@/wasm/sogTypes';
 import type { UseBabylonViewer } from '@/composables/useBabylonViewer';
@@ -88,7 +89,7 @@ export interface UseSplatFastNav {
   readonly reset: () => void;
 }
 
-const SUPPORTED_EXTENSIONS = ['.ply', '.spz'] as const;
+const SUPPORTED_EXTENSIONS = SUPPORTED_SPLAT_EXTENSIONS;
 
 function parseLog(message: string): LogEntry {
   const match = /^\[(INFO|WAIT|WARN|ERROR|SUCCESS|WORKER)\]\s*/.exec(message);
@@ -107,7 +108,7 @@ export function useSplatFastNav(
   options: UseSplatFastNavOptions = {}
 ): UseSplatFastNav {
   const status = ref<FastNavStatus>('idle');
-  const statusMessage = ref('Drop a .ply or .spz splat to begin.');
+  const statusMessage = ref('Drop a .ply, .spz, or .splat splat to begin.');
   const errorMessage = ref<string | null>(null);
   const logs = ref<LogEntry[]>([]);
   const phase = ref<FastNavUiPhase>('idle');
@@ -131,7 +132,7 @@ export function useSplatFastNav(
 
   const reset = (): void => {
     status.value = 'idle';
-    statusMessage.value = 'Drop a .ply or .spz splat to begin.';
+    statusMessage.value = 'Drop a .ply, .spz, or .splat splat to begin.';
     errorMessage.value = null;
     logs.value = [];
     phase.value = 'idle';
@@ -144,7 +145,7 @@ export function useSplatFastNav(
   const processFile = async (file: File): Promise<void> => {
     const name = file.name.toLowerCase();
     if (!SUPPORTED_EXTENSIONS.some((ext) => name.endsWith(ext))) {
-      errorMessage.value = 'Only .ply and .spz splat files are supported.';
+      errorMessage.value = 'Only .ply, .spz, and .splat splat files are supported.';
       status.value = 'error';
       return;
     }
@@ -162,12 +163,14 @@ export function useSplatFastNav(
         wasmReady = true;
       }
 
-      await viewer.loadGaussianSplat(file);
+      // Normalize to PLY once (WASM is ready above), then reuse the same bytes
+      // for both the viewer and the nav pipeline.
+      const bytes = await readSplatBytes(file);
+      await viewer.loadGaussianSplat(bytes);
       appendLog('[INFO] Splat visualized.');
 
-      const bytes = await readSplatBytes(file);
       currentBytes = bytes;
-      currentName = file.name.replace(/\.(ply|spz)$/i, '');
+      currentName = file.name.replace(/\.(ply|spz|splat)$/i, '');
       // Capture the raw splat count for the export UI (cheap: the parse is cached
       // and reused by the FAST NAV run below).
       try {

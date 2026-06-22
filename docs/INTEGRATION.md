@@ -256,8 +256,16 @@ const flip_y = (mesh.scaling?.y ?? 1) < 0;   // true for a standard splat import
 const floor = build_room_floor_mesh(splatBytes, { mode: 2, flip_y, rotation });
 ```
 
-For `.spz`, Niantic's convention is often rotated 180° on X relative to
-Babylon/PLY; apply that as a `rotation`, not as an output offset.
+**One loader path: normalize non-PLY formats to PLY at ingest.** The showcase
+converts `.spz` (Niantic) and `.splat` (antimatter15) to a full-fidelity PLY in
+WASM *before* visualization (`src/wasm/normalize.ts` → `splatwalk.spzToPly` /
+`splatToPly`), then hands those PLY bytes to `SceneLoader.ImportMeshAsync`. This
+keeps Babylon on its **PLY loader only** (so `.spz` does not pull a CDN-hosted
+decoder, which a strict CSP blocks), and — because every format now goes through
+the same loader — splat orientation is a single, stable loader decision. That is
+why `isSplatYFlipped()` (the `mesh.scaling.y` sign above) is the correct single
+source of truth for `flip_y`: the core cannot report it, since a 3DGS PLY header
+carries no chirality/up-axis and the Y-flip is applied by Babylon, not by parsing.
 
 **Crowd + click-to-move.** Build the navmesh with `recast-navigation`
 `importNavMesh`, then a `Crowd` with `CrowdAgent`s (player radius `0.5`,
@@ -355,3 +363,5 @@ addressed as of v0.3.0:
 | Structured progress callback | Met - `set_progress_callback()` |
 | Published, versioned package | Resolved in v0.3.0 - `@splatwalk/core` on npm |
 | Non-AGPL embedding path | Resolved in v0.3.0 - MIT core, free forever (see `../LICENSING.md`) |
+| `.spz` / `.splat` input without a CDN | Met - normalized to PLY in WASM at ingest (`spz_to_ply` / `splat_to_ply`, capability `splat_ingest`) |
+| Report the parsed splat orientation on the result (derive `flip_y` from the core instead of `mesh.scaling.y`) | Not applicable by design - a 3DGS PLY header carries no chirality/up-axis to report, and the render-space Y-flip is the renderer's loader decision, not a parse result. The core would only echo the `flip_y` you pass in. Detect it once from your renderer's splat transform (Babylon: `mesh.scaling.y < 0`); normalizing every format to one PLY loader path keeps that read stable. |

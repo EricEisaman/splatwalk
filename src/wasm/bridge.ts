@@ -456,6 +456,15 @@ export class SplatWalkBridge {
         return this.call<Uint8Array>('spzToPly', {});
     }
 
+    /**
+     * Convert an antimatter15 `.splat` buffer to a full-fidelity binary `.ply`.
+     * Used to normalize `.splat` input to PLY for the viewer + nav pipeline.
+     */
+    public async splatToPly(data: Uint8Array): Promise<Uint8Array> {
+        await this.ensureLoaded(data);
+        return this.call<Uint8Array>('splatToPly', {});
+    }
+
     private toSliceResult(raw: SliceResultRaw): SliceResult {
         return {
             files: new Map(raw.files),

@@ -602,6 +602,88 @@ fn parse_full_cloud_ply(data: &[u8]) -> Result<FullSplatCloud, String> {
     Ok(cloud)
 }
 
+/// Parse an antimatter15 `.splat` buffer into a full-fidelity [`FullSplatCloud`].
+///
+/// The `.splat` format is a flat array of fixed 32-byte records with no header:
+/// `[0..12)` position (3x `f32`), `[12..24)` linear scale (3x `f32`), `[24..28)`
+/// RGBA (4x `u8`, alpha = linear opacity), `[28..32)` quaternion (4x `u8`, each
+/// `q*128 + 128`, order `(w, x, y, z)`). It carries no spherical harmonics, so
+/// the resulting cloud is SH degree 0. Values are converted back into 3DGS/PLY
+/// conventions (log-space scale, raw opacity logit, DC color as an SH0
+/// coefficient) so [`write_ply`] round-trips it into a standard 3DGS PLY.
+pub fn parse_splat_buffer(data: &[u8]) -> Result<FullSplatCloud, String> {
+    const RECORD: usize = 32;
+    if data.is_empty() || data.len() % RECORD != 0 {
+        return Err(format!(
+            "Invalid .splat buffer: length {} is not a positive multiple of {}",
+            data.len(),
+            RECORD
+        ));
+    }
+
+    let n = data.len() / RECORD;
+    let mut cloud = FullSplatCloud {
+        sh_degree: 0,
+        positions: Vec::with_capacity(n),
+        scales: Vec::with_capacity(n),
+        rotations: Vec::with_capacity(n),
+        opacity_logit: Vec::with_capacity(n),
+        sh0: Vec::with_capacity(n),
+        sh_rest: Vec::new(),
+    };
+
+    let read_f32 = |b: &[u8]| f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+
+    for i in 0..n {
+        let r = &data[i * RECORD..(i + 1) * RECORD];
+
+        let position = [read_f32(&r[0..4]), read_f32(&r[4..8]), read_f32(&r[8..12])];
+
+        // `.splat` stores linear scale; 3DGS PLY stores log-space scale. Guard
+        // against non-positive values before the log.
+        let scale = [
+            read_f32(&r[12..16]).max(1e-9).ln(),
+            read_f32(&r[16..20]).max(1e-9).ln(),
+            read_f32(&r[20..24]).max(1e-9).ln(),
+        ];
+
+        // Color: 0..255 sRGB-ish DC -> SH0 coefficient. Alpha: linear opacity
+        // 0..1 -> raw logit (inverse sigmoid), clamped off the asymptotes.
+        let sh0 = [
+            (r[24] as f32 / 255.0 - 0.5) / SH_C0,
+            (r[25] as f32 / 255.0 - 0.5) / SH_C0,
+            (r[26] as f32 / 255.0 - 0.5) / SH_C0,
+        ];
+        let alpha = (r[27] as f32 / 255.0).clamp(1e-6, 1.0 - 1e-6);
+        let opacity_logit = (alpha / (1.0 - alpha)).ln();
+
+        // Quaternion: u8 `q*128 + 128` -> `[-1, 1]`, order (w, x, y, z), renormalized.
+        let mut q = [
+            (r[28] as f32 - 128.0) / 128.0,
+            (r[29] as f32 - 128.0) / 128.0,
+            (r[30] as f32 - 128.0) / 128.0,
+            (r[31] as f32 - 128.0) / 128.0,
+        ];
+        let norm = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+        if norm > 1e-9 {
+            for c in &mut q {
+                *c /= norm;
+            }
+        } else {
+            q = [1.0, 0.0, 0.0, 0.0];
+        }
+
+        cloud.positions.push(position);
+        cloud.scales.push(scale);
+        cloud.rotations.push(q);
+        cloud.opacity_logit.push(opacity_logit);
+        cloud.sh0.push(sh0);
+    }
+
+    console::log_1(&format!("Parsed {} splats from .splat (SH degree 0)", n).into());
+    Ok(cloud)
+}
+
 /// Serialize a [`FullSplatCloud`] to a binary little-endian 3DGS `.ply` buffer.
 /// Powers inline `.spz -> .ply` conversion so the rest of the app (Babylon
 /// viewer + nav pipeline) only ever has to deal with PLY.
@@ -667,4 +749,77 @@ pub fn write_ply(cloud: &FullSplatCloud) -> Vec<u8> {
 #[inline]
 fn push_f32(out: &mut Vec<u8>, v: f32) {
     out.extend_from_slice(&v.to_le_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+
+    /// Build a single antimatter15 `.splat` record (32 bytes).
+    fn splat_record(
+        pos: [f32; 3],
+        scale_linear: [f32; 3],
+        rgba: [u8; 4],
+        rot_bytes: [u8; 4],
+    ) -> Vec<u8> {
+        let mut r = Vec::with_capacity(32);
+        for v in pos {
+            r.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in scale_linear {
+            r.extend_from_slice(&v.to_le_bytes());
+        }
+        r.extend_from_slice(&rgba);
+        r.extend_from_slice(&rot_bytes);
+        r
+    }
+
+    #[wasm_bindgen_test]
+    fn splat_buffer_parses_to_cloud_in_ply_conventions() {
+        // Linear scale 1.0 -> log 0; identity quaternion (w byte clamps to 255).
+        let buf = splat_record([1.0, 2.0, 3.0], [1.0, 1.0, 1.0], [128, 64, 32, 255], [255, 128, 128, 128]);
+        let cloud = parse_splat_buffer(&buf).expect("valid .splat record");
+
+        assert_eq!(cloud.len(), 1);
+        assert_eq!(cloud.sh_degree, 0);
+
+        let p = cloud.positions[0];
+        assert!((p[0] - 1.0).abs() < 1e-6 && (p[1] - 2.0).abs() < 1e-6 && (p[2] - 3.0).abs() < 1e-6);
+
+        // Linear scale 1.0 -> ln(1.0) == 0 in log space.
+        for s in cloud.scales[0] {
+            assert!(s.abs() < 1e-6, "expected log-space scale ~0, got {s}");
+        }
+
+        // Quaternion renormalized to identity (w ~ 1, xyz ~ 0).
+        let q = cloud.rotations[0];
+        assert!((q[0] - 1.0).abs() < 1e-3, "expected w~1, got {}", q[0]);
+        assert!(q[1].abs() < 1e-3 && q[2].abs() < 1e-3 && q[3].abs() < 1e-3);
+    }
+
+    #[wasm_bindgen_test]
+    fn splat_round_trips_through_write_ply() {
+        let mut buf = Vec::new();
+        buf.extend(splat_record([1.0, 2.0, 3.0], [0.5, 0.5, 0.5], [200, 100, 50, 200], [255, 128, 128, 128]));
+        buf.extend(splat_record([-4.0, 5.0, -6.0], [2.0, 1.0, 0.25], [10, 20, 30, 40], [128, 255, 128, 128]));
+
+        let cloud = parse_splat_buffer(&buf).expect("valid .splat buffer");
+        let ply = write_ply(&cloud);
+        let points = parse_ply(&ply).expect("re-parse generated PLY");
+
+        assert_eq!(points.len(), 2);
+        assert!((points[0].point.x - 1.0).abs() < 1e-5);
+        assert!((points[0].point.y - 2.0).abs() < 1e-5);
+        assert!((points[0].point.z - 3.0).abs() < 1e-5);
+        assert!((points[1].point.x + 4.0).abs() < 1e-5);
+        assert!((points[1].point.z + 6.0).abs() < 1e-5);
+    }
+
+    #[wasm_bindgen_test]
+    fn splat_buffer_rejects_misaligned_length() {
+        assert!(parse_splat_buffer(&[]).is_err());
+        assert!(parse_splat_buffer(&[0u8; 31]).is_err());
+        assert!(parse_splat_buffer(&[0u8; 33]).is_err());
+    }
 }

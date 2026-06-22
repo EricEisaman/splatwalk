@@ -2,7 +2,7 @@
 
 A React Three Fiber integration of the SplatWalk FAST NAV pipeline, mirroring the
 Vuetify showcase but rendering with three.js instead of Babylon. It loads a
-`.ply` / `.spz` Gaussian splat, renders it with
+`.ply` / `.spz` / `.splat` Gaussian splat, renders it with
 [`@mkkellogg/gaussian-splats-3d`](https://github.com/mkkellogg/GaussianSplats3D),
 extracts the walkable floor with the SplatWalk WASM core, builds a Recast
 navmesh, and runs a click-to-move crowd (player + NPC) via
@@ -26,7 +26,7 @@ Then open the demo route:
 
 - http://localhost:5173/react
 
-Drop a `.ply` / `.spz` splat (or pick an example scene). FAST NAV runs
+Drop a `.ply` / `.spz` / `.splat` splat (or pick an example scene). FAST NAV runs
 automatically: floor field -> floor mesh -> Recast navmesh -> crowd + NPC. Click
 the green navmesh overlay to move the blue player agent; the green NPC shares the
 crowd.

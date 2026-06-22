@@ -16,7 +16,7 @@
 
 </div>
 
-**SplatWalk** turns raw **`.spz`** and **`.ply`** Gaussian splats into production-ready, *navigable* 3D: optimized **`.glb` ground meshes** and **Recast-compatible navmesh binaries** — built either from a one-click fast floor-field path or from a dedicated collision basis.
+**SplatWalk** turns raw **`.ply`**, **`.spz`**, and **`.splat`** Gaussian splats into production-ready, *navigable* 3D: optimized **`.glb` ground meshes** and **Recast-compatible navmesh binaries** — built either from a one-click fast floor-field path or from a dedicated collision basis.
 
 At its heart is a single **Rust-to-WASM core** with **zero dependency on any 3D engine, renderer, or UI framework**. It takes splat bytes in and returns meshes, navmesh-ready geometry, bounds, and SOG/GLB out — in a coordinate space *you* control. The mission is simple: give engineers and designers high-performance Gaussian Splat tooling that empowers them to ship real 3D applications, on whatever stack they already love.
 
@@ -31,7 +31,7 @@ The engine-free WASM core is the product; renderers are just consumers. The **sa
 
 ```mermaid
 flowchart LR
-    splat["Splat bytes (.spz / .ply)"] --> core["SplatWalk WASM core (Rust)"]
+    splat["Splat bytes (.ply / .spz / .splat)"] --> core["SplatWalk WASM core (Rust)"]
     core --> babylon["Babylon.js showcase"]
     core --> three["three.js / R3F demo"]
     core --> headless["Binary-only / headless"]
@@ -57,7 +57,7 @@ One **`FAST NAV`** click takes a raw splat all the way to a walkable navmesh wit
 - **2.5D SDF Diagnostics** — Browser-side column fields power the fast floor path and stay available under experimental debug for inspecting accepted, obstacle, variance, and rejected cells.
 - **Mesh Reconstruction** — Integrated Poisson reconstruction for full geometry.
 - **Streamed SOG Export** — Convert a splat into a SOG bundle — a single `meta.json` set or a streamed, Morton-ordered multi-chunk `lod-meta.json` set with lossless WebP planes — decodable by Babylon's SOG loaders and aimed at the GS streaming loader (PR #18563). Full spherical harmonics (configurable degree); large scenes (>1M splats) default to streamed LOD. See [`docs/wasm-api.md`](docs/wasm-api.md) and [`MILESTONES.md`](MILESTONES.md).
-- **Basic `.spz` Support** — `.spz` is normalized to a full-fidelity `.ply` (`spz_to_ply`) so the viewer and nav pipeline only ever deal with PLY.
+- **`.spz` / `.splat` Support** — `.spz` (Niantic) and `.splat` (antimatter15) are normalized to a full-fidelity `.ply` in WASM at ingest (`spz_to_ply` / `splat_to_ply`) so the viewer drives only Babylon's PLY loader (no CDN-hosted `.spz` decoder) and the nav pipeline only ever deals with PLY.
 - **One-Click Export** — Download production-ready `.glb` meshes and Recast-compatible navmesh binaries.
 
 ## Technology Stack

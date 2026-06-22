@@ -45,7 +45,7 @@
                     <strong>SplatWalk</strong> is a browser-based utility for turning <strong>3D Gaussian splat</strong>
                     scenes into game-ready assets: exportable <strong>.glb ground meshes</strong> and Recast-compatible
                     <strong>navmesh binaries</strong>. <strong>.ply</strong> is the primary supported input format;
-                    <strong>.spz</strong> import is available but not yet fully supported.
+                    <strong>.spz</strong> and <strong>.splat</strong> imports are converted to PLY on load.
                 </p>
                 <p>
                     Use <strong>FAST NAV</strong> to extract a walkable 2.5D floor field and bake click-to-move
@@ -59,8 +59,8 @@
             <div class="preprocess-section">
                 <h2>3D Workbench</h2>
                 <div class="viewer-description">
-                    <p>Drag and drop a <strong>.ply</strong> splat on the canvas (<strong>.spz</strong> experimental),
-                        use the file chooser, or select an example file to begin.</p>
+                    <p>Drag and drop a <strong>.ply</strong>, <strong>.spz</strong>, or <strong>.splat</strong> splat on the
+                        canvas, use the file chooser, or select an example file to begin.</p>
                     <div class="example-selector-container">
                         <label for="exampleSelect">SELECT EXAMPLE</label>
                         <select id="exampleSelect" class="cyber-select">
@@ -77,7 +77,7 @@
                         </select>
                         <div class="mobile-upload-divider">OR</div>
                         <button id="chooseFileBtn" class="cyber-button-pink">CHOOSE LOCAL FILE</button>
-                        <input type="file" id="localFileInput" accept=".ply,.spz" style="display: none;">
+                        <input type="file" id="localFileInput" accept=".ply,.spz,.splat" style="display: none;">
                     </div>
                 </div>
 

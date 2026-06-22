@@ -216,7 +216,7 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
           Gaussian Splat <span class="text-primary">FAST NAV</span>
         </div>
         <p class="text-body-2 text-medium-emphasis mb-4">
-          Drop a <strong>.ply</strong> or <strong>.spz</strong> 3D Gaussian Splat. It loads into Babylon.js, auto-runs
+          Drop a <strong>.ply</strong>, <strong>.spz</strong>, or <strong>.splat</strong> 3D Gaussian Splat. It loads into Babylon.js, auto-runs
           the FAST NAV pipeline (collider &rarr; navmesh &rarr; crowd &rarr; NPC), then frames the player top-down.
         </p>
 
@@ -267,7 +267,7 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
             <div class="text-center pa-8">
               <v-icon icon="mdi-cloud-upload-outline" size="72" color="primary" class="mb-3" />
               <div class="text-h6 font-weight-bold mb-2">Drop your splat here</div>
-              <div class="text-body-2 text-medium-emphasis mb-5">.ply or .spz · drag &amp; drop, browse, or pick an example</div>
+              <div class="text-body-2 text-medium-emphasis mb-5">.ply, .spz, or .splat · drag &amp; drop, browse, or pick an example</div>
               <div class="d-flex flex-wrap justify-center align-center ga-3">
                 <v-btn color="primary" size="large" prepend-icon="mdi-folder-open" @click="onBrowse">
                   Browse files
@@ -425,7 +425,7 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
     <input
       ref="fileInputRef"
       type="file"
-      accept=".ply,.spz"
+      accept=".ply,.spz,.splat"
       class="d-none"
       @change="onFileChange"
     >

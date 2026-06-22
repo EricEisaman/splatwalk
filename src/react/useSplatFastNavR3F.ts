@@ -9,6 +9,7 @@ import {
 } from '@/navigation/floor';
 import { buildNavmeshKey, getNavmesh, putNavmesh } from '@/navigation/navmeshCache';
 import { splatwalk, type MeshSettings } from '@/wasm/bridge';
+import { normalizeSplatToPly, SUPPORTED_SPLAT_EXTENSIONS } from '@/wasm/normalize';
 import { SliceArchive } from '@/wasm/sliceArchive';
 import type { SliceSettings } from '@/wasm/sogTypes';
 import { SplatNavController } from '@/react/three/SplatNavController';
@@ -29,7 +30,7 @@ export interface FastNavProgress {
   readonly fraction: number | null;
 }
 
-const SUPPORTED_EXTENSIONS = ['.ply', '.spz'] as const;
+const SUPPORTED_EXTENSIONS = SUPPORTED_SPLAT_EXTENSIONS;
 
 /** Recast parameters + adaptive ladder, mirroring `FAST_NAV_RECAST_ATTEMPTS`. */
 interface RecastParams {
@@ -111,18 +112,9 @@ function parseLog(message: string): LogEntry {
   return { id: Date.now() + Math.random(), tag, message: text };
 }
 
-/** Read raw splat bytes; `.spz` is gunzipped + normalized to PLY via WASM. */
+/** Read raw splat bytes; `.spz` / `.splat` are normalized to PLY via WASM. */
 async function readSplatBytes(file: File): Promise<Uint8Array> {
-  if (file.name.toLowerCase().endsWith('.spz')) {
-    if (!('DecompressionStream' in window)) {
-      throw new Error('Browser does not support DecompressionStream; cannot read .spz files.');
-    }
-    const ds = new DecompressionStream('gzip');
-    const stream = file.stream().pipeThrough(ds);
-    const decompressed = new Uint8Array(await new Response(stream).arrayBuffer());
-    return splatwalk.spzToPly(decompressed);
-  }
-  return new Uint8Array(await file.arrayBuffer());
+  return normalizeSplatToPly(file);
 }
 
 function runNavWorker(
@@ -217,7 +209,7 @@ export function useSplatFastNavR3F() {
   const controller = useMemo(() => new SplatNavController(), []);
 
   const [status, setStatus] = useState<FastNavStatus>('idle');
-  const [statusMessage, setStatusMessage] = useState('Drop a .ply or .spz splat to begin.');
+  const [statusMessage, setStatusMessage] = useState('Drop a .ply, .spz, or .splat splat to begin.');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [phase, setPhase] = useState<FastNavUiPhase>('idle');
@@ -243,7 +235,7 @@ export function useSplatFastNavR3F() {
 
   const reset = useCallback((): void => {
     setStatus('idle');
-    setStatusMessage('Drop a .ply or .spz splat to begin.');
+    setStatusMessage('Drop a .ply, .spz, or .splat splat to begin.');
     setErrorMessage(null);
     setLogs([]);
     setPhase('idle');
@@ -257,7 +249,7 @@ export function useSplatFastNavR3F() {
   const processBytes = useCallback(
     async (bytes: Uint8Array, name: string): Promise<void> => {
       currentBytes.current = bytes;
-      currentName.current = name.replace(/\.(ply|spz)$/i, '');
+      currentName.current = name.replace(/\.(ply|spz|splat)$/i, '');
 
       if (!wasmReady.current) {
         appendLog('[WAIT] Initializing SplatWalk WASM...');
@@ -369,7 +361,7 @@ export function useSplatFastNavR3F() {
       if (isBusy) return;
       const name = file.name.toLowerCase();
       if (!SUPPORTED_EXTENSIONS.some((ext) => name.endsWith(ext))) {
-        setErrorMessage('Only .ply and .spz splat files are supported.');
+        setErrorMessage('Only .ply, .spz, and .splat splat files are supported.');
         setStatus('error');
         return;
       }

@@ -47,7 +47,7 @@ Every v2 result carries three compatibility fields:
 
 - `api_version` (currently `2`) — the **hard** data contract. Treat a mismatch as a fatal, fail-fast condition.
 - `semver` (e.g. `"0.2.0"`) — the semantic version of the WASM core build, tracking the crate version. Use it for logging, cache keys, and human-facing diagnostics.
-- `capabilities` — an additive `string[]` of supported features (`progress_protocol_v1`, `glb_export`, `room_floor_mesh`, `sog_export`, `streamed_sog`, `fast_nav_preset`, `output_space`, `recast_config`, `progress_callback`). Feature-detect against this list so additive changes (new entry points / fields) do not force a hard failure. Never assume a capability is present without checking; never fail solely because an unknown capability appears.
+- `capabilities` — an additive `string[]` of supported features (`progress_protocol_v1`, `glb_export`, `room_floor_mesh`, `sog_export`, `streamed_sog`, `fast_nav_preset`, `output_space`, `recast_config`, `progress_callback`, `splat_ingest`). Feature-detect against this list so additive changes (new entry points / fields) do not force a hard failure. Never assume a capability is present without checking; never fail solely because an unknown capability appears.
 
 For cheap **pre-flight** feature detection (before parsing any bytes), call the standalone exports `splatwalk_version()`, `splatwalk_api_version()`, and `splatwalk_capabilities()` — they return the same values that appear on a full result, without the cost of a parse/field build.
 
@@ -348,6 +348,17 @@ this to normalize `.spz` input to PLY so the viewer and nav pipeline only ever
 deal with PLY. `.spz` files are gzip-compressed; decompress them (e.g. via the
 browser `DecompressionStream`) before calling.
 
+### `splat_to_ply(bytes)`
+
+Convert an antimatter15 `.splat` buffer (a flat array of fixed 32-byte records,
+no header) to a full-fidelity binary little-endian 3DGS `.ply` (`Uint8Array`).
+The `.splat` format carries no spherical harmonics, so the output is SH degree 0;
+linear scale is converted to log space, RGBA to an SH0 DC coefficient + opacity
+logit, and the packed `u8` quaternion is renormalized. Capability `splat_ingest`.
+Together with `spz_to_ply`, this normalizes every supported input to PLY at one
+ingest boundary (`src/wasm/normalize.ts`), so the viewer drives only Babylon's
+PLY loader (no CDN-hosted `.spz` decoder) and the nav pipeline always sees PLY.
+
 ### Slice settings
 
 All fields are optional and fall back to the defaults below:
@@ -389,7 +400,8 @@ const dir = archive.createBlobDirectory();  // path -> blob: URL
 //    stream lod-meta.json by URL (no app code).
 ```
 
-`spz_to_ply` is exposed as `splatwalk.spzToPly(bytes)`.
+`spz_to_ply` / `splat_to_ply` are exposed as `splatwalk.spzToPly(bytes)` /
+`splatwalk.splatToPly(bytes)`.
 
 ### UI
 

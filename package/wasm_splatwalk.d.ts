@@ -454,6 +454,9 @@ export function convert_to_sog(data: Uint8Array, settings: SliceSettings): Slice
 /** Convert a `.spz` (or `.ply`) splat to a full-fidelity binary little-endian 3DGS `.ply`. */
 export function spz_to_ply(data: Uint8Array): Uint8Array;
 
+/** Convert an antimatter15 `.splat` buffer to a full-fidelity binary little-endian 3DGS `.ply` (SH degree 0). */
+export function splat_to_ply(data: Uint8Array): Uint8Array;
+
 // ---------------------------------------------------------------------------
 // wasm-bindgen init plumbing (kept loose; matches the generated `--target web` glue)
 // ---------------------------------------------------------------------------
