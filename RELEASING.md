@@ -18,12 +18,18 @@ From the repo root:
 npm login                              # your @splatwalk-org account (2FA)
 npm run build:wasm                     # ./scripts/build.sh         -> pkg/
 npm run build:package                  # ./scripts/build-package.sh -> dist-pkg/
-npm publish dist-pkg --access public --otp=XXXXXX   # XXXXXX = authenticator code
+npm publish ./dist-pkg --access public --otp=XXXXXX   # XXXXXX = authenticator code
 ```
+
+> Use the `./dist-pkg` path form (or `cd dist-pkg && npm publish ...`). A bare
+> `npm publish dist-pkg` is interpreted by npm 11 as a *package spec* (it tries to
+> fetch a package named `dist-pkg` and fails with `ENOVERSIONS`). Also publish the
+> assembled `dist-pkg/`, **not** the repo root — `npm publish` from the root
+> publishes the whole-repo `sigma-wasm` package, not the `@splatwalk/core` core.
 
 Verify at <https://www.npmjs.com/package/@splatwalk/core>. (You can also publish
 the `splatwalk-core-*.tgz` attached to the matching GitHub release instead of
-rebuilding: `npm publish splatwalk-core-x.y.z.tgz --access public --otp=XXXXXX`.)
+rebuilding: `npm publish ./splatwalk-core-x.y.z.tgz --access public --otp=XXXXXX`.)
 
 ## Cutting a release
 
