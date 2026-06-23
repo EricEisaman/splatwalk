@@ -269,7 +269,9 @@ export class Playground {
         const ring = BABYLON.MeshBuilder.CreateTorus('agentRing', { diameter: 1.3, thickness: 0.06, tessellation: 24 }, scene);
         const ringMat = new BABYLON.StandardMaterial('ringMat', scene);
         ringMat.emissiveColor = BABYLON.Color3.FromHexString(Playground.ACCENT);
-        ringMat.alpha = 0.85;
+        // Keep the ring OPAQUE (like the capsule): opaque meshes write depth, so
+        // the Gaussian splat depth-tests against them and occludes correctly
+        // (hidden behind splat walls/furniture, visible on the open floor).
         ring.material = ringMat;
         ring.parent = agentRoot;
         ring.position.y = 0.04;

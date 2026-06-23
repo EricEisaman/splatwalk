@@ -63,8 +63,11 @@ export class SplatNavController {
   private crowd: Crowd | null = null;
   private playerAgent: CrowdAgent | null = null;
   private playerMesh: THREE.Mesh | null = null;
+  private playerLabel: THREE.Sprite | null = null;
   private readonly npcAgents: CrowdAgent[] = [];
   private readonly npcMeshes: THREE.Mesh[] = [];
+  private readonly npcLabels: THREE.Sprite[] = [];
+  private readonly labelTmp = new THREE.Vector3();
 
   /** Splat extent in render/oriented space, used to frame the top-down view. */
   private sceneBounds: { min: number[]; max: number[] } | null = null;
@@ -145,11 +148,14 @@ export class SplatNavController {
       this.crowd.update(Math.min(dt, 0.1));
       if (this.playerAgent && this.playerMesh) {
         this.syncMesh(this.playerMesh, this.playerAgent);
+        if (this.playerLabel) this.updateLabel(this.playerLabel, this.playerMesh);
       }
       for (let i = 0; i < this.npcAgents.length; i++) {
         const mesh = this.npcMeshes[i];
         const agent = this.npcAgents[i];
         if (mesh && agent) this.syncMesh(mesh, agent);
+        const label = this.npcLabels[i];
+        if (label && mesh) this.updateLabel(label, mesh);
       }
     }
   }
@@ -256,6 +262,12 @@ export class SplatNavController {
     this.playerMesh = playerMesh;
     this.world?.add(playerMesh);
     this.syncMesh(playerMesh, this.playerAgent);
+
+    // PLAYER billboard label, matching the Babylon demos (blue "PLAYER" text).
+    const label = SplatNavController.makeLabelSprite('PLAYER', '#1a80ff');
+    this.handles.scene.add(label);
+    this.playerLabel = label;
+    this.updateLabel(label, playerMesh);
   }
 
   /** Spawn a single (green) NPC crowd agent near the given point or the player. */
@@ -278,6 +290,12 @@ export class SplatNavController {
     this.npcAgents.push(agent);
     this.npcMeshes.push(mesh);
     this.syncMesh(mesh, agent);
+
+    // NPC billboard label, matching the Babylon demos (green "NPC" text).
+    const label = SplatNavController.makeLabelSprite('NPC', '#33ff59');
+    this.handles.scene.add(label);
+    this.npcLabels.push(label);
+    this.updateLabel(label, mesh);
   }
 
   /**
@@ -375,6 +393,58 @@ export class SplatNavController {
     mesh.position.set(p.x, p.y + yOffset, p.z);
   }
 
+  /**
+   * Build a billboard text label that matches the Babylon demos' marker labels.
+   * Rendered as ALPHA-TESTED opaque (transparent: false + alphaTest) so it writes
+   * depth and the Gaussian splat depth-tests against it: stable at every camera
+   * angle/distance and correctly occluded when the agent is behind splat geometry
+   * - the same approach as `Viewer.attachMarkerLabel` (src/scene/Viewer.ts). Mips
+   * are disabled so the thin text's alpha is not minified below the alphaTest
+   * cutoff at distance (which would make it vanish when far away).
+   */
+  private static makeLabelSprite(text: string, colorHex: string): THREE.Sprite {
+    const w = 256;
+    const h = 96;
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d') as CanvasRenderingContext2D;
+    ctx.clearRect(0, 0, w, h);
+    ctx.font = 'bold 44px Arial';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = colorHex;
+    ctx.fillText(text, w / 2, h / 2);
+
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.generateMipmaps = false;
+    texture.minFilter = THREE.LinearFilter;
+    texture.magFilter = THREE.LinearFilter;
+    texture.colorSpace = THREE.SRGBColorSpace;
+
+    const material = new THREE.SpriteMaterial({
+      map: texture,
+      transparent: false,
+      alphaTest: 0.35,
+      depthTest: true,
+      depthWrite: true,
+    });
+    const sprite = new THREE.Sprite(material);
+    sprite.scale.set(0.9, 0.9 * (h / w), 1); // ~0.9m wide, preserve text aspect
+    return sprite;
+  }
+
+  /** Park a label just above its agent mesh (in world space). */
+  private updateLabel(label: THREE.Sprite, mesh: THREE.Mesh): void {
+    mesh.getWorldPosition(this.labelTmp);
+    label.position.set(this.labelTmp.x, this.labelTmp.y + 0.9, this.labelTmp.z);
+  }
+
+  private disposeSprite(sprite: THREE.Sprite): void {
+    if (sprite.material.map) sprite.material.map.dispose();
+    sprite.material.dispose();
+  }
+
   private buildGeometry(positions: Float32Array, indices: Uint32Array): THREE.BufferGeometry {
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute('position', new THREE.BufferAttribute(positions.slice(), 3));
@@ -403,6 +473,19 @@ export class SplatNavController {
         this.disposeMesh(mesh);
       }
     }
+    // Labels live on the scene root (not the Z-mirrored world) so their
+    // billboard text reads the right way round; tear them down here.
+    const scene = this.handles?.scene;
+    if (this.playerLabel) {
+      scene?.remove(this.playerLabel);
+      this.disposeSprite(this.playerLabel);
+    }
+    for (const label of this.npcLabels) {
+      scene?.remove(label);
+      this.disposeSprite(label);
+    }
+    this.playerLabel = null;
+    this.npcLabels.length = 0;
     this.playerMesh = null;
     this.npcMeshes.length = 0;
     this.npcAgents.length = 0;

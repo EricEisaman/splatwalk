@@ -612,14 +612,26 @@ export class Viewer {
 
     private attachMarkerLabel(mesh: AbstractMesh, text: string, color: Color3): void {
         const label = Mesh.CreatePlane(`${mesh.name}_label`, 0.8, this.scene);
-        const texture = new DynamicTexture(`${mesh.name}_label_texture`, { width: 256, height: 96 }, this.scene, true);
+        // No mipmaps: with alpha testing, mipmap minification shrinks the thin
+        // text's alpha below alphaCutOff when the label is small/far, making it
+        // vanish at distance. Disabling mips keeps the text visible at any range.
+        const texture = new DynamicTexture(`${mesh.name}_label_texture`, { width: 256, height: 96 }, this.scene, false);
         texture.hasAlpha = true;
         texture.drawText(text, null, 58, "bold 44px Arial", color.toHexString(), "transparent", true);
 
         const material = new StandardMaterial(`${mesh.name}_label_mat`, this.scene);
         material.diffuseTexture = texture;
         material.emissiveColor = color;
-        material.opacityTexture = texture;
+        // Render the label as ALPHA-TESTED opaque (cut out the text from a
+        // transparent quad) rather than alpha-blended. Blended labels join the
+        // transparent pass and get sorted against the Gaussian splat (which never
+        // writes depth), so they pop in/out as the camera moves and float over
+        // splat walls. Alpha test puts the label in the opaque pass: it writes
+        // depth, so the splat depth-tests against it -> stable, and correctly
+        // occluded when the player is behind splat geometry.
+        material.useAlphaFromDiffuseTexture = true;
+        material.transparencyMode = Material.MATERIAL_ALPHATEST;
+        material.alphaCutOff = 0.35;
         material.backFaceCulling = false;
         label.material = material;
         label.billboardMode = Mesh.BILLBOARDMODE_ALL;
