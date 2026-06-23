@@ -20,12 +20,27 @@ import { GLTF2Export } from '@babylonjs/serializers/glTF';
 import { Crowd, NavMesh as RecastNavMesh, init as initRecast, importNavMesh, CrowdAgent } from 'recast-navigation';
 import type { GroundFieldCellState, WalkableGroundFieldResult } from '../wasm/bridge';
 
+/** Construction options for {@link Viewer}. */
+export interface ViewerOptions {
+    /**
+     * Render in a right-handed scene (`scene.useRightHandedSystem = true`) instead
+     * of Babylon's default left-handed one. Off by default; this is a
+     * conformance/regression path (gated behind the showcase's hidden `?rh=1`)
+     * that validates SplatWalk's `splatwalk_oriented` output (right-handed, +Y up)
+     * lands correctly in a right-handed Babylon scene, mirroring Babylon PR #18606.
+     * See `docs/coordinate-alignment.md`.
+     */
+    readonly rightHanded?: boolean;
+}
+
 export class Viewer {
     private engine: Engine;
     private scene: Scene;
     private camera: ArcRotateCamera;
+    private readonly rightHanded: boolean;
 
-    constructor(canvas: HTMLCanvasElement) {
+    constructor(canvas: HTMLCanvasElement, options: ViewerOptions = {}) {
+        this.rightHanded = options.rightHanded ?? false;
         this.engine = new Engine(canvas, true);
         this.scene = this.createScene();
         this.camera = this.createCamera();
@@ -51,8 +66,18 @@ export class Viewer {
 
     private createScene(): Scene {
         const scene = new Scene(this.engine);
+        // Opt-in right-handed scene: SplatWalk emits geometry in splatwalk_oriented
+        // space (right-handed, +Y up), which matches a right-handed Babylon scene
+        // directly, so the navmesh/floor render with no extra mirror. This is the
+        // PR #18606 RH counterpart; default stays left-handed for the showcase.
+        scene.useRightHandedSystem = this.rightHanded;
         scene.clearColor = new Color3(0.1, 0.1, 0.1).toColor4();
         return scene;
+    }
+
+    /** Whether this viewer renders in a right-handed scene (`?rh=1`). */
+    public isRightHanded(): boolean {
+        return this.rightHanded;
     }
 
     private createCamera(): ArcRotateCamera {

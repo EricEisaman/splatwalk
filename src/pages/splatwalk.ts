@@ -1384,7 +1384,10 @@ async function main() {
                 if (!url) return;
 
                 const selectedOption = exampleSelect.options[exampleSelect.selectedIndex];
-                const fileName = selectedOption.textContent?.split(' (')[0] + ".ply";
+                // Name the file from the URL's real extension so `.spz` / `.splat`
+                // example scenes get normalized to PLY (handleFileLoad ->
+                // normalizeSplatToPly) instead of being mis-read as raw PLY.
+                const fileName = url.split('/').pop() || ((selectedOption.textContent?.split(' (')[0] ?? 'example') + ".ply");
 
                 console.log(`[WAIT] Fetching example file: ${fileName}...`);
 

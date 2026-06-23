@@ -18,9 +18,29 @@ export interface MeshBuffers {
 }
 
 export interface CoordinateSpace {
-    space: 'splatwalk_oriented' | string;
-    up_axis: 'y' | string;
+    /** `splatwalk_oriented` for default output, `engine_output` when an `output_space` conversion was applied. */
+    space: 'splatwalk_oriented' | 'engine_output' | string;
+    up_axis: 'y' | 'z' | string;
     handedness: 'right' | 'left' | string;
+}
+
+/**
+ * Opt-in output coordinate convention for {@link MeshSettings.output_space}.
+ *
+ * When set, every mesh/basis/floor-plane result is converted from the default
+ * `splatwalk_oriented` space (right-handed, `+Y` up, CCW winding) into the
+ * requested convention and the reported `space` is updated to `engine_output`.
+ * Omitting it leaves all outputs in `splatwalk_oriented` space, unchanged.
+ * Per-cell ground-field scalars and `diagnostics` always stay in
+ * `splatwalk_oriented` space.
+ */
+export interface OutputSpaceSettings {
+    /** `"y"` (default) or `"z"` (rotates `+Y`-up into `+Z`-up about X). */
+    up_axis?: 'y' | 'z';
+    /** `"right"` (default) or `"left"` (mirrors the Z axis). */
+    handedness?: 'right' | 'left';
+    /** `"auto"` (default; flips only when the basis is mirrored), `"ccw"`, or `"cw"`. */
+    winding?: 'auto' | 'ccw' | 'cw';
 }
 
 export interface FloorPlane {
@@ -259,6 +279,11 @@ export interface MeshSettings {
      */
     prune_floaters_std_ratio?: number;
     rotation?: number[];
+    /**
+     * Opt-in output coordinate convention. Absent = default `splatwalk_oriented`
+     * output (right-handed, `+Y` up, CCW). See {@link OutputSpaceSettings}.
+     */
+    output_space?: OutputSpaceSettings;
     flip_y?: boolean;
 }
 

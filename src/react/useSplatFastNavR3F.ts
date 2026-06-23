@@ -399,9 +399,18 @@ export function useSplatFastNavR3F() {
         appendLog(`[WAIT] Fetching example scene: ${title}...`);
         const response = await fetch(url);
         if (!response.ok) throw new Error(`Failed to fetch ${title}: ${response.status}`);
-        const bytes = new Uint8Array(await response.arrayBuffer());
-        appendLog(`[SUCCESS] Fetched ${title} (${(bytes.byteLength / (1024 * 1024)).toFixed(2)} MB).`);
-        await processBytes(bytes, `${title}.ply`);
+        const raw = new Uint8Array(await response.arrayBuffer());
+        appendLog(`[SUCCESS] Fetched ${title} (${(raw.byteLength / (1024 * 1024)).toFixed(2)} MB).`);
+        // Normalize by the URL's real extension (.spz / .splat -> PLY) exactly like
+        // a dropped file, so non-PLY example scenes load too. WASM must be ready
+        // first: spz/splat conversion runs in the core (init() is idempotent).
+        const fileName = url.split('/').pop() || `${title}.ply`;
+        if (!wasmReady.current) {
+          await splatwalk.init();
+          wasmReady.current = true;
+        }
+        const bytes = await readSplatBytes(new File([raw], fileName));
+        await processBytes(bytes, fileName);
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
         setErrorMessage(detail);

@@ -14,7 +14,8 @@
     "lint": "eslint src --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
     "lint:fix": "eslint src --ext ts,tsx --fix",
     "type-check": "vue-tsc --noEmit && tsc -p tsconfig.react.json --noEmit",
-    "check": "npm run type-check && npm run lint"
+    "check": "npm run type-check && npm run lint",
+    "check:handedness": "node examples/handedness-check.mjs"
   },
   "dependencies": {
     "@babylonjs/core": "^9.12.0",

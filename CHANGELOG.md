@@ -35,6 +35,38 @@ Every v2 result advertises a `capabilities` string array. Current flags:
   full-fidelity 3DGS PLY (positions, log-space scale, SH0 DC color, opacity logit,
   renormalized rotation; SH degree 0). `.splat` joins `.ply` and `.spz` everywhere
   in the app and pipeline.
+- **Right-handed Babylon regression scene (Mutualism Track B / issues #3, #6).**
+  The Babylon `Viewer` accepts a `rightHanded` option (`scene.useRightHandedSystem
+  = true`), wired through `useBabylonViewer` and gated behind a hidden `?rh=1` URL
+  flag on the Vuetify showcase (no user-facing toggle — left-handed stays the
+  default). It validates that SplatWalk's `splatwalk_oriented` output (right-handed,
+  +Y up) lands in a right-handed Babylon scene with no boundary mirror; measured
+  coincidence is documented in `docs/coordinate-alignment.md`. This is the geometry
+  counterpart to Babylon's right-handed Gaussian-splat sort (PR #18606).
+- **"Stairs" example scene.** A `.spz` example splat added to all three demos
+  (homepage workbench, Vuetify showcase, R3F demo), exercising the `.spz` ingest
+  path end-to-end from the example menus.
+- **Babylon.js Playground interactive demo (Mutualism Track A / issue #2).** A
+  zero-install, copy-paste Playground snippet (`public/playground/babylon-fast-nav.ts`,
+  TypeScript ES-module `export class Playground` with a static async
+  `CreateScene`, matching the Playground V2 runner's entry-export resolution) that
+  is a full workbench-style
+  experience with its own in-scene UI (in the spirit of babylon-game-starter):
+  it loads `@splatwalk/core` + recast.js from CDNs, renders a real Gaussian splat,
+  runs `build_room_floor_mesh` (FAST NAV floor, honoring the `flip_y` contract),
+  builds a **Babylon Recast navmesh** from the floor, spawns a crowd agent, and
+  supports **click-to-move**. Includes a scene picker (`.ply` + gunzipped `.spz`),
+  splat/floor/navmesh toggles, a live HUD, and a top-down "focus on player"
+  camera. A **Full screen** toggle borrows the babylon-game-starter idiom: inside
+  the Playground it "hijacks" the split (tags `#pg-split` so the editor + splitter
+  collapse and `#canvasZone` fills the view — pure CSS, so the overlay UI survives),
+  and outside it falls back to the Fullscreen API; a `?fullscreen=true` URL param
+  enters full screen on load. A runnable demo lives at `/playground/` (`public/playground/index.html`,
+  linked from the homepage nav) and reproduces the Playground TS pipeline; it adds
+  a **Download `playground.json`** button — a byte-compatible Babylon Playground
+  **V2 snippet** (`{ payload, name, description, tags }` → V2 manifest, with the
+  `unicode` base64 path for non-Latin1 source) so users can load it into the real
+  Playground and edit it. Documented in `README.md` and `docs/INTEGRATION.md`.
 
 ### Changed
 
@@ -54,6 +86,12 @@ Every v2 result advertises a `capabilities` string array. Current flags:
   loaded as a normalized PLY (same convention as a native PLY), the special-case
   rotation is gone and splat orientation is consistent across `.ply` / `.spz` /
   `.splat`.
+- **Non-PLY example scenes now load.** Every demo's example loader hard-coded a
+  `.ply` filename when fetching, so `.spz` / `.splat` example URLs were handed to
+  the PLY path unnormalized (and the R3F loader normalized before the WASM core was
+  initialized). Example loaders now derive the filename from the URL's real
+  extension and ensure the core is initialized first, so `.spz` example scenes
+  (e.g. "Stairs") normalize to PLY and render like dropped files.
 
 ## [0.3.2] - 2026-06-22
 

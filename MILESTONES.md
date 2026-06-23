@@ -4,6 +4,10 @@ This document tracks the streaming-oriented roadmap for SplatWalk: what shipped
 now (splat slicing / SOG export), and the work queued for when Babylon's
 Gaussian-splat streaming lands in production.
 
+> For the ecosystem-facing roadmap — mutually-beneficial integrations with the
+> Babylon.js Playground, the GS runtime, babylon-game-starter, and three.js —
+> see [`MUTUALISM_MILESTONES.md`](MUTUALISM_MILESTONES.md).
+
 ## Now — `splatSlice` / SOG export (shipped)
 
 Goal: let integrators turn a `.ply`/`.spz` splat into a streamable, hostable

@@ -61,6 +61,7 @@ export * as floor from '@/navigation/floor';
 /** WASM core data-contract types, published so binary-only integrators get real types. */
 export type {
   MeshSettings,
+  OutputSpaceSettings,
   MeshBuffers,
   CoordinateSpace,
   FloorPlane,

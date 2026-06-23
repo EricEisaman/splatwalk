@@ -12,6 +12,7 @@ export const DEFAULT_EXAMPLE_SCENES: readonly ExampleScene[] = [
   { title: 'Bedroom', url: 'https://raw.githubusercontent.com/EricEisaman/assets/main/environment/splats/bedroom.ply' },
   { title: 'Tropical Compound', url: 'https://raw.githubusercontent.com/EricEisaman/assets/main/environment/splats/tropical_compound.ply' },
   { title: 'Industrial Warehouse', url: 'https://raw.githubusercontent.com/EricEisaman/assets/main/environment/splats/industrial_warehouse.ply' },
+  { title: 'Stairs', url: 'https://raw.githubusercontent.com/EricEisaman/assets/main/environment/splats/stairs.spz' },
 ];
 
 // Re-exported so integrators can extend the built-in recovery ladder.
@@ -62,7 +63,13 @@ const cardRef = ref<ComponentPublicInstance | null>(null);
 const isDragging = ref(false);
 const isFullscreen = ref(false);
 
-const babylon = useBabylonViewer(canvasRef);
+// Babylon is left-handed by default - the one correct setting for everyday use.
+// A right-handed scene (scene.useRightHandedSystem, the PR #18606 counterpart) is
+// a conformance/regression path only, so it is gated behind a hidden `?rh=1` URL
+// flag (the handedness regression scene) rather than a user-facing toggle.
+const rightHanded = new URLSearchParams(window.location.search).get('rh') === '1';
+
+const babylon = useBabylonViewer(canvasRef, { rightHanded });
 const { status, statusMessage, errorMessage, logs, isBusy, phase, progress, splatCount, loadAndProcess, loadExample, exportSog, reset } =
   useSplatFastNav(babylon, { recovery: props.recovery, strayTrim: props.strayTrim, prune: props.prune });
 

@@ -103,6 +103,9 @@ settings as the base layer.
 
 ## 4. The coordinate / `flip_y` contract (read this first)
 
+> For the condensed, cross-engine summary of this section and sections 9-10, see
+> the one-page [Canonical GS Alignment Recipe](coordinate-alignment.md).
+
 The single most common integration bug is a navmesh mirrored or offset from the
 rendered splat. SplatWalk parses raw PLY/SPZ coordinates, but most renderers flip
 Y on import. Resolve it once, at the boundary:
@@ -287,6 +290,70 @@ above the player (`beta ≈ 0`), targets the player, and sets
 `radius = cameraHeight - player.y`, where `cameraHeight` sits just below the
 splat ceiling, clamped between one player-height and 4 m above the player's head
 so the player stays framed in rooms of any height.
+
+**Right-handed regression scene (`?rh=1`).** The Vuetify showcase can build the
+viewer with `scene.useRightHandedSystem = true` via a hidden `?rh=1` URL flag
+(`ViewerOptions.rightHanded` in `src/scene/Viewer.ts`). This is a
+conformance/regression path — left-handed stays the default — that proves the
+`splatwalk_oriented` output (right-handed, `+Y` up) lands in a right-handed
+Babylon scene with **no** boundary mirror (the geometry counterpart to Babylon
+PR [#18606](https://github.com/BabylonJS/Babylon.js/pull/18606)'s right-handed
+splat sort). Measured coincidence is in
+[`coordinate-alignment.md`](coordinate-alignment.md) ("Babylon.js (right-handed)").
+
+**Zero-install Playground (CDN) — interactive demo.** A self-contained Babylon.js
+Playground snippet that mirrors the homepage workbench with its own in-scene UI
+(in the spirit of babylon-game-starter): it loads `@splatwalk/core` + recast.js
+from CDNs, renders a real splat, extracts the FAST NAV floor, builds a Recast
+navmesh from it, spawns a crowd agent, and supports **click-to-move**. The core
+SplatWalk call is unchanged from the rest of this guide:
+
+```ts
+// Babylon Playground (TypeScript). Full file: public/playground/babylon-fast-nav.ts
+const sw: any = await import('https://cdn.jsdelivr.net/npm/@splatwalk/core@0.3.2/wasm_splatwalk.js');
+await sw.default();        // wasm-bindgen --target web init (fetches the .wasm from the same CDN dir)
+sw.init_splatwalk();       // register the PLY/SPZ parsers (once)
+
+const bytes = new Uint8Array(await (await fetch(SPLAT_URL)).arrayBuffer());
+const flip_y = (splat.scaling?.y ?? 1) < 0;  // detect from the loaded splat, as above
+const floor = sw.build_room_floor_mesh(bytes, { ...sw.fast_nav_preset(), mode: 2, flip_y });
+// → floor.mesh.vertices / floor.mesh.indices, in splatwalk_oriented space (renders directly)
+
+// The floor mesh feeds Babylon's Recast navmesh + crowd directly (same chirality):
+await BABYLON.Tools.LoadScriptAsync('https://cdn.babylonjs.com/recast.js');
+const nav = new BABYLON.RecastJSPlugin(await Recast());
+nav.createNavMesh([floorMesh], recastParams);    // floorMesh = the rendered floor above
+const crowd = nav.createCrowd(8, 0.5, scene);
+const agentIndex = crowd.addAgent(nav.getClosestPoint(center), agentParams, agentTransformNode);
+// pointer-tap → crowd.agentGoto(agentIndex, nav.getClosestPoint(pickedPoint))
+```
+
+> Give each crowd agent a `TransformNode` in `addAgent` — `crowd.update()` writes
+> the agent pose onto it and throws if it is missing. Make the splat mesh
+> `isPickable = false` so click-to-move picks the floor/navmesh, not the splat.
+
+- **Snippet:** [`public/playground/babylon-fast-nav.ts`](../public/playground/babylon-fast-nav.ts)
+  (paste into the Playground's TS editor). It is an ES module that
+  `export`s `class Playground` with a static async `CreateScene(engine, canvas)`;
+  the Playground **V2** runner resolves the scene factory from the entry module's
+  exports (`Playground.CreateScene` / `default.CreateScene` / `createScene` /
+  `default`) and awaits it. The snippet builds its own DOM UI on the canvas parent,
+  so the demo is identical in the real Playground.
+- **Runnable demo + `playground.json` export:** open **`/playground/`** on the dev
+  server (`npm run dev` → `http://localhost:5173/playground/index.html`); source
+  [`public/playground/index.html`](../public/playground/index.html). It reproduces
+  the Playground TS pipeline and offers a **Download `playground.json`** button.
+  The file is a Babylon Playground **V2 snippet** (`{ payload, name, description,
+  tags }` → V2 manifest), so it loads straight into the Playground for editing.
+  It lives under `public/` so the bundler serves the **raw** source the
+  in-browser transpile and `playground.json` export depend on (do not put it on a
+  path your bundler rewrites, e.g. `/examples/...` under Vite).
+- **CDN caveats:** jsDelivr/unpkg serve the `.wasm` as `application/wasm` with
+  `access-control-allow-origin: *` (streaming instantiation works; wasm-bindgen
+  falls back to non-streaming `instantiate` on a wrong MIME type). Fetch the splat
+  from a CORS-enabled host — `raw.githubusercontent.com` sends
+  `access-control-allow-origin: *`. `.spz` examples are gunzipped in-browser
+  (`DecompressionStream('gzip')`) before `spz_to_ply`.
 
 ## 10. React Three Fiber (three.js) integration
 

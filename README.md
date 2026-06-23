@@ -56,7 +56,7 @@ One **`FAST NAV`** click takes a raw splat all the way to a walkable navmesh wit
 - **Navigation Markers** — The scene labels the magenta seed marker, blue player agent, green NPC agent, and green walkable navmesh overlay.
 - **2.5D SDF Diagnostics** — Browser-side column fields power the fast floor path and stay available under experimental debug for inspecting accepted, obstacle, variance, and rejected cells.
 - **Mesh Reconstruction** — Integrated Poisson reconstruction for full geometry.
-- **Streamed SOG Export** — Convert a splat into a SOG bundle — a single `meta.json` set or a streamed, Morton-ordered multi-chunk `lod-meta.json` set with lossless WebP planes — decodable by Babylon's SOG loaders and aimed at the GS streaming loader (PR #18563). Full spherical harmonics (configurable degree); large scenes (>1M splats) default to streamed LOD. See [`docs/wasm-api.md`](docs/wasm-api.md) and [`MILESTONES.md`](MILESTONES.md).
+- **Streamed SOG Export** — Convert a splat into a SOG bundle — a single `meta.json` set or a streamed, Morton-ordered multi-chunk `lod-meta.json` set with lossless WebP planes — decodable by Babylon's SOG loaders and aimed at the GS streaming loader (PR #18563). Full spherical harmonics (configurable degree); large scenes (>1M splats) default to streamed LOD. See [`docs/wasm-api.md`](docs/wasm-api.md), [`MILESTONES.md`](MILESTONES.md), and the ecosystem roadmap in [`MUTUALISM_MILESTONES.md`](MUTUALISM_MILESTONES.md).
 - **`.spz` / `.splat` Support** — `.spz` (Niantic) and `.splat` (antimatter15) are normalized to a full-fidelity `.ply` in WASM at ingest (`spz_to_ply` / `splat_to_ply`) so the viewer drives only Babylon's PLY loader (no CDN-hosted `.spz` decoder) and the nav pipeline only ever deals with PLY.
 - **One-Click Export** — Download production-ready `.glb` meshes and Recast-compatible navmesh binaries.
 
@@ -76,6 +76,18 @@ There are two supported integration levels:
 
 1. **Published core** (`@splatwalk/core`): the wasm binary, wasm-bindgen glue, hand-authored types, and the framework-agnostic `floor` module, versioned together. `npm install @splatwalk/core`.
 2. **TypeScript bridge** (`src/wasm/bridge.ts`): a thin typed wrapper around the WASM exports if you build from this repo with a bundler.
+
+### Try it in the Babylon.js Playground (zero install)
+
+A copy-paste [Babylon.js Playground](https://playground.babylonjs.com) snippet that is a full interactive demo — a workbench-style experience with its own in-scene UI (in the spirit of [babylon-game-starter](https://github.com/EricEisaman/babylon-game-starter)). It loads `@splatwalk/core` from a CDN, renders a real Gaussian splat, runs `build_room_floor_mesh` to extract the walkable floor (respecting the `flip_y` contract), builds a **Babylon Recast navmesh** from that floor, spawns a crowd agent, and lets you **click the floor to walk** the agent around the splat world. A scene picker switches between example `.ply`/`.spz` splats; toggles show/hide the splat, floor, and navmesh.
+
+- **Snippet (TypeScript Playground form):** [`public/playground/babylon-fast-nav.ts`](public/playground/babylon-fast-nav.ts) — paste into the Playground's TS editor and Run. The snippet builds its own UI, so the experience is identical in the real Playground.
+- **Runnable demo:** open **`/playground/`** on the dev server (`npm run dev` → <http://localhost:5173/playground/index.html>) or the deployed site. Source: [`public/playground/index.html`](public/playground/index.html). It reproduces the Playground TS pipeline (same Babylon CDN build, in-browser transpile) and adds a **Download `playground.json`** button. The downloaded file is a Babylon Playground **V2 snippet** (`{ payload, name, description, tags }`), so you can load it straight into the Playground and edit it.
+
+> Served from `public/` so Vite/your bundler ships it **verbatim** — the in-browser TypeScript transpile (and the `playground.json` export) need the raw source, not a bundler-rewritten module. The navmesh uses Babylon's `RecastJSPlugin` (recast.js loaded from the Babylon CDN), the same path that runs inside the real Playground.
+- **Saved Playground:** <!-- TODO: paste the saved playground.babylonjs.com snippet URL here after saving -->
+
+> **CDN / sandbox caveats.** jsDelivr and unpkg serve the `.wasm` as `application/wasm` with `access-control-allow-origin: *`, so streaming instantiation works (wasm-bindgen also falls back to non-streaming `instantiate` if a CDN ever serves the wrong MIME type). Fetch your splat from a CORS-enabled host — `raw.githubusercontent.com` sends `access-control-allow-origin: *`.
 
 ### Minimal one-button floor-nav flow
 
@@ -116,7 +128,7 @@ The single most common integration bug is a navmesh that is mirrored or offset f
 - Pass user orientation via `settings.rotation` (radians). WASM bakes it into bounds, regions, meshes, basis, and the ground field, so re-running after a rotation re-aligns everything.
 - Do **not** derive floor height from renderer meshes or apply visual Y offsets to "fix" alignment. Fix `flip_y`/`rotation`/settings instead.
 
-See [`docs/wasm-api.md`](docs/wasm-api.md) for the full entry-point contract, the ground-field cell states, settings reference, and binary-only integrator guidance.
+See the one-page [Canonical GS Alignment Recipe](docs/coordinate-alignment.md) for the cross-engine handedness/`flip_y`/`output_space` rule, and [`docs/wasm-api.md`](docs/wasm-api.md) for the full entry-point contract, the ground-field cell states, settings reference, and binary-only integrator guidance.
 
 ### Reusable Vue/Vuetify component
 

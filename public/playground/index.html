@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SplatWalk × Babylon Playground — interactive demo</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #0a0d12; overflow: hidden; }
+      #renderCanvas { width: 100vw; height: 100vh; display: block; touch-action: none; outline: none; }
+      /* Harness-only export controls (top-right). The interactive UI is built by
+         the snippet itself, so this page adds only the playground.json affordances. */
+      #pgExport {
+        position: fixed; top: 14px; right: 14px; z-index: 40; display: flex; gap: 8px; align-items: center;
+        font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      }
+      #pgExport button {
+        font-size: 12px; font-weight: 800; letter-spacing: .3px; padding: 9px 13px;
+        border-radius: 10px; cursor: pointer; transition: filter .15s, opacity .15s;
+        backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+      }
+      /* Home icon link — same intent as the Home link on the Vuetify/React pages. */
+      #homeLink {
+        display: flex; align-items: center; justify-content: center; width: 40px; height: 40px;
+        border-radius: 10px; color: #e8eefc; background: rgba(10,13,18,.72);
+        border: 1px solid rgba(255,255,255,.14); box-shadow: 0 8px 24px rgba(0,0,0,.35);
+        backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+        cursor: pointer; text-decoration: none; transition: filter .15s, border-color .15s;
+      }
+      #homeLink:hover { filter: brightness(1.25); border-color: rgba(57,255,20,.5); }
+      #homeLink svg { width: 20px; height: 20px; }
+      #downloadPg { color: #08120a; background: #39ff14; border: 1px solid rgba(57,255,20,.4);
+        box-shadow: 0 8px 24px rgba(57,255,20,.28); }
+      #downloadPg:hover { filter: brightness(1.08); }
+      #downloadPg:disabled { background: #2a2f38; color: #7a869c; border-color: rgba(255,255,255,.1);
+        box-shadow: none; cursor: default; }
+      #openPg { color: #e8eefc; background: rgba(10,13,18,.72); border: 1px solid rgba(255,255,255,.14); }
+      #openPg:hover { filter: brightness(1.2); }
+      #harnessError {
+        position: fixed; bottom: 14px; right: 14px; z-index: 40; max-width: 360px; display: none;
+        font: 12px/1.4 ui-monospace, monospace; color: #ff8f6b; background: rgba(10,13,18,.85);
+        border: 1px solid rgba(255,90,60,.4); padding: 10px 12px; border-radius: 10px;
+      }
+    </style>
+    <!-- Same CDN build the Babylon Playground uses. -->
+    <script src="https://cdn.babylonjs.com/babylon.js"></script>
+    <script src="https://cdn.babylonjs.com/loaders/babylonjs.loaders.min.js"></script>
+    <!-- In-browser TypeScript transpiler, exactly like the Playground. -->
+    <script src="https://cdn.jsdelivr.net/npm/typescript@5.9.3/lib/typescript.min.js"></script>
+  </head>
+  <body>
+    <canvas id="renderCanvas"></canvas>
+    <div id="pgExport">
+      <a id="homeLink" href="/" title="Back to SplatWalk home" aria-label="Home">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M9.5 21v-6h5v6"/>
+        </svg>
+      </a>
+      <button id="downloadPg" disabled title="Download a Babylon Playground V2 snippet (playground.json) you can load into https://playground.babylonjs.com">Download playground.json</button>
+      <button id="openPg" title="Open this demo live in the Babylon.js Playground (snippet #VUGYNW) in a new tab">Open Playground ↗</button>
+    </div>
+    <div id="harnessError"></div>
+    <script>
+      // This harness reproduces the Babylon Playground TS pipeline so the exact
+      // `babylon-fast-nav.ts` deliverable can be verified locally: fetch the .ts,
+      // transpile it in-browser (module: ESNext keeps `import()` intact), inject it,
+      // then import the ES module and call `Playground.CreateScene(engine, canvas)`,
+      // exactly like the Playground V2 runner. The snippet builds
+      // its own in-scene UI; this page only adds the playground.json export.
+      window.__harness = { ready: false, error: null };
+      const errEl = document.getElementById('harnessError');
+      const showError = (msg) => { errEl.textContent = 'harness: ' + msg; errEl.style.display = 'block'; console.error('[harness]', msg); };
+
+      // Build a Babylon Playground **V2** `playground.json`, byte-compatible with the
+      // editor's own `PackSnippetData` (BabylonJS/Babylon.js tools/playground), so it
+      // loads cleanly via the Playground's local-file load. The file is:
+      //   { payload, name, description, tags }
+      // where payload = JSON.stringify({ code, unicode?, engine, version }) and
+      //       code    = JSON.stringify({ v:2, language:"TS", entry:"index.ts", imports:{}, files:{ "index.ts": <src> } })
+      // `unicode` (base64 of the UTF-8 bytes) is emitted only when the source has
+      // non-Latin1 characters, exactly as the editor does.
+      window.__buildPlaygroundJson = function (tsSource) {
+        const manifest = {
+          v: 2,
+          language: 'TS',
+          entry: 'index.ts',
+          imports: {},
+          files: { 'index.ts': tsSource },
+        };
+        const codeToSave = JSON.stringify(manifest);
+        const buffer = new TextEncoder().encode(codeToSave);
+        let latin1 = '';
+        for (let i = 0; i < buffer.length; i++) latin1 += String.fromCharCode(buffer[i]);
+        const needsUnicode = latin1 !== codeToSave;
+        const payload = JSON.stringify({
+          code: codeToSave,
+          unicode: needsUnicode ? btoa(latin1) : undefined,
+          engine: 'WebGL2',
+          version: 2,
+        });
+        const snippetData = {
+          payload,
+          name: 'SplatWalk — Walkable Gaussian-Splat World',
+          description: 'Interactive @splatwalk/core demo: Gaussian splat -> FAST NAV floor -> Recast navmesh -> click-to-move agent.',
+          tags: 'splatwalk, gaussian splatting, navmesh, recast, wasm',
+        };
+        return JSON.stringify(snippetData);
+      };
+
+      const dlBtn = document.getElementById('downloadPg');
+      dlBtn.addEventListener('click', () => {
+        const src = window.__harness.tsSource;
+        if (!src) return;
+        const blob = new Blob([window.__buildPlaygroundJson(src)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'playground.json';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 5000);
+      });
+      document.getElementById('openPg').addEventListener('click', () => {
+        window.open('https://playground.babylonjs.com/#VUGYNW', '_blank', 'noopener');
+      });
+
+      (async function boot() {
+        try {
+          const canvas = document.getElementById('renderCanvas');
+          const engine = new BABYLON.Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true });
+          window.__harness.engine = engine;
+
+          const tsSource = await (await fetch('./babylon-fast-nav.ts', { cache: 'no-store' })).text();
+          // The playground.json download depends only on the source, so enable it now.
+          window.__harness.tsSource = tsSource;
+          dlBtn.disabled = false;
+
+          // Transpile to an ES module and import it via a blob URL — the same shape
+          // the Babylon Playground V2 runner uses: it resolves the scene factory
+          // from the entry module's exports (Playground.CreateScene / default).
+          const js = window.ts.transpile(tsSource, {
+            target: window.ts.ScriptTarget.ES2020,
+            module: window.ts.ModuleKind.ESNext, // ES module + dynamic import() intact
+          });
+          const moduleUrl = URL.createObjectURL(new Blob([js], { type: 'text/javascript' }));
+          const mod = await import(moduleUrl);
+          setTimeout(() => URL.revokeObjectURL(moduleUrl), 10000);
+          const factory =
+            (mod.default && mod.default.CreateScene) ||
+            (mod.Playground && mod.Playground.CreateScene) ||
+            mod.createScene ||
+            mod.default;
+          if (typeof factory !== 'function') {
+            throw new Error('No CreateScene export (Playground.CreateScene / createScene / default) in entry module');
+          }
+
+          const scene = await factory(engine, canvas);
+          window.__harness.scene = scene;
+          engine.runRenderLoop(() => scene.render());
+          window.addEventListener('resize', () => engine.resize());
+          window.__harness.ready = true; // scene constructed; scene loading state lives in window.__demo
+        } catch (e) {
+          window.__harness.error = (e && e.message) || String(e);
+          showError(window.__harness.error);
+          console.error(e);
+        }
+      })();
+    </script>
+  </body>
+</html>

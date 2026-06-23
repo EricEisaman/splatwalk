@@ -245,7 +245,10 @@ export function useSplatFastNav(
       // the browser fetch() stream aborts mid-body on some networks, while
       // Babylon's transport (used everywhere else) downloads reliably.
       const data = (await Tools.LoadFileAsync(url, true)) as ArrayBuffer;
-      const file = new File([data], `${title}.ply`, { type: 'application/octet-stream' });
+      // Name the file from the URL's real extension so `.spz` / `.splat` example
+      // scenes get normalized to PLY (via readSplatBytes) just like dropped files.
+      const fileName = url.split('/').pop() || `${title}.ply`;
+      const file = new File([data], fileName, { type: 'application/octet-stream' });
       appendLog(`[SUCCESS] Fetched ${title} (${(file.size / (1024 * 1024)).toFixed(2)} MB).`);
 
       await processFile(file);
