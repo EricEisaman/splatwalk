@@ -26,6 +26,20 @@ Every v2 result advertises a `capabilities` string array. Current flags:
 | `progress_callback` | exposes `set_progress_callback()` (opt-in structured progress) |
 | `splat_ingest` | exposes `splat_to_ply` (antimatter15 `.splat` -> PLY normalization) alongside `spz_to_ply` |
 
+## [0.3.6] - 2026-06-23
+
+### Fixed
+
+- **Playground broke in production with `BABYLON is not defined`.** The deployed
+  nginx Content-Security-Policy (`nginx.conf.template`) restricted `script-src` to
+  `'self'`, so the standalone `/playground/` page could not load Babylon.js, the
+  Babylon loaders, the in-browser TypeScript transpiler, the `@splatwalk/core`
+  WASM module, or `recast.js` from their CDNs, and its transpiled blob-module
+  import was blocked too. `script-src` now also allows `blob:`,
+  `https://cdn.babylonjs.com`, and `https://cdn.jsdelivr.net`. Verified by serving
+  the real nginx config locally and loading the page in a real browser: the splat
+  scene, navmesh, and agent come up with zero CSP violations.
+
 ## [0.3.5] - 2026-06-22
 
 ### Added

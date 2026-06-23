@@ -65,7 +65,7 @@ import {
 if (splatwalk_api_version() !== 2) throw new Error('Unsupported SplatWalk binary');
 
 const caps = splatwalk_capabilities();        // e.g. ['room_floor_mesh', 'recast_config', ...]
-const version = splatwalk_version();          // tracks the crate version, e.g. '0.3.5'
+const version = splatwalk_version();          // tracks the crate version, e.g. '0.3.6'
 
 if (!caps.includes('room_floor_mesh')) {
   // Fall back to the multi-step field path instead of the one-call entry point.
@@ -314,7 +314,7 @@ unchanged from the rest of this guide:
 
 ```ts
 // Babylon Playground (TypeScript). Full file: public/playground/babylon-fast-nav.ts
-const sw: any = await import('https://cdn.jsdelivr.net/npm/@splatwalk/core@0.3.5/wasm_splatwalk.js');
+const sw: any = await import('https://cdn.jsdelivr.net/npm/@splatwalk/core@0.3.6/wasm_splatwalk.js');
 await sw.default();        // wasm-bindgen --target web init (fetches the .wasm from the same CDN dir)
 sw.init_splatwalk();       // register the PLY/SPZ parsers (once)
 
