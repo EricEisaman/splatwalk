@@ -26,7 +26,7 @@ Every v2 result advertises a `capabilities` string array. Current flags:
 | `progress_callback` | exposes `set_progress_callback()` (opt-in structured progress) |
 | `splat_ingest` | exposes `splat_to_ply` (antimatter15 `.splat` -> PLY normalization) alongside `spz_to_ply` |
 
-## [Unreleased]
+## [0.3.4] - 2026-06-22
 
 ### Added
 
@@ -58,15 +58,21 @@ Every v2 result advertises a `capabilities` string array. Current flags:
   supports **click-to-move**. Includes a scene picker (`.ply` + gunzipped `.spz`),
   splat/floor/navmesh toggles, a live HUD, and a top-down "focus on player"
   camera. A **Full screen** toggle borrows the babylon-game-starter idiom: inside
-  the Playground it "hijacks" the split (tags `#pg-split` so the editor + splitter
-  collapse and `#canvasZone` fills the view — pure CSS, so the overlay UI survives),
-  and outside it falls back to the Fullscreen API; a `?fullscreen=true` URL param
-  enters full screen on load. A runnable demo lives at `/playground/` (`public/playground/index.html`,
-  linked from the homepage nav) and reproduces the Playground TS pipeline; it adds
-  a **Download `playground.json`** button — a byte-compatible Babylon Playground
-  **V2 snippet** (`{ payload, name, description, tags }` → V2 manifest, with the
-  `unicode` base64 path for non-Latin1 source) so users can load it into the real
-  Playground and edit it. Documented in `README.md` and `docs/INTEGRATION.md`.
+  the Playground it "hijacks" the split — the snippet tags `#pg-split` to drop its
+  fixed-pixel CSS grid (`display:block`), hides the editor + splitter, and lets
+  `#canvasZone` fill 100% before calling `engine.resize()` (pure CSS, no browser
+  Fullscreen API, so the overlay UI survives and tracks the full render area).
+  Outside the Playground it falls back to the Fullscreen API; a `?fullscreen=true`
+  URL param enters full screen on load. A **home icon link** overlays the demo
+  (matching the Home affordance on the Vuetify/React pages). A runnable demo lives
+  at `/playground/` (`public/playground/index.html`, linked from the homepage nav)
+  and reproduces the Playground TS pipeline; it adds a **Download `playground.json`**
+  button — a byte-compatible Babylon Playground **V2 snippet** (`{ payload, name,
+  description, tags }` → V2 manifest, with the `unicode` base64 path for non-Latin1
+  source) so users can load it into the real Playground and edit it — and an
+  **Open Playground ↗** button that opens the published snippet
+  ([`#VUGYNW`](https://playground.babylonjs.com/#VUGYNW)). Documented in
+  `README.md` and `docs/INTEGRATION.md`.
 
 ### Changed
 
@@ -92,6 +98,19 @@ Every v2 result advertises a `capabilities` string array. Current flags:
   initialized). Example loaders now derive the filename from the URL's real
   extension and ensure the core is initialized first, so `.spz` example scenes
   (e.g. "Stairs") normalize to PLY and render like dropped files.
+- **Playground Full screen toggle now actually fills the canvas.** The Playground's
+  `#pg-split` is a CSS grid with **fixed-pixel** tracks (e.g. `597px 6px 597px`), so
+  hiding the editor left its column reserved and the canvas never grew (the overlay
+  appeared to "do nothing"). The toggle now drops the grid (`display:block`) so
+  `#canvasZone` fills the full width; verified live in the Babylon Playground
+  (597px → 1200px), with the overlay UI staying visible and repositioning over the
+  full render area.
+- **Playground snippet compiles under TypeScript 5.7+.** TS 5.7 made typed arrays
+  generic over their backing buffer (`Uint8Array<ArrayBufferLike>`) and `BlobPart`
+  now requires an `ArrayBuffer`-backed view (not a possible `SharedArrayBuffer`).
+  The snippet keeps the PLY bytes `ArrayBuffer`-backed (copying `spz_to_ply`'s
+  output) so `new Blob([ply])` type-checks — without a version-specific generic
+  annotation that the Playground's own TS would reject.
 
 ## [0.3.2] - 2026-06-22
 
