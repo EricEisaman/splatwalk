@@ -26,6 +26,29 @@ Every v2 result advertises a `capabilities` string array. Current flags:
 | `progress_callback` | exposes `set_progress_callback()` (opt-in structured progress) |
 | `splat_ingest` | exposes `splat_to_ply` (antimatter15 `.splat` -> PLY normalization) alongside `spz_to_ply` |
 
+## [0.3.5] - 2026-06-22
+
+### Added
+
+- **R3F demo agent labels.** The React Three Fiber demo now renders billboard
+  `PLAYER` (blue) and `NPC` (green) labels above its crowd agents, matching the
+  Babylon demos. They use the same depth-correct technique as below.
+
+### Fixed
+
+- **Agent markers no longer pop in/out or float over splat geometry.** The agent
+  marker labels in the Babylon demos (`PLAYER` / `NPC` / `SEED`, via
+  `Viewer.attachMarkerLabel`) and the Playground demo's agent ring were
+  alpha-blended, so they joined the transparent render pass and were sorted
+  against the Gaussian splat (which never writes depth). That made them flicker
+  in and out with the camera angle/distance and draw on top of splat walls and
+  furniture. They are now rendered as **alpha-tested opaque** (the Playground
+  ring is simply opaque, like the player capsule), so they write depth and the
+  splat depth-tests against them: stable at every angle/distance and correctly
+  occluded when the agent is behind splat geometry. Label textures also disable
+  mipmaps so the thin text does not minify below the alpha-test cutoff and vanish
+  at distance.
+
 ## [0.3.4] - 2026-06-22
 
 ### Added

@@ -85,7 +85,7 @@ A copy-paste [Babylon.js Playground](https://playground.babylonjs.com) snippet t
 - **Runnable demo:** open **`/playground/`** on the dev server (`npm run dev` → <http://localhost:5173/playground/index.html>) or the deployed site. Source: [`public/playground/index.html`](public/playground/index.html). It reproduces the Playground TS pipeline (same Babylon CDN build, in-browser transpile) and adds a **Download `playground.json`** button. The downloaded file is a Babylon Playground **V2 snippet** (`{ payload, name, description, tags }`), so you can load it straight into the Playground and edit it. An **Open Playground ↗** button opens the saved snippet directly, and a home icon links back to this site.
 
 > Served from `public/` so Vite/your bundler ships it **verbatim** — the in-browser TypeScript transpile (and the `playground.json` export) need the raw source, not a bundler-rewritten module. The navmesh uses Babylon's `RecastJSPlugin` (recast.js loaded from the Babylon CDN), the same path that runs inside the real Playground.
-- **Saved Playground:** <https://playground.babylonjs.com/#VUGYNW>
+- **Saved Playground:** <https://playground.babylonjs.com/#VXTB9K>
 
 > **CDN / sandbox caveats.** jsDelivr and unpkg serve the `.wasm` as `application/wasm` with `access-control-allow-origin: *`, so streaming instantiation works (wasm-bindgen also falls back to non-streaming `instantiate` if a CDN ever serves the wrong MIME type). Fetch your splat from a CORS-enabled host — `raw.githubusercontent.com` sends `access-control-allow-origin: *`.
 

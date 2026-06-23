@@ -65,7 +65,7 @@ import {
 if (splatwalk_api_version() !== 2) throw new Error('Unsupported SplatWalk binary');
 
 const caps = splatwalk_capabilities();        // e.g. ['room_floor_mesh', 'recast_config', ...]
-const version = splatwalk_version();          // tracks the crate version, e.g. '0.3.4'
+const version = splatwalk_version();          // tracks the crate version, e.g. '0.3.5'
 
 if (!caps.includes('room_floor_mesh')) {
   // Fall back to the multi-step field path instead of the one-call entry point.
@@ -314,7 +314,7 @@ unchanged from the rest of this guide:
 
 ```ts
 // Babylon Playground (TypeScript). Full file: public/playground/babylon-fast-nav.ts
-const sw: any = await import('https://cdn.jsdelivr.net/npm/@splatwalk/core@0.3.4/wasm_splatwalk.js');
+const sw: any = await import('https://cdn.jsdelivr.net/npm/@splatwalk/core@0.3.5/wasm_splatwalk.js');
 await sw.default();        // wasm-bindgen --target web init (fetches the .wasm from the same CDN dir)
 sw.init_splatwalk();       // register the PLY/SPZ parsers (once)
 
@@ -350,7 +350,7 @@ const agentIndex = crowd.addAgent(nav.getClosestPoint(center), agentParams, agen
   The file is a Babylon Playground **V2 snippet** (`{ payload, name, description,
   tags }` → V2 manifest), so it loads straight into the Playground for editing. An
   **Open Playground ↗** button opens the published snippet
-  ([`#VUGYNW`](https://playground.babylonjs.com/#VUGYNW)), and a home icon links
+  ([`#VXTB9K`](https://playground.babylonjs.com/#VXTB9K)), and a home icon links
   back to the SplatWalk homepage. It lives under `public/` so the bundler serves
   the **raw** source the in-browser transpile and `playground.json` export depend
   on (do not put it on a path your bundler rewrites, e.g. `/examples/...` under Vite).
