@@ -28,6 +28,7 @@
     "@huggingface/tokenizers": "^0.0.6",
     "@mdi/font": "^7.4.47",
     "@mkkellogg/gaussian-splats-3d": "^0.4.7",
+    "@splatwalk/core": "^0.3.6",
     "@mui/icons-material": "^6.5.0",
     "@mui/material": "^6.5.0",
     "@react-three/drei": "^9.122.0",

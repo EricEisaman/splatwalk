@@ -12,7 +12,7 @@ import init, {
     splat_to_ply,
     spz_to_ply,
     suggest_region,
-} from '../../pkg/wasm_splatwalk/wasm_splatwalk.js';
+} from '@splatwalk/core';
 import type { SliceManifestRaw } from './sogTypes';
 
 /**
