@@ -47,11 +47,19 @@ impl RawPlane {
     /// Encode this plane to a **lossless** WebP buffer. `image-webp` only emits
     /// VP8L (lossless), so the quantized codebook indices survive byte-exact.
     pub fn encode_webp(&self) -> Result<Vec<u8>, String> {
+        if self.width == 0 || self.height == 0 {
+            return Err(format!("Invalid plane dimensions for {}: {}x{}", self.name, self.width, self.height));
+        }
+        let expected_len = self.width * self.height * 4;
+        if self.rgba.len() != expected_len {
+            return Err(format!("Plane {} has incorrect buffer size: got {}, expected {}", 
+                self.name, self.rgba.len(), expected_len));
+        }
         let mut out = Vec::new();
         let encoder = image_webp::WebPEncoder::new(&mut out);
         encoder
             .encode(&self.rgba, self.width as u32, self.height as u32, image_webp::ColorType::Rgba8)
-            .map_err(|e| format!("WebP encode failed for {}: {}", self.name, e))?;
+            .map_err(|e| format!("WebP encode failed for {} ({}x{}): {}", self.name, self.width, self.height, e))?;
         Ok(out)
     }
 }
@@ -402,7 +410,9 @@ fn encode_sh_n(
 
     // Materialize per-splat SH vectors in coeff-major order (k * 3 + channel),
     // converting from the cloud's channel-major storage.
+    crate::emit_progress("sh", Some(0.0));
     let mut vectors = vec![0.0f32; count * dim];
+    
     for i in 0..count {
         let src = i * src_stride;
         let dst = i * dim;
@@ -412,9 +422,11 @@ fn encode_sh_n(
             }
         }
     }
+    crate::emit_progress("sh", Some(0.1));
 
     let clusters = sh_cluster_count.clamp(1, 65536).min(count);
     let (centroids, labels) = kmeans(&vectors, dim, clusters, sh_iterations);
+    crate::emit_progress("sh", Some(0.7));
 
     // Codebook over all centroid component values; centroid bytes index it.
     let codebook = build_codebook(centroids.iter().copied());
@@ -422,27 +434,53 @@ fn encode_sh_n(
     // --- labels plane (per-splat 16-bit cluster index, low/high in R/G) ---
     let mut labels_rgba = vec![0u8; width * height * 4];
     for (i, &label) in labels.iter().enumerate() {
-        let base = i * 4;
-        labels_rgba[base] = (label & 0xff) as u8;
-        labels_rgba[base + 1] = ((label >> 8) & 0xff) as u8;
-        labels_rgba[base + 3] = 255;
+        if i < count {
+            let base = i * 4;
+            labels_rgba[base] = (label & 0xff) as u8;
+            labels_rgba[base + 1] = ((label >> 8) & 0xff) as u8;
+            labels_rgba[base + 3] = 255;
+        }
     }
 
     // --- centroids plane (64 palette columns wide, `coeffs` texels each) ---
-    let centroids_width = SH_PALETTE_COLUMNS * coeffs;
+    let centroids_width = SH_PALETTE_COLUMNS.checked_mul(coeffs)
+        .unwrap_or(SH_PALETTE_COLUMNS);
     let centroids_height = clusters.div_ceil(SH_PALETTE_COLUMNS).max(1);
-    let mut centroids_rgba = vec![0u8; centroids_width * centroids_height * 4];
+    
+    // Check for potential overflow in allocation
+    let centroids_pixel_count = centroids_width.checked_mul(centroids_height)
+        .and_then(|w| w.checked_mul(4))
+        .unwrap_or(0);
+    
+    if centroids_pixel_count == 0 || centroids_pixel_count > 512 * 1024 * 1024 {
+        // Centroids plane too large; skip shN encoding
+        crate::emit_progress("sh", Some(1.0));
+        return Some(SogDataFile {
+            shape: vec![count, coeffs * 3],
+            dtype: "uint8".to_string(),
+            mins: None,
+            maxs: None,
+            codebook: Some(vec![0.0; CODEBOOK_SIZE]),
+            encoding: "kmeans-codebook".to_string(),
+            files: vec![],
+            bands: Some(degree),
+        });
+    }
+    
+    let mut centroids_rgba = vec![0u8; centroids_pixel_count];
     for n in 0..clusters {
         let col = n % SH_PALETTE_COLUMNS;
         let row = n / SH_PALETTE_COLUMNS;
         for k in 0..coeffs {
             let x = col * coeffs + k;
             let texel = (row * centroids_width + x) * 4;
-            for j in 0..3 {
-                let value = centroids[n * dim + k * 3 + j];
-                centroids_rgba[texel + j] = nearest_codebook_index(&codebook, value);
+            if texel + 3 < centroids_rgba.len() && n * dim + k * 3 + 2 < centroids.len() {
+                for j in 0..3 {
+                    let value = centroids[n * dim + k * 3 + j];
+                    centroids_rgba[texel + j] = nearest_codebook_index(&codebook, value);
+                }
+                centroids_rgba[texel + 3] = 255;
             }
-            centroids_rgba[texel + 3] = 255;
         }
     }
 
@@ -458,6 +496,7 @@ fn encode_sh_n(
         height,
         rgba: labels_rgba,
     });
+    crate::emit_progress("sh", Some(0.9));
 
     Some(SogDataFile {
         shape: vec![count, dim],
@@ -520,14 +559,25 @@ fn nearest_codebook_index(codebook: &[f32], value: f32) -> u8 {
 /// on a capped random-ish sample for speed, then every vector is assigned to its
 /// nearest centroid. Returns `(centroids[clusters * dim], labels[count])`.
 fn kmeans(vectors: &[f32], dim: usize, clusters: usize, iterations: usize) -> (Vec<f32>, Vec<usize>) {
+    if dim == 0 {
+        return (vec![], vec![0; vectors.len()]);
+    }
+    
     let count = vectors.len() / dim;
+    if count == 0 {
+        return (vec![], vec![]);
+    }
+    
     let clusters = clusters.clamp(1, count.max(1));
 
     // Deterministic, well-spread initial centroids by striding the input.
     let mut centroids = vec![0.0f32; clusters * dim];
     for c in 0..clusters {
-        let src = (c * count / clusters).min(count.saturating_sub(1)) * dim;
-        centroids[c * dim..(c + 1) * dim].copy_from_slice(&vectors[src..src + dim]);
+        let src_idx = (c * count / clusters).min(count.saturating_sub(1));
+        let src = src_idx * dim;
+        if src + dim <= vectors.len() {
+            centroids[c * dim..(c + 1) * dim].copy_from_slice(&vectors[src..src + dim]);
+        }
     }
 
     // Training subsample (strided) keeps Lloyd iterations cheap.
@@ -545,13 +595,16 @@ fn kmeans(vectors: &[f32], dim: usize, clusters: usize, iterations: usize) -> (V
         }
         let mut i = 0;
         while i < count {
-            let v = &vectors[i * dim..(i + 1) * dim];
-            let c = nearest_centroid(&centroids, dim, clusters, v);
-            let off = c * dim;
-            for d in 0..dim {
-                sums[off + d] += v[d];
+            if let Some(v) = vectors.get(i * dim..(i + 1) * dim) {
+                let c = nearest_centroid(&centroids, dim, clusters, v);
+                let off = c * dim;
+                if off + dim <= sums.len() {
+                    for d in 0..dim {
+                        sums[off + d] += v[d];
+                    }
+                    counts[c] = counts[c].saturating_add(1);
+                }
             }
-            counts[c] += 1;
             i += train_stride;
         }
         for c in 0..clusters {
@@ -571,8 +624,9 @@ fn kmeans(vectors: &[f32], dim: usize, clusters: usize, iterations: usize) -> (V
         if i % report_every == 0 {
             crate::emit_progress("sh", Some(i as f64 / count as f64));
         }
-        let v = &vectors[i * dim..(i + 1) * dim];
-        labels[i] = nearest_centroid(&centroids, dim, clusters, v);
+        if let Some(v) = vectors.get(i * dim..(i + 1) * dim) {
+            labels[i] = nearest_centroid(&centroids, dim, clusters, v);
+        }
     }
 
     (centroids, labels)
@@ -580,12 +634,22 @@ fn kmeans(vectors: &[f32], dim: usize, clusters: usize, iterations: usize) -> (V
 
 #[inline]
 fn nearest_centroid(centroids: &[f32], dim: usize, clusters: usize, v: &[f32]) -> usize {
+    if dim == 0 || clusters == 0 {
+        return 0;
+    }
+    if centroids.len() < clusters * dim {
+        // Safety: avoid out-of-bounds access
+        return 0;
+    }
     let mut best = 0usize;
     let mut best_dist = f32::INFINITY;
     for c in 0..clusters {
         let off = c * dim;
         let mut dist = 0.0f32;
         for d in 0..dim {
+            if off + d >= centroids.len() || d >= v.len() {
+                continue;
+            }
             let diff = centroids[off + d] - v[d];
             dist += diff * diff;
             if dist >= best_dist {
