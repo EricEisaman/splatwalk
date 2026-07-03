@@ -19,6 +19,7 @@ import '@babylonjs/loaders'; // Import loaders (OBJ, GLTF, STL)
 import { GLTF2Export } from '@babylonjs/serializers/glTF';
 import { Crowd, NavMesh as RecastNavMesh, init as initRecast, importNavMesh, CrowdAgent } from 'recast-navigation';
 import type { GroundFieldCellState, WalkableGroundFieldResult } from '../wasm/bridge';
+import { SplatPerfHud, installSplatWalkPerfProbe } from './splatPerfHud';
 
 /** Construction options for {@link Viewer}. */
 export interface ViewerOptions {
@@ -50,7 +51,9 @@ export class Viewer {
         // this.createDummyMesh();
 
         // Start render loop
+        installSplatWalkPerfProbe(this._perfHud);
         this.engine.runRenderLoop(() => {
+            this._perfHud.recordFrame();
             this.scene.render();
         });
 
@@ -103,6 +106,7 @@ export class Viewer {
     private splatMesh: AbstractMesh | null = null;
     private splatMeshes: AbstractMesh[] = [];
     private rotation: { x: number, y: number, z: number } = { x: 0, y: 0, z: 0 };
+    private readonly _perfHud = new SplatPerfHud();
 
     /**
      * Visualize a splat from full-fidelity binary 3DGS PLY bytes. Non-PLY formats
@@ -112,6 +116,7 @@ export class Viewer {
      * the app CSP), and keeps splat orientation consistent across input formats.
      */
     public async loadGaussianSplat(plyBytes: Uint8Array): Promise<void> {
+        const loadStart = performance.now();
         try {
             this.disableRegionSelection();
             this.clearGroundFieldOverlay();
@@ -145,6 +150,11 @@ export class Viewer {
                 this.camera.setTarget(center);
                 this.camera.radius = radius * 2.0;
             }
+
+            this._perfHud.recordSplatLoad(
+                performance.now() - loadStart,
+                this.splatMeshes.length,
+            );
 
         } catch (e) {
             console.error("Failed to visualize splat:", e);
