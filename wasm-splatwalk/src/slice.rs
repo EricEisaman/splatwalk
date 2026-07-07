@@ -79,117 +79,167 @@ pub struct SliceManifest {
     pub chunk_count: usize,
 }
 
-// --- lod-meta.json schema ------------------------------------------------
+// --- PlayCanvas Streamed SOG v1 / BJS 9.15-compatible lod-meta.json schema ---
+//
+// BJS 9.15 GaussianSplattingStream is an explicit port of the PlayCanvas Streamed
+// SOG format. IsLODMetadata validates { lodLevels, filenames, tree } and ignores
+// the PlayCanvas v1 fields { version, count, counts, asset } for backward compat.
+//
+// We emit the full PlayCanvas v1 schema so the output is accepted by both BJS and
+// PlayCanvas tooling:
+//   version: 1              — PC v1 required; BJS ignores but accepts
+//   count: N                — total Gaussians (finest level); PC v1 required
+//   counts: [N0, N1, ...]   — per-LOD Gaussian count; PC v1 required
+//   lodLevels: N            — required by both
+//   filenames: [...]        — required by both
+//   tree: { bound, lods }   — required by both
+//
+// References:
+//   BJS PR #18588  — gaussianSplattingStream.ts ISOGLODMetadata
+//   PlayCanvas spec — https://developer.playcanvas.com/user-manual/gaussian-splatting/formats/streamed-sog/
+
+use std::collections::HashMap;
 
 #[derive(Serialize)]
-struct LodMeta {
+struct BjsLodEntry {
+    file: usize,
+    offset: usize,
+    count: usize,
+}
+
+#[derive(Serialize)]
+struct BjsBound {
+    min: [f64; 3],
+    max: [f64; 3],
+}
+
+#[derive(Serialize)]
+struct BjsLodNode {
+    bound: BjsBound,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    children: Option<Vec<BjsLodNode>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lods: Option<HashMap<String, BjsLodEntry>>,
+}
+
+#[derive(Serialize)]
+struct BjsLodMeta {
+    /// PlayCanvas v1 format version. BJS ignores this field but accepts it.
     version: u32,
-    #[serde(rename = "splatCount")]
-    splat_count: usize,
-    #[serde(rename = "shDegree")]
-    sh_degree: usize,
-    #[serde(rename = "chunkCountTarget")]
-    chunk_count_target: usize,
-    #[serde(rename = "chunkExtent")]
-    chunk_extent: f64,
-    levels: Vec<LodLevel>,
+    #[serde(rename = "lodLevels")]
+    lod_levels: usize,
+    /// Total Gaussians in the scene (= finest LOD level count). PlayCanvas v1 required.
+    count: usize,
+    /// Gaussian count per LOD level (index 0 = finest). PlayCanvas v1 required.
+    counts: Vec<usize>,
+    filenames: Vec<String>,
+    tree: BjsLodNode,
 }
 
-#[derive(Serialize)]
-struct LodLevel {
-    level: usize,
-    #[serde(rename = "splatCount")]
-    splat_count: usize,
-    chunks: Vec<LodChunk>,
-}
-
-#[derive(Serialize)]
-struct LodChunk {
-    id: usize,
-    #[serde(rename = "splatCount")]
-    splat_count: usize,
-    #[serde(rename = "boundMin")]
-    bound_min: [f32; 3],
-    #[serde(rename = "boundMax")]
-    bound_max: [f32; 3],
-    /// Directory (within the bundle) holding this chunk's `meta.json` + planes.
-    dir: String,
-    meta: String,
-}
-
-/// Slice a full-fidelity cloud into a streamed-SOG manifest.
+/// Slice a full-fidelity cloud into a BJS 9.15-compatible streamed-SOG manifest.
+///
+/// Each LOD level maps to one SOG meta.json + WebP planes. The `lod-meta.json`
+/// `tree` is a single root leaf node whose `lods` map covers all levels, so BJS
+/// can stream the finest available level based on camera distance. For multi-GB
+/// source files the slicing stride thins the cloud at coarser levels without
+/// holding the full cloud twice in memory.
 pub fn slice(cloud: &FullSplatCloud, params: &SliceParams) -> Result<SliceManifest, String> {
     let total = cloud.len();
     if total == 0 {
         return Err("Cannot slice an empty splat cloud".to_string());
     }
 
+    // Guard against overflow on very large clouds (multi-GB source files).
+    let levels = params.lod_levels.max(1).min(8);
+
     let order = morton_order(cloud);
-    let levels = params.lod_levels.max(1);
 
     let mut files: Vec<SliceTextFile> = Vec::new();
     let mut binaries: Vec<SliceBinaryFile> = Vec::new();
-    let mut meta_levels: Vec<LodLevel> = Vec::with_capacity(levels);
+    let mut filenames: Vec<String> = Vec::with_capacity(levels);
+    let mut lods: HashMap<String, BjsLodEntry> = HashMap::with_capacity(levels);
+    let mut per_level_counts: Vec<usize> = Vec::with_capacity(levels);
     let mut global_chunk_count = 0usize;
+    let mut file_index = 0usize;
 
     for level in 0..levels {
-        // Coarsest level (0) is most decimated; the last level is full detail.
-        let stride = 1usize << (levels - 1 - level);
-        let level_indices: Vec<usize> = order.iter().copied().step_by(stride).collect();
-        let chunks = chunk_indices(cloud, &level_indices, params);
+        // Level 0 = finest (BJS/PC convention). Coarser levels subsample.
+        // stride = 1 at finest level; doubles per coarser step.
+        let stride = 1usize << level;
+        // Clamp to avoid zero-length level on very small clouds.
+        let level_indices: Vec<usize> = order
+            .iter()
+            .copied()
+            .step_by(stride.max(1))
+            .take(total.saturating_div(stride.max(1)).max(1))
+            .collect();
 
-        let mut meta_chunks: Vec<LodChunk> = Vec::with_capacity(chunks.len());
-        for (chunk_id, chunk) in chunks.iter().enumerate() {
-            let dir = format!("lod{}/chunk{}", level, chunk_id);
-            let sub = cloud.select(chunk);
-            let dataset = encode_sog(
-                &sub,
-                params.sh_degree,
-                params.sh_cluster_count,
-                params.sh_iterations,
-            );
-
-            let meta_json = serde_json::to_string(&dataset.meta)
-                .map_err(|e| format!("Failed to serialize chunk meta: {}", e))?;
-            files.push(SliceTextFile {
-                path: format!("{}/meta.json", dir),
-                contents: meta_json,
-            });
-
-            for plane in &dataset.planes {
-                let bytes = plane.encode_webp()?;
-                binaries.push(SliceBinaryFile {
-                    path: format!("{}/{}", dir, plane.name),
-                    bytes,
-                });
-            }
-
-            let (bound_min, bound_max) = bounds(cloud, chunk);
-            meta_chunks.push(LodChunk {
-                id: chunk_id,
-                splat_count: chunk.len(),
-                bound_min,
-                bound_max,
-                dir,
-                meta: "meta.json".to_string(),
-            });
-            global_chunk_count += 1;
+        if level_indices.is_empty() {
+            continue;
         }
 
-        meta_levels.push(LodLevel {
-            level,
-            splat_count: level_indices.len(),
-            chunks: meta_chunks,
+        let dir = format!("lod{}", level);
+        let sub = cloud.select(&level_indices);
+        let dataset = encode_sog(
+            &sub,
+            params.sh_degree,
+            params.sh_cluster_count,
+            params.sh_iterations,
+        );
+
+        let meta_path = format!("{}/meta.json", dir);
+        let meta_json = serde_json::to_string(&dataset.meta)
+            .map_err(|e| format!("Failed to serialize chunk meta: {}", e))?;
+        files.push(SliceTextFile {
+            path: meta_path.clone(),
+            contents: meta_json,
         });
+
+        for plane in &dataset.planes {
+            let bytes = plane.encode_webp()?;
+            binaries.push(SliceBinaryFile {
+                path: format!("{}/{}", dir, plane.name),
+                bytes,
+            });
+        }
+
+        filenames.push(meta_path);
+        lods.insert(
+            level.to_string(),
+            BjsLodEntry {
+                file: file_index,
+                offset: 0,
+                count: level_indices.len(),
+            },
+        );
+        per_level_counts.push(level_indices.len());
+        file_index += 1;
+        global_chunk_count += 1;
     }
 
-    let lod_meta = LodMeta {
-        version: LOD_META_VERSION,
-        splat_count: total,
-        sh_degree: cloud.sh_degree.min(params.sh_degree),
-        chunk_count_target: params.chunk_count,
-        chunk_extent: params.chunk_extent,
-        levels: meta_levels,
+    if filenames.is_empty() {
+        return Err("Slice produced no LOD levels — cloud may be too small.".to_string());
+    }
+
+    let (world_min, world_max) = bounds_all(cloud);
+    let root_node = BjsLodNode {
+        bound: BjsBound {
+            min: [world_min[0] as f64, world_min[1] as f64, world_min[2] as f64],
+            max: [world_max[0] as f64, world_max[1] as f64, world_max[2] as f64],
+        },
+        children: None,
+        lods: Some(lods),
+    };
+
+    // `count` = finest-level splat count (PC v1: total across all LOD levels
+    // excluding environment; for our single-leaf tree, level 0 is the finest).
+    let lod_meta = BjsLodMeta {
+        version: 1,
+        lod_levels: file_index,
+        count: total,
+        counts: per_level_counts,
+        filenames: filenames.clone(),
+        tree: root_node,
     };
     let lod_meta_json = serde_json::to_string_pretty(&lod_meta)
         .map_err(|e| format!("Failed to serialize lod-meta: {}", e))?;
@@ -204,8 +254,8 @@ pub fn slice(cloud: &FullSplatCloud, params: &SliceParams) -> Result<SliceManife
     })
 }
 
-/// Convenience for the single-bundle (non-LOD) SOG export path. Returns one
-/// `meta.json` plus its planes, all at the bundle root.
+/// Single (non-LOD) SOG export: one `meta.json` + planes, plus a BJS-compatible
+/// `lod-meta.json` wrapping it as a single-level tree root.
 pub fn encode_single(
     cloud: &FullSplatCloud,
     sh_degree: usize,
@@ -226,13 +276,48 @@ pub fn encode_single(
         });
     }
 
+    let (world_min, world_max) = bounds_all(cloud);
+    let mut lods = HashMap::new();
+    lods.insert(
+        "0".to_string(),
+        BjsLodEntry {
+            file: 0,
+            offset: 0,
+            count: cloud.len(),
+        },
+    );
+    let splat_count = cloud.len();
+    let lod_meta = BjsLodMeta {
+        version: 1,
+        lod_levels: 1,
+        count: splat_count,
+        counts: vec![splat_count],
+        filenames: vec!["meta.json".to_string()],
+        tree: BjsLodNode {
+            bound: BjsBound {
+                min: [world_min[0] as f64, world_min[1] as f64, world_min[2] as f64],
+                max: [world_max[0] as f64, world_max[1] as f64, world_max[2] as f64],
+            },
+            children: None,
+            lods: Some(lods),
+        },
+    };
+    let lod_meta_json = serde_json::to_string_pretty(&lod_meta)
+        .map_err(|e| format!("Failed to serialize lod-meta: {}", e))?;
+
     Ok(SliceManifest {
-        lod_meta_path: "meta.json".to_string(),
-        lod_meta_json: meta_json.clone(),
-        files: vec![SliceTextFile {
-            path: "meta.json".to_string(),
-            contents: meta_json,
-        }],
+        lod_meta_path: "lod-meta.json".to_string(),
+        lod_meta_json: lod_meta_json.clone(),
+        files: vec![
+            SliceTextFile {
+                path: "lod-meta.json".to_string(),
+                contents: lod_meta_json,
+            },
+            SliceTextFile {
+                path: "meta.json".to_string(),
+                contents: meta_json,
+            },
+        ],
         binaries,
         splat_count: cloud.len(),
         chunk_count: 1,
