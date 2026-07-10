@@ -185,6 +185,16 @@ export interface NavmeshBasisResult extends ResultContract {
     diagnostics: ReconstructionDiagnostics;
 }
 
+export interface CollisionVoxelBoundaryResult extends ResultContract {
+    mesh: MeshBuffers;
+    /** GLB bytes of the collision mesh, present only when `emit_glb` was set. */
+    glb?: Uint8Array;
+    space: CoordinateSpace;
+    basis: FieldBasis;
+    floor_plane: FloorPlane;
+    diagnostics: ReconstructionDiagnostics;
+}
+
 export interface WalkableGroundFieldResult extends ResultContract {
     cells: GroundFieldCell[];
     width: number;
@@ -211,6 +221,12 @@ export interface RoomFloorSettings extends MeshSettings {
     emit_glb?: boolean;
     /** Optional recovery ladder; when omitted a built-in default ladder is used. */
     recovery?: RoomFloorRecoveryStep[];
+}
+
+/** Settings for {@link SplatWalkBridge.buildCollisionVoxelBoundary}. */
+export interface CollisionVoxelBoundarySettings extends MeshSettings {
+    /** When true, also emit a GLB of the collision boundary mesh in `glb`. Default false. */
+    emit_glb?: boolean;
 }
 
 /** Result of {@link SplatWalkBridge.buildRoomFloorMesh}: a triangulated room-floor mesh. */
@@ -420,6 +436,11 @@ export class SplatWalkBridge {
     public async convertSplatToNavmeshBasis(data: Uint8Array, settings: MeshSettings): Promise<NavmeshBasisResult> {
         await this.ensureLoaded(data);
         return this.call<NavmeshBasisResult>('convertSplatToNavmeshBasis', { settings });
+    }
+
+    public async buildCollisionVoxelBoundary(data: Uint8Array, settings: CollisionVoxelBoundarySettings): Promise<CollisionVoxelBoundaryResult> {
+        await this.ensureLoaded(data);
+        return this.call<CollisionVoxelBoundaryResult>('buildCollisionVoxelBoundary', { settings });
     }
 
     public async buildWalkableGroundField(data: Uint8Array, settings: MeshSettings): Promise<WalkableGroundFieldResult> {

@@ -34,6 +34,7 @@ pub const API_VERSION: u8 = 2;
 /// tolerate additive changes (new entry points / fields) instead of hard-failing
 /// on every version bump. See `docs/wasm-api.md` for the documented meaning.
 pub const CAPABILITIES: &[&str] = &[
+    "collision_voxel_boundary",
     "progress_protocol_v1",
     "glb_export",
     "room_floor_mesh",
@@ -556,6 +557,20 @@ pub struct NavmeshBasisResult {
 }
 
 #[derive(Serialize)]
+pub struct CollisionVoxelBoundaryResult {
+    pub api_version: u8,
+    pub semver: String,
+    pub capabilities: Vec<String>,
+    pub mesh: MeshBuffers,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub glb: Option<serde_bytes::ByteBuf>,
+    pub space: CoordinateSpace,
+    pub basis: FieldBasis,
+    pub floor_plane: FloorPlane,
+    pub diagnostics: ReconstructionDiagnostics,
+}
+
+#[derive(Serialize)]
 pub struct WalkableGroundFieldResult {
     pub api_version: u8,
     pub semver: String,
@@ -610,6 +625,11 @@ struct RoomFloorOptions {
     recovery: Option<Vec<RoomFloorStepCfg>>,
 }
 
+#[derive(Deserialize, Default)]
+struct CollisionVoxelBoundaryOptions {
+    emit_glb: Option<bool>,
+}
+
 /// Built-in recovery ladder mirroring the TypeScript `DEFAULT_FAST_NAV_RECOVERY`.
 fn default_room_floor_recovery() -> Vec<RoomFloorStepCfg> {
     use serde_json::json;
@@ -660,6 +680,19 @@ fn default_room_floor_recovery() -> Vec<RoomFloorStepCfg> {
 
 fn parse_settings(settings: JsValue) -> Result<MeshSettings, JsValue> {
     serde_wasm_bindgen::from_value(settings).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+fn validate_collision_mesh_mode(settings: &MeshSettings) -> Result<(), JsValue> {
+    match settings.collision_mesh_mode.as_deref().unwrap_or("faces") {
+        "faces" => Ok(()),
+        "smooth" => Err(JsValue::from_str(
+            "collision_mesh_mode=\"smooth\" is reserved but not implemented; use \"faces\".",
+        )),
+        other => Err(JsValue::from_str(&format!(
+            "Invalid collision_mesh_mode: {}. Expected \"faces\" or \"smooth\".",
+            other
+        ))),
+    }
 }
 
 /// Identity of a parsed+pruned+oriented point set, so repeated WASM calls on the
@@ -799,6 +832,9 @@ pub fn suggest_region(data: &[u8], settings: JsValue) -> Result<JsValue, JsValue
 pub fn convert_splat_to_mesh(data: &[u8], settings: JsValue) -> Result<JsValue, JsValue> {
     let settings = parse_settings(settings)?;
     let mode = settings.mode;
+    if mode == 2 {
+        validate_collision_mesh_mode(&settings)?;
+    }
 
     log(&format!("Received {} bytes (Mode: {})", data.len(), mode));
 
@@ -816,9 +852,27 @@ pub fn convert_splat_to_mesh(data: &[u8], settings: JsValue) -> Result<JsValue, 
 #[wasm_bindgen]
 pub fn convert_splat_to_navmesh_basis(data: &[u8], settings: JsValue) -> Result<JsValue, JsValue> {
     let settings = parse_settings(settings)?;
+    validate_collision_mesh_mode(&settings)?;
     let splats = parse_splats(data, &settings)?;
     let mut result = mesh::convert_splat_to_navmesh_basis(&splats, &settings);
     output_space::apply_navmesh_basis(&settings, &mut result);
+    Ok(serde_wasm_bindgen::to_value(&result)?)
+}
+
+#[wasm_bindgen]
+pub fn build_collision_voxel_boundary(data: &[u8], settings: JsValue) -> Result<JsValue, JsValue> {
+    let options: CollisionVoxelBoundaryOptions =
+        serde_wasm_bindgen::from_value(settings.clone()).unwrap_or_default();
+    let settings = parse_settings(settings)?;
+    validate_collision_mesh_mode(&settings)?;
+    let splats = parse_splats(data, &settings)?;
+    let mut result = mesh::build_collision_voxel_boundary(&splats, &settings);
+    output_space::apply_collision_voxel_boundary(&settings, &mut result);
+    if options.emit_glb.unwrap_or(false) {
+        let bytes = glb::mesh_to_glb(&result.mesh.vertices, &result.mesh.indices)
+            .map_err(|e| JsValue::from_str(&e))?;
+        result.glb = Some(serde_bytes::ByteBuf::from(bytes));
+    }
     Ok(serde_wasm_bindgen::to_value(&result)?)
 }
 

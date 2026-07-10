@@ -2,6 +2,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import NavWorker from '@/navigation/navmesh.worker?worker';
 import {
+  buildCollisionBoundarySettings,
+  exportCollisionBoundaryGlb,
+  exportNavmeshBinary,
+  generateCollisionBoundary as generateCollisionBoundaryArtifact,
+  type CollisionBoundaryArtifact,
+} from '@/collision/voxelBoundary';
+import {
   FAST_NAV_PRESET,
   extractFloorFieldWithRecovery,
   resolveRecovery,
@@ -224,8 +231,10 @@ export function useSplatFastNavR3F() {
   const [maxChunkExtent, setMaxChunkExtent] = useState(DEFAULT_SLICE_SETTINGS.chunk_extent);
 
   const wasmReady = useRef(false);
+  const currentCollisionArtifact = useRef<CollisionBoundaryArtifact | null>(null);
   const currentBytes = useRef<Uint8Array | null>(null);
   const currentName = useRef('splat');
+  const currentNavMeshData = useRef<Uint8Array | null>(null);
 
   const isBusy = status === 'loading' || status === 'processing';
 
@@ -250,15 +259,19 @@ export function useSplatFastNavR3F() {
     setSplatCount(null);
     setMaxShDegree(DEFAULT_SLICE_SETTINGS.sh_degree);
     setMaxChunkExtent(DEFAULT_SLICE_SETTINGS.chunk_extent);
+    currentCollisionArtifact.current = null;
     currentBytes.current = null;
     currentName.current = 'splat';
+    currentNavMeshData.current = null;
     void controller.reset();
   }, [controller]);
 
   const processBytes = useCallback(
     async (bytes: Uint8Array, name: string): Promise<void> => {
       currentBytes.current = bytes;
+      currentCollisionArtifact.current = null;
       currentName.current = name.replace(/\.(ply|spz|splat)$/i, '');
+      currentNavMeshData.current = null;
       setMaxShDegree(inferPlyShDegree(bytes));
 
       if (!wasmReady.current) {
@@ -297,6 +310,7 @@ export function useSplatFastNavR3F() {
         debugPositions: Float32Array,
         debugIndices: Uint32Array
       ): Promise<void> => {
+        currentNavMeshData.current = navMeshData;
         controller.showNavMesh(debugPositions, debugIndices);
         const playerSpawn = navMeshCentroid(debugPositions);
         const npcSpawn = farthestVertex(debugPositions, playerSpawn);
@@ -449,6 +463,60 @@ export function useSplatFastNavR3F() {
     []
   );
 
+  const exportNavmesh = useCallback(async (): Promise<void> => {
+    const navMeshData = currentNavMeshData.current;
+    if (!navMeshData) throw new Error('No navmesh generated to export.');
+    exportNavmeshBinary({
+      filename: `${currentName.current}.nav`,
+      navMeshData,
+    });
+  }, []);
+
+  const generateCollisionBoundary = useCallback(async (): Promise<CollisionBoundaryArtifact> => {
+    const bytes = currentBytes.current;
+    if (!bytes) throw new Error('No splat loaded to generate collision from.');
+    const base: MeshSettings = { ...FAST_NAV_PRESET, mode: 2, flip_y: true, rotation: [0, 0, 0] };
+    const carveHeight = FAST_NAV_PRESET.collision_carve_height ?? 1.7;
+    const suggested = await splatwalk.suggestRegion(bytes, base);
+    const seed = [
+      (suggested.region_min[0] + suggested.region_max[0]) * 0.5,
+      suggested.floor_y + carveHeight * 0.5,
+      (suggested.region_min[2] + suggested.region_max[2]) * 0.5,
+    ];
+    const artifact = await generateCollisionBoundaryArtifact({
+      bytes,
+      settings: buildCollisionBoundarySettings({
+        base,
+        emitGlb: true,
+        flipY: true,
+        rotation: [0, 0, 0],
+        seed,
+      }),
+    });
+    currentCollisionArtifact.current = artifact;
+    controller.showCollisionBoundary(
+      new Float32Array(artifact.result.mesh.vertices),
+      new Uint32Array(artifact.result.mesh.indices)
+    );
+    appendLog(
+      `[SUCCESS] Collision boundary ready: ${artifact.result.mesh.vertex_count} vertices, ${artifact.result.mesh.face_count} faces.`
+    );
+    return artifact;
+  }, [appendLog, controller]);
+
+  const exportCollisionMesh = useCallback(async (): Promise<Uint8Array> => {
+    const artifact = currentCollisionArtifact.current ?? await generateCollisionBoundary();
+    return exportCollisionBoundaryGlb({
+      artifact,
+      filename: `${currentName.current}.collision.glb`,
+    });
+  }, [generateCollisionBoundary]);
+
+  const setCollisionBoundaryVisible = useCallback(
+    (visible: boolean): void => controller.setCollisionBoundaryVisible(visible),
+    [controller]
+  );
+
   return {
     controller,
     status,
@@ -465,6 +533,10 @@ export function useSplatFastNavR3F() {
     loadAndProcess,
     loadExample,
     exportSog,
+    exportNavmesh,
+    generateCollisionBoundary,
+    exportCollisionMesh,
+    setCollisionBoundaryVisible,
     reset,
   };
 }

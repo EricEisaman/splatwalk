@@ -56,6 +56,7 @@ export class SplatNavController {
   private splatGroup: THREE.Group | null = null;
   private splatViewer: GaussianSplats3D.DropInViewer | null = null;
 
+  private collisionBoundaryMesh: THREE.Mesh | null = null;
   private floorMesh: THREE.Mesh | null = null;
   private navMeshOverlay: THREE.Mesh | null = null;
 
@@ -125,6 +126,11 @@ export class SplatNavController {
         world.remove(this.floorMesh);
         this.disposeMesh(this.floorMesh);
         this.floorMesh = null;
+      }
+      if (this.collisionBoundaryMesh) {
+        world.remove(this.collisionBoundaryMesh);
+        this.disposeMesh(this.collisionBoundaryMesh);
+        this.collisionBoundaryMesh = null;
       }
       if (this.navMeshOverlay) {
         world.remove(this.navMeshOverlay);
@@ -210,6 +216,33 @@ export class SplatNavController {
     });
     this.floorMesh = new THREE.Mesh(geometry, material);
     this.world.add(this.floorMesh);
+  }
+
+  /** Show the collision voxel boundary overlay (cyan), independent of the navmesh. */
+  public showCollisionBoundary(positions: Float32Array, indices: Uint32Array): void {
+    if (!this.world) return;
+    if (this.collisionBoundaryMesh) {
+      this.world.remove(this.collisionBoundaryMesh);
+      this.disposeMesh(this.collisionBoundaryMesh);
+    }
+    const geometry = this.buildGeometry(positions, indices);
+    const material = new THREE.MeshBasicMaterial({
+      color: 0x00d9ff,
+      transparent: true,
+      opacity: 0.28,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    this.collisionBoundaryMesh = new THREE.Mesh(geometry, material);
+    this.collisionBoundaryMesh.renderOrder = 1;
+    this.world.add(this.collisionBoundaryMesh);
+  }
+
+  /** Toggle the collision voxel boundary overlay. */
+  public setCollisionBoundaryVisible(visible: boolean): void {
+    if (this.collisionBoundaryMesh) {
+      this.collisionBoundaryMesh.visible = visible;
+    }
   }
 
   /** Show the walkable navmesh overlay (green) and use it as the click target. */
@@ -345,6 +378,11 @@ export class SplatNavController {
         this.world.remove(this.floorMesh);
         this.disposeMesh(this.floorMesh);
         this.floorMesh = null;
+      }
+      if (this.collisionBoundaryMesh) {
+        this.world.remove(this.collisionBoundaryMesh);
+        this.disposeMesh(this.collisionBoundaryMesh);
+        this.collisionBoundaryMesh = null;
       }
       if (this.navMeshOverlay) {
         this.world.remove(this.navMeshOverlay);

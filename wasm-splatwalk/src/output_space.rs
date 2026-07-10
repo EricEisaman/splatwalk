@@ -16,8 +16,9 @@
 use serde::Deserialize;
 
 use crate::{
-    CoordinateSpace, FieldBasis, FloorPlane, MeshBuffers, MeshSettings, NavmeshBasisResult,
-    ReconstructionResult, SplatBounds, SuggestedRegion, WalkableGroundFieldResult,
+    CollisionVoxelBoundaryResult, CoordinateSpace, FieldBasis, FloorPlane, MeshBuffers,
+    MeshSettings, NavmeshBasisResult, ReconstructionResult, SplatBounds, SuggestedRegion,
+    WalkableGroundFieldResult,
 };
 
 /// Requested output coordinate convention. All fields are optional and default to
@@ -198,6 +199,18 @@ pub fn apply_reconstruction(settings: &MeshSettings, result: &mut Reconstruction
 }
 
 pub fn apply_navmesh_basis(settings: &MeshSettings, result: &mut NavmeshBasisResult) {
+    if let Some(t) = transform_for(settings) {
+        apply_mesh_buffers(&t, &mut result.mesh);
+        apply_basis(&t, &mut result.basis);
+        apply_floor_plane(&t, &mut result.floor_plane);
+        result.space = t.coordinate_space();
+    }
+}
+
+pub fn apply_collision_voxel_boundary(
+    settings: &MeshSettings,
+    result: &mut CollisionVoxelBoundaryResult,
+) {
     if let Some(t) = transform_for(settings) {
         apply_mesh_buffers(&t, &mut result.mesh);
         apply_basis(&t, &mut result.basis);

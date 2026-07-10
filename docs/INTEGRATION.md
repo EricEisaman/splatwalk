@@ -70,6 +70,9 @@ const version = splatwalk_version();          // tracks the crate version, e.g. 
 if (!caps.includes('room_floor_mesh')) {
   // Fall back to the multi-step field path instead of the one-call entry point.
 }
+if (!caps.includes('collision_voxel_boundary')) {
+  // Hide collision/physics export UI or fall back to an imported .collision.glb.
+}
 ```
 
 ## 3. One-call room floor
@@ -101,9 +104,35 @@ If you need the lower-level field (per-cell states for your own meshing), use
 `build_walkable_ground_field` instead and merge `fast_nav_preset()` into your
 settings as the base layer.
 
-## 4. The coordinate / `flip_y` contract (read this first)
+## 4. Collision voxel boundary mode
 
-> For the condensed, cross-engine summary of this section and sections 9-10, see
+Collision export is a second runtime mode, not the default FAST NAV navmesh mode:
+
+```ts
+import {
+  build_collision_voxel_boundary,
+  mesh_to_glb,
+} from '@splatwalk/core';
+
+const collision = build_collision_voxel_boundary(splatBytes, {
+  mode: 2,
+  flip_y: true,
+  rotation: [0, 0, 0],
+  collision_mesh_mode: 'faces',
+  collision_scene_type: 'outdoor',
+  collision_seed: [0, 1, 0],
+  emit_glb: true,
+});
+
+const collisionGlb =
+  collision.glb ?? mesh_to_glb(collision.mesh.vertices, collision.mesh.indices);
+```
+
+Use this path for a collision/physics overlay or `.collision.glb` export. It follows the PlayCanvas-inspired voxel occupancy/fill/carve pipeline and emits exact voxel-boundary faces today. `collision_mesh_mode: 'smooth'` is reserved and rejected until smoothing is implemented. For walking/crowd simulation, keep using the FAST NAV floor-field path; do not feed the collision mesh into the one-button room navigation workflow unless you are intentionally running an advanced/manual collider bake.
+
+## 5. The coordinate / `flip_y` contract (read this first)
+
+> For the condensed, cross-engine summary of this section and sections 10-11, see
 > the one-page [Canonical GS Alignment Recipe](coordinate-alignment.md).
 
 The single most common integration bug is a navmesh mirrored or offset from the
@@ -131,7 +160,7 @@ const result = build_room_floor_mesh(splatBytes, {
 // result.space.space === 'engine_output'
 ```
 
-## 5. Feeding Recast without the voxel-truncation bug
+## 6. Feeding Recast without the voxel-truncation bug
 
 Recast stores agent dimensions as **integer voxel counts**, so passing sub-metre
 metre values silently truncates them to `0` (a slab or a fragmented navmesh).
@@ -155,7 +184,7 @@ const cfg = recast_config({
 See [Recast parameter units (metres vs voxels)](wasm-api.md#recast-parameter-units-metres-vs-voxels)
 for the exact conversion.
 
-## 6. Progress reporting
+## 7. Progress reporting
 
 Register an opt-in callback invoked as `(stage, fraction)` at documented stage
 boundaries - no need to intercept the global console. The
@@ -173,7 +202,7 @@ set_progress_callback((stage, fraction) => {
 set_progress_callback(undefined);   // clear when done
 ```
 
-## 7. Handling failures
+## 8. Handling failures
 
 `build_room_floor_mesh` throws a structured `RoomFloorFailure` object (not a
 string) when no recovery step yields a usable floor. Branch on the stable
@@ -198,7 +227,7 @@ try {
 }
 ```
 
-## 8. Framework-agnostic floor module
+## 9. Framework-agnostic floor module
 
 The `@splatwalk/core/floor` subpath ships the FAST NAV floor logic with no
 Babylon or bundler dependency. Inject the binary's field builder so the module
@@ -231,7 +260,7 @@ builds a Recast navmesh, and runs a click-to-move crowd, see the
 `src/react/`). It uses the same engine-agnostic floor module and
 `recast-navigation` crowd on a three.js scene.
 
-## 9. Babylon.js integration
+## 10. Babylon.js integration
 
 Babylon.js is the reference renderer for the SplatWalk showcase. The complete,
 working integration is `src/scene/Viewer.ts` (UI in `src/vuetify/`, route
@@ -361,7 +390,7 @@ const agentIndex = crowd.addAgent(nav.getClosestPoint(center), agentParams, agen
   `access-control-allow-origin: *`. `.spz` examples are gunzipped in-browser
   (`DecompressionStream('gzip')`) before `spz_to_ply`.
 
-## 10. React Three Fiber (three.js) integration
+## 11. React Three Fiber (three.js) integration
 
 A first-class three.js / React reference ships in-repo: route `/react`, source
 under `src/react/` (engine logic in `src/react/three/SplatNavController.ts`),
@@ -420,7 +449,7 @@ target the player, and use a vertical FOV of `~0.8 rad (45.84°)` to match
 Babylon's `ArcRotateCamera`. Use a ceiling `margin` of ~`0.65 m` so the camera
 keeps headroom below the ceiling instead of hugging it.
 
-## 11. Integrator ask status
+## 12. Integrator ask status
 
 The community integration wishlist gathered against the pre-release core is fully
 addressed as of v0.3.0:

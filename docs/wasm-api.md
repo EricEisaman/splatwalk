@@ -8,7 +8,7 @@ This document describes the v2 SplatWalk WASM API contract. The v2 API is intent
 - `settings.rotation` is applied after `flip_y`, and before bounds, suggested regions, region filtering, mesh extraction, navmesh-basis generation, and walkable-ground-field generation. Re-running generation after a user rotation therefore re-aligns every output to the new orientation.
 - `region_min` and `region_max` are expressed in `splatwalk_oriented` space (post-`flip_y`, post-`rotation`).
 - `splatwalk_oriented` uses `up_axis: "y"` and `handedness: "right"`.
-- `get_splat_bounds`, `suggest_region`, `convert_splat_to_mesh`, `convert_splat_to_navmesh_basis`, and `build_walkable_ground_field` all report the `space` metadata they use.
+- `get_splat_bounds`, `suggest_region`, `convert_splat_to_mesh`, `build_collision_voxel_boundary`, `convert_splat_to_navmesh_basis`, and `build_walkable_ground_field` all report the `space` metadata they use.
 - Returned mesh vertices are emitted in the same `splatwalk_oriented` space as region filtering. Integrators should not infer transforms from Babylon preview meshes.
 - Every v2 result includes `api_version: 2` so integrations can fail fast on stale bindings.
 
@@ -47,7 +47,7 @@ Every v2 result carries three compatibility fields:
 
 - `api_version` (currently `2`) — the **hard** data contract. Treat a mismatch as a fatal, fail-fast condition.
 - `semver` (e.g. `"0.2.0"`) — the semantic version of the WASM core build, tracking the crate version. Use it for logging, cache keys, and human-facing diagnostics.
-- `capabilities` — an additive `string[]` of supported features (`progress_protocol_v1`, `glb_export`, `room_floor_mesh`, `sog_export`, `streamed_sog`, `fast_nav_preset`, `output_space`, `recast_config`, `progress_callback`, `splat_ingest`). Feature-detect against this list so additive changes (new entry points / fields) do not force a hard failure. Never assume a capability is present without checking; never fail solely because an unknown capability appears.
+- `capabilities` — an additive `string[]` of supported features (`collision_voxel_boundary`, `progress_protocol_v1`, `glb_export`, `room_floor_mesh`, `sog_export`, `streamed_sog`, `fast_nav_preset`, `output_space`, `recast_config`, `progress_callback`, `splat_ingest`). Feature-detect against this list so additive changes (new entry points / fields) do not force a hard failure. Never assume a capability is present without checking; never fail solely because an unknown capability appears.
 
 For cheap **pre-flight** feature detection (before parsing any bytes), call the standalone exports `splatwalk_version()`, `splatwalk_api_version()`, and `splatwalk_capabilities()` — they return the same values that appear on a full result, without the cost of a parse/field build.
 
@@ -106,9 +106,27 @@ Returns a structured reconstruction result:
 
 `diagnostics` includes point counts, region filtering counts, RANSAC inliers, grid dimensions, accepted cell counts, face rejection counts, connected-component counts, low-confidence hole-fill counts, optional distance-field erosion counts, discarded-component counts, and the detected floor plane when available.
 
+### `build_collision_voxel_boundary(bytes, settings)`
+
+Builds the PlayCanvas-style runtime collision representation: splat occupancy -> voxel fill/seal -> reachable-space carve -> watertight boundary mesh. This is the primary collision/physics export path and is separate from the FAST NAV floor-field path.
+
+```ts
+{
+  api_version: 2;
+  mesh: MeshBuffers;
+  glb?: Uint8Array; // present when settings.emit_glb === true
+  space: CoordinateSpace;
+  basis: FieldBasis;
+  floor_plane: FloorPlane;
+  diagnostics: ReconstructionDiagnostics;
+}
+```
+
+Set `emit_glb: true` to receive `.collision.glb` bytes directly. Otherwise call `mesh_to_glb(result.mesh.vertices, result.mesh.indices)` with the returned mesh. `collision_mesh_mode: "faces"` emits exact exposed voxel faces, matching PlayCanvas `splat-transform -K faces` semantics. `collision_mesh_mode: "smooth"` is reserved and is rejected until a marching-cubes-style surface is implemented.
+
 ### `convert_splat_to_navmesh_basis(bytes, settings)`
 
-Returns the authoritative collider/basis mesh and metadata for Recast or engine-specific navmesh bakes:
+Legacy/advanced compatibility wrapper that returns the generated voxel collision basis mesh and metadata for Recast or engine-specific navmesh bakes:
 
 ```ts
 {
@@ -121,7 +139,7 @@ Returns the authoritative collider/basis mesh and metadata for Recast or engine-
 }
 ```
 
-The mesh is the generated voxel collision basis used by the advanced/manual collider navmesh path. It is useful when no imported `.collision.glb` / Collider Mesh GLB exists, but it is not the `FAST NAV` default because Recast can treat collider boundary faces as walkable surfaces in noisy indoor scans.
+The mesh is the same generated voxel collision boundary used by the advanced/manual collider navmesh path, but new collision integrations should call `build_collision_voxel_boundary` so collision export code does not read as a navmesh-basis operation. It remains useful for old callers that already feed this mesh into Recast when no imported `.collision.glb` / Collider Mesh GLB exists. It is not the `FAST NAV` default because Recast can treat collider boundary faces as walkable surfaces in noisy indoor scans.
 
 ### `build_walkable_ground_field(bytes, settings)`
 
@@ -592,7 +610,7 @@ Some integrators consume only the generated `pkg/wasm_splatwalk/wasm_splatwalk.j
 - For one-button room navigation, mirror the browser `FAST NAV` path: call `build_walkable_ground_field`, keep only `walkable` and `filled` cells, select the seed-nearest connected component, triangulate that floor component, then pass it to Recast.
 - When handing that floor mesh to Recast, convert the agent dimensions from metres to **integer voxel units** (`walkableHeight = ceil(h/ch)`, `walkableClimb = floor(climb/ch)`, `walkableRadius = ceil(r/cs)`) and pad the vertical bounds above the highest floor cell by at least `walkableHeight`. Passing sub-metre metre values directly truncates them to `0` voxels, which removes erosion, turns every height step into a wall, and fragments one walkable level into disjoint islands. See "Recast parameter units (metres vs voxels)" above.
 - For advanced collision workflows, treat the production target as PlayCanvas-style voxel collision: voxel occupancy, seed-based cluster/fill/carve, then a watertight collision mesh.
-- Use `convert_splat_to_navmesh_basis(bytes, settings)` for the generated voxel collision mesh when no imported collider GLB exists. It emits the collision basis, not the renderer mesh.
+- Use `build_collision_voxel_boundary(bytes, { ...settings, emit_glb: true })` for generated collision/physics overlays and `.collision.glb` export when no imported collider GLB exists. Use `convert_splat_to_navmesh_basis(bytes, settings)` only for legacy callers that still name this artifact as a navmesh basis.
 - Treat `GroundFieldCell.state` as part of the fast-nav contract. Preserve `obstacle`, `height_variance`, `void`, unfilled `low_confidence`, `eroded`, and `discarded_component` as blocked/rejected states.
 - Treat `cells_rejected_low_confidence`, `cells_rejected_height_variance`, `cells_rejected_obstacle`, `cells_void`, `cells_eroded`, and `cells_discarded_component` as first-class navigation diagnostics. These fields explain why furniture, walls, voids, noisy regions, optional clearance erosion, or disconnected islands were excluded before Recast.
 - Do not fill obstacle, height-variance, void, eroded, unfilled low-confidence, or discarded-component cells downstream. SplatWalk only closes small enclosed low-confidence floor components in the 2.5D field; downstream integrations should preserve that decision.
@@ -618,7 +636,8 @@ Collision/reconstruction settings:
 - `collision_fill_size`: fill/seal distance in meters.
 - `collision_carve_height`: capsule height in meters for reachable-space carving.
 - `collision_carve_radius`: capsule radius in meters for reachable-space carving.
-- `collision_mesh_mode`: currently `"faces"` for exact exposed voxel faces. `"smooth"` is reserved for a later marching-cubes/copanar-merge path.
+- `collision_mesh_mode`: `"faces"` emits exact exposed voxel faces. `"smooth"` is reserved for a later marching-cubes/copanar-merge path and is rejected by the current binary.
+- `emit_glb`: accepted by `build_collision_voxel_boundary`; when true, the result includes GLB bytes suitable for saving as `.collision.glb`.
 
 The diagnostics include `collision_grid_width`, `collision_grid_height`, `collision_grid_depth`, `collision_occupied_voxels`, `collision_cluster_kept_voxels`, `collision_cluster_discarded_voxels`, `collision_filled_voxels`, `collision_carved_voxels`, `collision_surface_faces`, `collision_seed_used`, `collision_seed_state`, `collision_scene_type`, `collision_mesh_mode`, `collision_external_fill_leaked`, and `collision_failure_reason`.
 

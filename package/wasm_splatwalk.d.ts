@@ -244,6 +244,12 @@ export interface RoomFloorSettings extends MeshSettings {
   recovery?: RoomFloorRecoveryStep[];
 }
 
+/** Settings for {@link build_collision_voxel_boundary}. */
+export interface CollisionVoxelBoundarySettings extends MeshSettings {
+  /** When true, also emit a GLB of the collision boundary mesh in `glb`. Default false. */
+  emit_glb?: boolean;
+}
+
 // ---------------------------------------------------------------------------
 // Results
 // ---------------------------------------------------------------------------
@@ -273,6 +279,16 @@ export interface SuggestedRegion extends ResultContract {
 
 export interface NavmeshBasisResult extends ResultContract {
   mesh: MeshBuffers;
+  space: CoordinateSpace;
+  basis: FieldBasis;
+  floor_plane: FloorPlane;
+  diagnostics: ReconstructionDiagnostics;
+}
+
+export interface CollisionVoxelBoundaryResult extends ResultContract {
+  mesh: MeshBuffers;
+  /** GLB bytes of the collision mesh, present only when `emit_glb` was set. */
+  glb?: Uint8Array;
   space: CoordinateSpace;
   basis: FieldBasis;
   floor_plane: FloorPlane;
@@ -425,6 +441,11 @@ export function suggest_region(data: Uint8Array, settings: MeshSettings): Sugges
 export function convert_splat_to_mesh(data: Uint8Array, settings: MeshSettings): ReconstructionResult;
 
 export function convert_splat_to_navmesh_basis(data: Uint8Array, settings: MeshSettings): NavmeshBasisResult;
+
+export function build_collision_voxel_boundary(
+  data: Uint8Array,
+  settings: CollisionVoxelBoundarySettings
+): CollisionVoxelBoundaryResult;
 
 export function build_walkable_ground_field(data: Uint8Array, settings: MeshSettings): WalkableGroundFieldResult;
 

@@ -1,5 +1,6 @@
 /// <reference lib="webworker" />
 import init, {
+    build_collision_voxel_boundary,
     init_splatwalk,
     build_room_floor_mesh,
     build_walkable_ground_field,
@@ -159,6 +160,9 @@ ctx.onmessage = async (e: MessageEvent): Promise<void> => {
                 break;
             case 'convertSplatToNavmeshBasis':
                 result = convert_splat_to_navmesh_basis(currentData, settings);
+                break;
+            case 'buildCollisionVoxelBoundary':
+                result = build_collision_voxel_boundary(currentData, settings);
                 break;
             case 'buildWalkableGroundField':
                 result = build_walkable_ground_field(currentData, settings);

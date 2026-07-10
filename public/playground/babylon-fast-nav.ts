@@ -57,6 +57,14 @@ interface SwModule {
     selected_area: number;
     space: { space: string; handedness: string; up_axis: string };
   };
+  build_collision_voxel_boundary?: (
+    bytes: Uint8Array,
+    settings: Record<string, unknown>
+  ) => {
+    glb?: Uint8Array;
+    mesh: { vertices: Float32Array; indices: Uint32Array; vertex_count: number; face_count: number };
+  };
+  mesh_to_glb?: (positions: Float32Array, indices: Uint32Array) => Uint8Array;
 }
 
 export class Playground {
@@ -109,13 +117,31 @@ export class Playground {
     // --- Mutable world state ---------------------------------------------
     const world: {
       splat: BABYLON.AbstractMesh | null;
+      collision: BABYLON.Mesh | null;
+      collisionGlb: Uint8Array | null;
       floor: BABYLON.Mesh | null;
       navDebug: BABYLON.Mesh | null;
+      navData: Uint8Array | null;
+      ply: Uint8Array | null;
+      splatFlipY: boolean;
       agentRoot: BABYLON.TransformNode | null;
       crowd: BABYLON.ICrowd | null;
       agentIndex: number;
       loading: boolean;
-    } = { splat: null, floor: null, navDebug: null, agentRoot: null, crowd: null, agentIndex: -1, loading: false };
+    } = {
+      splat: null,
+      collision: null,
+      collisionGlb: null,
+      floor: null,
+      navDebug: null,
+      navData: null,
+      ply: null,
+      splatFlipY: false,
+      agentRoot: null,
+      crowd: null,
+      agentIndex: -1,
+      loading: false,
+    };
 
     // dev/test hooks
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -129,9 +155,59 @@ export class Playground {
       if (world.crowd) { world.crowd.dispose(); world.crowd = null; }
       world.agentIndex = -1;
       world.agentRoot?.dispose(false, true); // disposes child capsule + ring
-      for (const m of [world.splat, world.floor, world.navDebug]) m?.dispose();
-      world.splat = world.floor = world.navDebug = null;
+      for (const m of [world.splat, world.collision, world.floor, world.navDebug]) m?.dispose();
+      world.splat = world.collision = world.floor = world.navDebug = null;
+      world.collisionGlb = world.navData = world.ply = null;
+      world.splatFlipY = false;
       world.agentRoot = null;
+    };
+
+    const downloadBytes = (bytes: Uint8Array, filename: string, type: string): void => {
+      const url = URL.createObjectURL(new Blob([bytes], { type }));
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+    };
+
+    const generateCollisionBoundary = (): { mesh: { vertices: Float32Array; indices: Uint32Array; vertex_count: number; face_count: number }; glb?: Uint8Array } | null => {
+      if (!world.ply) {
+        ui.setStatus('Load a scene before generating collision.', 'warn');
+        return null;
+      }
+      if (!sw.build_collision_voxel_boundary) {
+        ui.setStatus('This published @splatwalk/core build does not expose collision boundary export yet.', 'warn');
+        return null;
+      }
+      world.collision?.dispose();
+      ui.setStatus('Generating collision voxel boundary...', 'busy');
+      const settings = Object.assign({}, sw.fast_nav_preset(), {
+        mode: 2,
+        flip_y: world.splatFlipY,
+        emit_glb: true,
+        collision_mesh_mode: 'faces',
+      });
+      const result = sw.build_collision_voxel_boundary(world.ply, settings);
+      const mesh = new BABYLON.Mesh('collision_boundary', scene);
+      const vd = new BABYLON.VertexData();
+      vd.positions = result.mesh.vertices;
+      vd.indices = result.mesh.indices;
+      vd.applyToMesh(mesh);
+      const mat = new BABYLON.StandardMaterial('collisionMat', scene);
+      mat.diffuseColor = new BABYLON.Color3(0, 0.85, 1);
+      mat.emissiveColor = new BABYLON.Color3(0, 0.2, 0.3);
+      mat.alpha = 0.28;
+      mat.backFaceCulling = false;
+      mesh.material = mat;
+      mesh.setEnabled(ui.toggles.collision.checked);
+      mesh.isPickable = false;
+      world.collision = mesh;
+      world.collisionGlb = result.glb ?? null;
+      ui.setStatus(`Collision boundary ready (${result.mesh.face_count} faces).`, 'ok');
+      return result;
     };
 
     const frameWorld = (mesh: BABYLON.AbstractMesh): void => {
@@ -181,6 +257,7 @@ export class Playground {
           const spzBytes = new Uint8Array(await new Response(stream).arrayBuffer());
           ply = new Uint8Array(sw.spz_to_ply(spzBytes));
         }
+        world.ply = ply;
 
         // 2) Render the Gaussian splat.
         ui.setStatus('Rendering splat...', 'busy');
@@ -196,6 +273,7 @@ export class Playground {
 
         // 3) FAST NAV floor. flip_y comes straight off the loaded splat.
         const flip_y = !!splat.scaling && splat.scaling.y < 0;
+        world.splatFlipY = flip_y;
         ui.setStatus('Extracting walkable floor (FAST NAV)...', 'busy');
         const settings = Object.assign({}, sw.fast_nav_preset(), { mode: 2, flip_y });
         const floorResult = sw.build_room_floor_mesh(ply, settings);
@@ -240,6 +318,9 @@ export class Playground {
         navDebug.setEnabled(ui.toggles.navmesh.checked);
         navDebug.isPickable = true;
         world.navDebug = navDebug;
+        world.navData = typeof (nav as unknown as { getNavmeshData?: () => Uint8Array }).getNavmeshData === 'function'
+          ? (nav as unknown as { getNavmeshData: () => Uint8Array }).getNavmeshData()
+          : null;
         const navTris = (navDebug.getIndices()?.length ?? 0) / 3;
         setDemo({ navTriangles: navTris });
 
@@ -323,11 +404,38 @@ export class Playground {
     // --- Wire UI controls ------------------------------------------------
     ui.onSceneChange((index) => { void loadScene(Playground.SCENES[index]); });
     ui.toggles.splat.addEventListener('change', () => world.splat?.setEnabled(ui.toggles.splat.checked));
+    ui.toggles.collision.addEventListener('change', () => world.collision?.setEnabled(ui.toggles.collision.checked));
     ui.toggles.floor.addEventListener('change', () => { if (world.floor) world.floor.isVisible = ui.toggles.floor.checked; });
     ui.toggles.navmesh.addEventListener('change', () => world.navDebug?.setEnabled(ui.toggles.navmesh.checked));
     ui.onRecenter(() => {
       if (world.crowd && world.agentIndex >= 0) framePlayer();
       else if (world.splat) frameWorld(world.splat);
+    });
+    ui.onExportNavmesh(() => {
+      if (!world.navData) {
+        ui.setStatus('No navmesh binary is available yet.', 'warn');
+        return;
+      }
+      downloadBytes(world.navData, 'splatwalk.nav', 'application/octet-stream');
+      ui.setStatus('Navmesh download started.', 'ok');
+    });
+    ui.onGenerateCollision(() => { generateCollisionBoundary(); });
+    ui.onExportCollision(() => {
+      const result = world.collision ? null : generateCollisionBoundary();
+      const mesh = result?.mesh ?? (world.collision ? {
+        vertices: world.collision.getVerticesData(BABYLON.VertexBuffer.PositionKind) as Float32Array,
+        indices: new Uint32Array(world.collision.getIndices() ?? []),
+        vertex_count: 0,
+        face_count: 0,
+      } : null);
+      if (!mesh) return;
+      const glb = world.collisionGlb ?? (sw.mesh_to_glb ? sw.mesh_to_glb(mesh.vertices, mesh.indices) : null);
+      if (!glb) {
+        ui.setStatus('This @splatwalk/core build cannot serialize collision GLB yet.', 'warn');
+        return;
+      }
+      downloadBytes(glb, 'splatwalk.collision.glb', 'model/gltf-binary');
+      ui.setStatus('Collision mesh download started.', 'ok');
     });
 
     // --- Full screen (babylon-game-starter idiom) ------------------------
@@ -396,9 +504,12 @@ export class Playground {
     setControlsEnabled: (enabled: boolean) => void;
     onSceneChange: (cb: (index: number) => void) => void;
     onRecenter: (cb: () => void) => void;
+    onExportNavmesh: (cb: () => void) => void;
+    onGenerateCollision: (cb: () => void) => void;
+    onExportCollision: (cb: () => void) => void;
     onFullscreen: (cb: (on: boolean) => void) => void;
     setFullscreenChecked: (on: boolean) => void;
-    toggles: { splat: HTMLInputElement; floor: HTMLInputElement; navmesh: HTMLInputElement };
+    toggles: { splat: HTMLInputElement; collision: HTMLInputElement; floor: HTMLInputElement; navmesh: HTMLInputElement };
   } {
     const parent = canvas.parentElement ?? document.body;
     if (getComputedStyle(parent).position === 'static') parent.style.position = 'relative';
@@ -439,6 +550,7 @@ export class Playground {
         .sw-btn{width:100%;background:${ACCENT};color:#08120a;border:none;border-radius:9px;
           padding:9px;font-size:12px;font-weight:800;letter-spacing:.3px;cursor:pointer;transition:filter .15s}
         .sw-btn:hover{filter:brightness(1.08)}
+        .sw-btn.secondary{background:rgba(255,255,255,.08);color:#e8eefc;border:1px solid rgba(255,255,255,.14);margin-top:7px}
         .sw-hint{position:absolute;bottom:20px;left:50%;transform:translateX(-50%);z-index:30;
           background:rgba(10,13,18,.78);backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,.12);
           color:#e8eefc;font-family:system-ui,sans-serif;font-size:12px;font-weight:600;
@@ -475,11 +587,15 @@ export class Playground {
       <select class="sw-select" id="sw-scene">${Playground.SCENES.map((s, i) => `<option value="${i}">${s.title}</option>`).join('')}</select>
       <div class="sw-toggles">
         <label class="sw-toggle"><input type="checkbox" id="sw-t-splat" checked> Gaussian splat</label>
+        <label class="sw-toggle"><input type="checkbox" id="sw-t-collision" checked> Collision boundary</label>
         <label class="sw-toggle"><input type="checkbox" id="sw-t-floor"> Walkable floor</label>
         <label class="sw-toggle"><input type="checkbox" id="sw-t-nav" checked> Navmesh</label>
         <label class="sw-toggle"><input type="checkbox" id="sw-t-fs"> Full screen</label>
       </div>
       <button class="sw-btn" id="sw-recenter">RECENTER CAMERA</button>
+      <button class="sw-btn secondary" id="sw-export-nav">EXPORT NAVMESH</button>
+      <button class="sw-btn secondary" id="sw-generate-collision">GENERATE COLLISION</button>
+      <button class="sw-btn secondary" id="sw-export-collision">EXPORT COLLISION GLB</button>
     `;
     parent.appendChild(panel);
 
@@ -493,6 +609,7 @@ export class Playground {
     const sceneSel = $('sw-scene') as HTMLSelectElement;
     const toggles = {
       splat: $('sw-t-splat') as HTMLInputElement,
+      collision: $('sw-t-collision') as HTMLInputElement,
       floor: $('sw-t-floor') as HTMLInputElement,
       navmesh: $('sw-t-nav') as HTMLInputElement,
     };
@@ -526,6 +643,9 @@ export class Playground {
       setControlsEnabled: (enabled) => { sceneSel.disabled = !enabled; },
       onSceneChange: (cb) => sceneSel.addEventListener('change', () => cb(Number(sceneSel.value))),
       onRecenter: (cb) => $('sw-recenter').addEventListener('click', cb),
+      onExportNavmesh: (cb) => $('sw-export-nav').addEventListener('click', cb),
+      onGenerateCollision: (cb) => $('sw-generate-collision').addEventListener('click', cb),
+      onExportCollision: (cb) => $('sw-export-collision').addEventListener('click', cb),
       onFullscreen: (cb) => fsToggle.addEventListener('change', () => cb(fsToggle.checked)),
       setFullscreenChecked: (on) => { fsToggle.checked = on; },
       toggles,

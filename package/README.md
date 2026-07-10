@@ -27,6 +27,7 @@ See [`LICENSING.md`](https://github.com/EricEisaman/splatwalk/blob/main/LICENSIN
 
 ```ts
 import init, {
+  build_collision_voxel_boundary,
   init_splatwalk,
   build_walkable_ground_field,
   build_room_floor_mesh,
@@ -42,10 +43,21 @@ if (field.api_version !== 2) throw new Error('stale SplatWalk binary');
 // One-call room floor (binary-side equivalent of the FAST NAV floor path):
 const floor = build_room_floor_mesh(splatBytes, { ...settings, emit_glb: true });
 const glb = floor.glb ?? mesh_to_glb(floor.mesh.vertices, floor.mesh.indices);
+
+// Collision voxel boundary mode (runtime physics / .collision.glb export):
+const collision = build_collision_voxel_boundary(splatBytes, {
+  ...settings,
+  collision_mesh_mode: 'faces',
+  emit_glb: true,
+});
+const collisionGlb =
+  collision.glb ?? mesh_to_glb(collision.mesh.vertices, collision.mesh.indices);
 ```
 
 `semver` and `capabilities` on every result let you tolerate additive change
 instead of hard-failing on a version bump; `api_version` stays the hard gate.
+Check for `collision_voxel_boundary` before showing collision export UI in apps
+that may run against older published binaries.
 
 ## Use the framework-agnostic floor module
 

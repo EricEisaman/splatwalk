@@ -66,6 +66,10 @@ export function SplatFastNavShowcase(): JSX.Element {
     maxChunkExtent,
     loadAndProcess,
     loadExample,
+    exportNavmesh,
+    generateCollisionBoundary,
+    exportCollisionMesh,
+    setCollisionBoundaryVisible,
     exportSog,
     reset,
   } = nav;
@@ -88,8 +92,15 @@ export function SplatFastNavShowcase(): JSX.Element {
   const [sogMode, setSogMode] = useState<SogExportMode>('streamed');
   const [sogExporting, setSogExporting] = useState(false);
   const [sogSummary, setSogSummary] = useState<string | null>(null);
+  const [collisionBoundaryVisible, setCollisionBoundaryVisibleState] = useState(true);
+  const [collisionExporting, setCollisionExporting] = useState(false);
+  const [collisionSummary, setCollisionSummary] = useState<string | null>(null);
+  const [navExporting, setNavExporting] = useState(false);
+  const [navSummary, setNavSummary] = useState<string | null>(null);
 
   useEffect(() => {
+    setCollisionSummary(null);
+    setNavSummary(null);
     setSogSummary(null);
     setSogMode(isLargeScene ? 'streamed' : 'single');
   }, [splatCount, isLargeScene]);
@@ -190,6 +201,49 @@ export function SplatFastNavShowcase(): JSX.Element {
       setSogExporting(false);
     }
   }, [exportSog, maxChunkExtent, maxShDegree, sliceForm, sogExporting, sogMode]);
+
+  const runCollisionGenerate = useCallback(async (): Promise<void> => {
+    if (collisionExporting) return;
+    setCollisionExporting(true);
+    setCollisionSummary(null);
+    try {
+      const artifact = await generateCollisionBoundary();
+      setCollisionBoundaryVisibleState(true);
+      setCollisionSummary(
+        `Collision boundary: ${artifact.result.mesh.vertex_count} vertices, ${artifact.result.mesh.face_count} faces.`
+      );
+    } catch (error) {
+      setCollisionSummary(`Collision generation failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setCollisionExporting(false);
+    }
+  }, [collisionExporting, generateCollisionBoundary]);
+
+  const runCollisionExport = useCallback(async (): Promise<void> => {
+    if (collisionExporting) return;
+    setCollisionExporting(true);
+    try {
+      const bytes = await exportCollisionMesh();
+      setCollisionSummary(`Exported collision mesh (${(bytes.byteLength / 1e6).toFixed(1)} MB).`);
+    } catch (error) {
+      setCollisionSummary(`Collision export failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setCollisionExporting(false);
+    }
+  }, [collisionExporting, exportCollisionMesh]);
+
+  const runNavmeshExport = useCallback(async (): Promise<void> => {
+    if (navExporting) return;
+    setNavExporting(true);
+    try {
+      await exportNavmesh();
+      setNavSummary('Navmesh export started.');
+    } catch (error) {
+      setNavSummary(`Navmesh export failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setNavExporting(false);
+    }
+  }, [exportNavmesh, navExporting]);
 
   const numberField = (
     key: keyof typeof sliceForm,
@@ -385,6 +439,57 @@ export function SplatFastNavShowcase(): JSX.Element {
           </Box>
 
           {status === 'done' && (
+            <>
+            <Accordion sx={{ mt: 2 }}>
+              <AccordionSummary expandIcon={<ExpandMoreIcon />}>Navigation and collision exports</AccordionSummary>
+              <AccordionDetails>
+                {navSummary && (
+                  <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 2 }}>
+                    {navSummary}
+                  </Typography>
+                )}
+                <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1.5, mb: 2 }}>
+                  <Button startIcon={<DownloadIcon />} disabled={navExporting} onClick={() => void runNavmeshExport()}>
+                    Export navmesh (.nav)
+                  </Button>
+                </Box>
+
+                {collisionSummary && (
+                  <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 2 }}>
+                    {collisionSummary}
+                  </Typography>
+                )}
+                <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1.5 }}>
+                  <Button
+                    color="secondary"
+                    disabled={collisionExporting}
+                    startIcon={<ViewInArIcon />}
+                    onClick={() => void runCollisionGenerate()}
+                  >
+                    Generate collision boundary
+                  </Button>
+                  <Button
+                    variant="outlined"
+                    onClick={() => {
+                      const visible = !collisionBoundaryVisible;
+                      setCollisionBoundaryVisibleState(visible);
+                      setCollisionBoundaryVisible(visible);
+                    }}
+                  >
+                    {collisionBoundaryVisible ? 'Hide collision boundary' : 'Show collision boundary'}
+                  </Button>
+                  <Button
+                    variant="outlined"
+                    disabled={collisionExporting}
+                    startIcon={<DownloadIcon />}
+                    onClick={() => void runCollisionExport()}
+                  >
+                    Export collision mesh (.glb)
+                  </Button>
+                </Box>
+              </AccordionDetails>
+            </Accordion>
+
             <Accordion sx={{ mt: 2 }}>
               <AccordionSummary expandIcon={<ExpandMoreIcon />}>Streamed SOG export</AccordionSummary>
               <AccordionDetails>
@@ -462,6 +567,7 @@ export function SplatFastNavShowcase(): JSX.Element {
                 </Button>
               </AccordionDetails>
             </Accordion>
+            </>
           )}
 
           {logs.length > 0 && (

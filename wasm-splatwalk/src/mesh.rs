@@ -1,8 +1,8 @@
 use crate::splat::PointNormal;
 use crate::{
-    CoordinateSpace, FieldBasis, FloorPlane, GroundFieldCell, GroundFieldCellState, MeshBuffers,
-    MeshSettings, NavmeshBasisResult, ReconstructionDiagnostics, ReconstructionResult, SplatBounds,
-    SuggestedRegion, WalkableGroundFieldResult,
+    CollisionVoxelBoundaryResult, CoordinateSpace, FieldBasis, FloorPlane, GroundFieldCell,
+    GroundFieldCellState, MeshBuffers, MeshSettings, NavmeshBasisResult, ReconstructionDiagnostics,
+    ReconstructionResult, SplatBounds, SuggestedRegion, WalkableGroundFieldResult,
 };
 use nalgebra::{Point3, UnitQuaternion, Vector3};
 use poisson_reconstruction::{PoissonReconstruction, Real};
@@ -234,6 +234,48 @@ pub fn convert_splat_to_navmesh_basis(
         semver: crate::core_semver(),
         capabilities: crate::capabilities(),
         mesh: MeshBuffers::new(mesh.vertices, mesh.indices),
+        space: CoordinateSpace::splatwalk_oriented(),
+        basis,
+        floor_plane: plane,
+        diagnostics,
+    }
+}
+
+pub fn build_collision_voxel_boundary(
+    points: &[PointNormal],
+    settings: &MeshSettings,
+) -> CollisionVoxelBoundaryResult {
+    let context = build_context(points, settings);
+    let mut diagnostics = context.diagnostics.clone();
+    let collision = build_collision_mesh(&context, settings, &mut diagnostics);
+    let (mesh, basis, plane, diagnostics) = if let Some(collision) = collision {
+        (
+            collision.mesh,
+            collision.basis,
+            collision.plane,
+            collision.diagnostics,
+        )
+    } else {
+        (
+            ReconstructedMesh {
+                vertices: vec![],
+                indices: vec![],
+            },
+            default_field_basis(),
+            FloorPlane {
+                normal: [0.0, 1.0, 0.0],
+                d: 0.0,
+            },
+            diagnostics,
+        )
+    };
+
+    CollisionVoxelBoundaryResult {
+        api_version: crate::API_VERSION,
+        semver: crate::core_semver(),
+        capabilities: crate::capabilities(),
+        mesh: MeshBuffers::new(mesh.vertices, mesh.indices),
+        glb: None,
         space: CoordinateSpace::splatwalk_oriented(),
         basis,
         floor_plane: plane,

@@ -3,6 +3,14 @@ import { computed, ref, type ComputedRef, type Ref } from 'vue';
 import { Tools } from '@babylonjs/core';
 
 import {
+  buildCollisionBoundarySettings,
+  exportCollisionBoundaryGlb,
+  exportNavmeshBinary,
+  generateCollisionBoundary as generateCollisionBoundaryArtifact,
+  seedFromRegionBounds,
+  type CollisionBoundaryArtifact,
+} from '@/collision/voxelBoundary';
+import {
   readSplatBytes,
   runFastNav,
   type FastNavRecoveryConfig,
@@ -95,6 +103,14 @@ export interface UseSplatFastNav {
    * splat is loaded.
    */
   readonly exportSog: (mode: SogExportMode, settings?: SliceSettings) => Promise<SliceArchive>;
+  /** Export the generated Recast navmesh binary. */
+  readonly exportNavmesh: () => Promise<void>;
+  /** Generate and show the collision voxel boundary overlay. */
+  readonly generateCollisionBoundary: () => Promise<CollisionBoundaryArtifact>;
+  /** Export the collision voxel boundary mesh as `.collision.glb`. */
+  readonly exportCollisionMesh: () => Promise<Uint8Array>;
+  /** Show or hide the collision voxel boundary overlay. */
+  readonly setCollisionBoundaryVisible: (visible: boolean) => void;
   /** Reset back to the idle state, clearing logs and errors. */
   readonly reset: () => void;
 }
@@ -132,6 +148,8 @@ export function useSplatFastNav(
   // Bytes + base name of the loaded scene, retained for SOG export.
   let currentBytes: Uint8Array | null = null;
   let currentName = 'splat';
+  let currentCollisionArtifact: CollisionBoundaryArtifact | null = null;
+  let currentNavMeshData: Uint8Array | null = null;
 
   const appendLog = (message: string): void => {
     logs.value.push(parseLog(message));
@@ -153,7 +171,9 @@ export function useSplatFastNav(
     maxShDegree.value = DEFAULT_SLICE_SETTINGS.sh_degree;
     maxChunkExtent.value = DEFAULT_SLICE_SETTINGS.chunk_extent;
     currentBytes = null;
+    currentCollisionArtifact = null;
     currentName = 'splat';
+    currentNavMeshData = null;
   };
 
   const processFile = async (file: File): Promise<void> => {
@@ -185,7 +205,9 @@ export function useSplatFastNav(
       appendLog('[INFO] Splat visualized.');
 
       currentBytes = bytes;
+      currentCollisionArtifact = null;
       currentName = file.name.replace(/\.(ply|spz|splat)$/i, '');
+      currentNavMeshData = null;
       // Capture the raw splat count for the export UI (cheap: the parse is cached
       // and reused by the FAST NAV run below).
       try {
@@ -202,7 +224,7 @@ export function useSplatFastNav(
 
       status.value = 'processing';
       statusMessage.value = 'Running FAST NAV...';
-      await runFastNav({
+      const fastNav = await runFastNav({
         viewer,
         bytes,
         onLog: appendLog,
@@ -211,6 +233,7 @@ export function useSplatFastNav(
         strayTrim: options.strayTrim,
         prune: options.prune,
       });
+      currentNavMeshData = fastNav.navMeshData;
       phase.value = 'done';
       progress.value = null;
 
@@ -298,6 +321,51 @@ export function useSplatFastNav(
     return archive;
   };
 
+  const exportNavmesh = async (): Promise<void> => {
+    if (!currentNavMeshData) {
+      throw new Error('No navmesh generated to export.');
+    }
+    exportNavmeshBinary({
+      filename: `${currentName}.nav`,
+      navMeshData: currentNavMeshData,
+    });
+  };
+
+  const generateCollisionBoundary = async (): Promise<CollisionBoundaryArtifact> => {
+    const bytes = currentBytes;
+    const viewer = babylon.viewer.value;
+    if (!bytes || !viewer) {
+      throw new Error('No loaded splat to generate collision from.');
+    }
+    const rotation = viewer.getSplatRotation();
+    const settings = buildCollisionBoundarySettings({
+      emitGlb: true,
+      flipY: viewer.isSplatYFlipped(),
+      rotation: [rotation.x, rotation.y, rotation.z],
+      seed: seedFromRegionBounds({ regionBounds: viewer.getRegionBounds() }),
+    });
+    const artifact = await generateCollisionBoundaryArtifact({ bytes, settings });
+    currentCollisionArtifact = artifact;
+    viewer.displayColliderMesh(artifact.result.mesh.vertices, artifact.result.mesh.indices, 0.35);
+    viewer.setColliderVisible(true);
+    appendLog(
+      `[SUCCESS] Collision boundary ready: ${artifact.result.mesh.vertex_count} vertices, ${artifact.result.mesh.face_count} faces.`
+    );
+    return artifact;
+  };
+
+  const exportCollisionMesh = async (): Promise<Uint8Array> => {
+    const artifact = currentCollisionArtifact ?? await generateCollisionBoundary();
+    return exportCollisionBoundaryGlb({
+      artifact,
+      filename: `${currentName}.collision.glb`,
+    });
+  };
+
+  const setCollisionBoundaryVisible = (visible: boolean): void => {
+    babylon.viewer.value?.setColliderVisible(visible);
+  };
+
   return {
     status,
     statusMessage,
@@ -312,6 +380,10 @@ export function useSplatFastNav(
     loadAndProcess,
     loadExample,
     exportSog,
+    exportNavmesh,
+    generateCollisionBoundary,
+    exportCollisionMesh,
+    setCollisionBoundaryVisible,
     reset,
   };
 }

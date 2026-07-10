@@ -75,7 +75,7 @@ const isFullscreen = ref(false);
 const rightHanded = new URLSearchParams(window.location.search).get('rh') === '1';
 
 const babylon = useBabylonViewer(canvasRef, { rightHanded });
-const { status, statusMessage, errorMessage, logs, isBusy, phase, progress, splatCount, maxShDegree, maxChunkExtent, loadAndProcess, loadExample, exportSog, reset } =
+const { status, statusMessage, errorMessage, logs, isBusy, phase, progress, splatCount, maxShDegree, maxChunkExtent, loadAndProcess, loadExample, exportSog, exportNavmesh, generateCollisionBoundary, exportCollisionMesh, setCollisionBoundaryVisible, reset } =
   useSplatFastNav(babylon, { recovery: props.recovery, strayTrim: props.strayTrim, prune: props.prune });
 
 // --- Streamed SOG export -------------------------------------------------
@@ -96,10 +96,17 @@ const isLargeScene = computed(
 const sogMode = ref<SogExportMode>('streamed');
 const sogExporting = ref(false);
 const sogSummary = ref<string | null>(null);
+const collisionBoundaryVisible = ref(true);
+const collisionExporting = ref(false);
+const collisionSummary = ref<string | null>(null);
+const navExporting = ref(false);
+const navSummary = ref<string | null>(null);
 
 // Auto-pick the recommended mode whenever a new scene's count resolves; the
 // user can still flip it before exporting.
 watch(splatCount, () => {
+  collisionSummary.value = null;
+  navSummary.value = null;
   sogSummary.value = null;
   sogMode.value = isLargeScene.value ? 'streamed' : 'single';
 });
@@ -143,6 +150,47 @@ async function runSogExport(): Promise<void> {
     sogSummary.value = `Export failed: ${error instanceof Error ? error.message : String(error)}`;
   } finally {
     sogExporting.value = false;
+  }
+}
+
+async function runCollisionGenerate(): Promise<void> {
+  if (collisionExporting.value) return;
+  collisionExporting.value = true;
+  collisionSummary.value = null;
+  try {
+    const artifact = await generateCollisionBoundary();
+    collisionBoundaryVisible.value = true;
+    collisionSummary.value = `Collision boundary: ${artifact.result.mesh.vertex_count} vertices, ${artifact.result.mesh.face_count} faces.`;
+  } catch (error) {
+    collisionSummary.value = `Collision generation failed: ${error instanceof Error ? error.message : String(error)}`;
+  } finally {
+    collisionExporting.value = false;
+  }
+}
+
+async function runCollisionExport(): Promise<void> {
+  if (collisionExporting.value) return;
+  collisionExporting.value = true;
+  try {
+    const bytes = await exportCollisionMesh();
+    collisionSummary.value = `Exported collision mesh (${(bytes.byteLength / 1e6).toFixed(1)} MB).`;
+  } catch (error) {
+    collisionSummary.value = `Collision export failed: ${error instanceof Error ? error.message : String(error)}`;
+  } finally {
+    collisionExporting.value = false;
+  }
+}
+
+async function runNavmeshExport(): Promise<void> {
+  if (navExporting.value) return;
+  navExporting.value = true;
+  try {
+    await exportNavmesh();
+    navSummary.value = 'Navmesh export started.';
+  } catch (error) {
+    navSummary.value = `Navmesh export failed: ${error instanceof Error ? error.message : String(error)}`;
+  } finally {
+    navExporting.value = false;
   }
 }
 
@@ -365,6 +413,52 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
         </div>
 
         <v-expansion-panels v-if="status === 'done'" class="mt-4" variant="accordion">
+          <v-expansion-panel title="Navigation and collision exports">
+            <template #text>
+              <div v-if="navSummary" class="text-caption text-medium-emphasis mb-3">{{ navSummary }}</div>
+              <div class="d-flex flex-wrap ga-3 mb-4">
+                <v-btn
+                  color="primary"
+                  :loading="navExporting"
+                  prepend-icon="mdi-download"
+                  @click="runNavmeshExport"
+                >
+                  Export navmesh (.nav)
+                </v-btn>
+              </div>
+
+              <v-divider class="mb-4" />
+
+              <div v-if="collisionSummary" class="text-caption text-medium-emphasis mb-3">{{ collisionSummary }}</div>
+              <div class="d-flex flex-wrap align-center ga-3">
+                <v-btn
+                  color="secondary"
+                  :loading="collisionExporting"
+                  prepend-icon="mdi-cube-outline"
+                  @click="runCollisionGenerate"
+                >
+                  Generate collision boundary
+                </v-btn>
+                <v-switch
+                  v-model="collisionBoundaryVisible"
+                  color="primary"
+                  density="compact"
+                  hide-details
+                  label="Show collision boundary"
+                  @update:model-value="setCollisionBoundaryVisible(Boolean($event))"
+                />
+                <v-btn
+                  variant="tonal"
+                  :loading="collisionExporting"
+                  prepend-icon="mdi-download"
+                  @click="runCollisionExport"
+                >
+                  Export collision mesh (.glb)
+                </v-btn>
+              </div>
+            </template>
+          </v-expansion-panel>
+
           <v-expansion-panel title="Streamed SOG export">
             <template #text>
               <div v-if="sogStatusText" class="text-caption mb-3" :class="isLargeScene ? 'text-primary' : 'text-medium-emphasis'">

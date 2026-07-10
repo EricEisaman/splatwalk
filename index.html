@@ -338,7 +338,7 @@
                                 <input type="number" id="paramNavSlope" value="45" step="5" min="0" max="90">
                             </div>
 
-                            <div class="section-title nav-section-title">Voxel Collision / NavMesh</div>
+                            <div class="section-title nav-section-title">Voxel Collision Boundary / NavMesh</div>
                             <div class="control-row">
                                 <label title="Use generated collision from the splat or import a dedicated collider GLB from PlayCanvas/SuperSplat/World Labs.">Collider Source:</label>
                                 <select id="paramColliderSource" class="cyber-select">
@@ -498,6 +498,9 @@
                             </details>
 
                             <div class="nav-button-group stack">
+                                <button id="generateCollisionBtn" class="cyber-button secondary">GENERATE COLLISION BOUNDARY</button>
+                                <button id="downloadCollisionBtn" class="cyber-button secondary"
+                                    style="display: none;">EXPORT COLLISION MESH</button>
                                 <button id="generateNavBtn" class="cyber-button secondary">GENERATE NAVMESH</button>
                                 <button id="downloadNavBtn" class="cyber-button secondary"
                                     style="display: none;">DOWNLOAD NAVMESH</button>

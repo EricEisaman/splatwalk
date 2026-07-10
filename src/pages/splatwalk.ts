@@ -1,6 +1,14 @@
 import { Viewer } from '../scene/Viewer';
 import { DropZone } from '../components/DropZone';
 import { splatwalk, type GroundFieldCellState, type MeshSettings } from '../wasm/bridge';
+import {
+    collisionBoundaryDiagnosticsSummary,
+    exportCollisionBoundaryGlb,
+    exportNavmeshBinary,
+    generateCollisionBoundary,
+    toCollisionBoundarySettings,
+    type CollisionBoundaryArtifact,
+} from '../collision/voxelBoundary';
 import { normalizeSplatToPly, isSupportedSplatFile } from '../wasm/normalize';
 import { SliceArchive } from '../wasm/sliceArchive';
 import {
@@ -231,6 +239,7 @@ async function main() {
     // UI Event Listeners placeholder (will be attached to mesh once created)
     let currentMesh: Mesh | null = null;
     let currentMat: StandardMaterial | null = null;
+    let generatedCollisionArtifact: CollisionBoundaryArtifact | null = null;
     let importedColliderGeometry: { positions: Float32Array, indices: Uint32Array } | null = null;
 
     if (showMeshCheckbox) {
@@ -359,6 +368,7 @@ async function main() {
             try {
                 const opacity = Number.parseFloat(colliderOpacitySlider?.value ?? '0.35') || 0.35;
                 importedColliderGeometry = await viewer.loadColliderMesh(colliderFile, opacity);
+                generatedCollisionArtifact = null;
                 if (showColliderCheckbox) {
                     viewer.setColliderVisible(showColliderCheckbox.checked);
                 }
@@ -463,6 +473,7 @@ async function main() {
             await viewer.loadGaussianSplat(visualBytes);
             currentMesh = null;
             currentMat = null;
+            generatedCollisionArtifact = null;
             importedColliderGeometry = null;
             if (colliderGlbInput) colliderGlbInput.value = '';
             setColliderGlbLabel(null);
@@ -780,7 +791,6 @@ async function main() {
                     console.warn("[WARN] Fast path switched to generated collider because no Collider GLB is loaded.");
                 }
                 const showColliderCheckbox = document.getElementById('showColliderMesh') as HTMLInputElement | null;
-                const colliderOpacitySlider = document.getElementById('colliderOpacity') as HTMLInputElement | null;
                 let geometry: { positions: Float32Array, indices: Uint32Array };
                 let sourceLabel = 'generated_voxel_collider';
                 let effectiveFastSeed = navSettings.collision_seed ?? fastSeed;
@@ -818,40 +828,25 @@ async function main() {
                     console.log(`[INFO] Using imported Collider GLB as authoritative Recast input.`);
                     console.log(`[INFO] Imported collider: ${geometry.positions.length / 3} vertices, ${geometry.indices.length / 3} triangles.`);
                 } else {
-                    const basis = await splatwalk.convertSplatToNavmeshBasis(bytes, navSettings);
+                    const artifact = generatedCollisionArtifact ?? await generateCollisionBoundaryFromSplat(
+                        bytes,
+                        toCollisionBoundarySettings(navSettings)
+                    );
+                    const boundary = artifact.result;
                     geometry = {
-                        positions: new Float32Array(basis.mesh.vertices),
-                        indices: new Uint32Array(basis.mesh.indices),
+                        positions: new Float32Array(boundary.mesh.vertices),
+                        indices: new Uint32Array(boundary.mesh.indices),
                     };
-                    const opacity = Number.parseFloat(colliderOpacitySlider?.value ?? '0.35') || 0.35;
-                    viewer.displayColliderMesh(geometry.positions, geometry.indices, opacity);
                     if (showColliderCheckbox) {
                         viewer.setColliderVisible(showColliderCheckbox.checked);
                     }
 
-                    console.log(`[INFO] Generated collider: ${basis.mesh.vertex_count} vertices, ${basis.mesh.face_count} faces.`);
-                    console.log(
-                        `[INFO] Collision grid: ${basis.diagnostics.collision_grid_width}x${basis.diagnostics.collision_grid_height}x${basis.diagnostics.collision_grid_depth}, ` +
-                        `voxel=${basis.diagnostics.collision_voxel_size.toFixed(3)}, ` +
-                        `scene=${basis.diagnostics.collision_scene_type}, mesh=${basis.diagnostics.collision_mesh_mode}`
-                    );
-                    console.log(
-                        `[INFO] Collision stages: occupied=${basis.diagnostics.collision_occupied_voxels}, ` +
-                        `clusterKept=${basis.diagnostics.collision_cluster_kept_voxels}, ` +
-                        `clusterDiscarded=${basis.diagnostics.collision_cluster_discarded_voxels}, ` +
-                        `filled=${basis.diagnostics.collision_filled_voxels}, ` +
-                        `carved=${basis.diagnostics.collision_carved_voxels}, ` +
-                        `surfaceFaces=${basis.diagnostics.collision_surface_faces}`
-                    );
-                    console.log(
-                        `[INFO] Collision seed: used=${JSON.stringify(basis.diagnostics.collision_seed_used ?? navSettings.collision_seed)}, ` +
-                        `state=${basis.diagnostics.collision_seed_state}, ` +
-                        `externalFillLeaked=${basis.diagnostics.collision_external_fill_leaked}`
-                    );
-                    if (basis.diagnostics.collision_seed_used) {
-                        viewer.displaySeedMarker(basis.diagnostics.collision_seed_used);
+                    console.log(`[INFO] Using generated collision boundary as Recast input.`);
+                    console.log(`[INFO] Collision boundary: ${boundary.mesh.vertex_count} vertices, ${boundary.mesh.face_count} faces.`);
+                    if (boundary.diagnostics.collision_seed_used) {
+                        viewer.displaySeedMarker(boundary.diagnostics.collision_seed_used);
                     }
-                    if (basis.diagnostics.collision_external_fill_leaked) {
+                    if (boundary.diagnostics.collision_external_fill_leaked) {
                         console.warn("[WARN] Indoor external fill skipped because the seed leaked to exterior. Move the seed inside the room or increase fill size.");
                     }
                 }
@@ -1009,8 +1004,19 @@ async function main() {
             }
 
             const globalDownloadNavBtn = document.getElementById('downloadNavBtn') as HTMLButtonElement | null;
+            const globalDownloadCollisionBtn = document.getElementById('downloadCollisionBtn') as HTMLButtonElement | null;
             const globalGenerateNavBtn = document.getElementById('generateNavBtn') as HTMLButtonElement | null;
+            const globalGenerateCollisionBtn = document.getElementById('generateCollisionBtn') as HTMLButtonElement | null;
             const globalAddNpcBtn = document.getElementById('addNpcBtn') as HTMLButtonElement | null;
+            if (globalGenerateCollisionBtn) {
+                globalGenerateCollisionBtn.onclick = async () => {
+                    try {
+                        await generateCollisionBoundaryFromSplat(await readSplatBytes());
+                    } catch (error) {
+                        logError(`Collision boundary generation failed: ${error}`);
+                    }
+                };
+            }
             if (globalGenerateNavBtn) {
                 globalGenerateNavBtn.onclick = async () => {
                     try {
@@ -1026,14 +1032,24 @@ async function main() {
                         console.warn("[WARN] No navmesh binary generated yet.");
                         return;
                     }
-                    const blob = new Blob([generatedNavData as any], { type: 'application/octet-stream' });
-                    const url = URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = `${file.name.replace(/\.(ply|spz|splat)$/i, "")}.nav`;
-                    a.click();
-                    URL.revokeObjectURL(url);
+                    exportNavmeshBinary({
+                        filename: `${file.name.replace(/\.(ply|spz|splat)$/i, "")}.nav`,
+                        navMeshData: generatedNavData,
+                    });
                     console.log("[Main] NavMesh binary download started.");
+                };
+            }
+            if (globalDownloadCollisionBtn) {
+                globalDownloadCollisionBtn.onclick = async () => {
+                    if (!generatedCollisionArtifact) {
+                        console.warn("[WARN] No collision boundary generated yet.");
+                        return;
+                    }
+                    await exportCollisionBoundaryGlb({
+                        artifact: generatedCollisionArtifact,
+                        filename: `${file.name.replace(/\.(ply|spz|splat)$/i, "")}.collision.glb`,
+                    });
+                    console.log("[Main] Collision mesh GLB download started.");
                 };
             }
             if (globalAddNpcBtn) {
@@ -1109,6 +1125,40 @@ async function main() {
                 }
 
                 return settings;
+            };
+
+            const generateCollisionBoundaryFromSplat = async (
+                bytes: Uint8Array,
+                settings = toCollisionBoundarySettings(buildMeshSettings(true))
+            ): Promise<CollisionBoundaryArtifact> => {
+                console.log("[WAIT] Generating collision voxel boundary...");
+                const artifact = await generateCollisionBoundary({ bytes, settings });
+                generatedCollisionArtifact = artifact;
+
+                const opacity = Number.parseFloat(colliderOpacitySlider?.value ?? '0.35') || 0.35;
+                const mesh = artifact.result.mesh;
+                viewer.displayColliderMesh(
+                    new Float32Array(mesh.vertices),
+                    new Uint32Array(mesh.indices),
+                    opacity
+                );
+                if (showColliderCheckbox) {
+                    viewer.setColliderVisible(showColliderCheckbox.checked);
+                }
+                if (artifact.result.diagnostics.collision_seed_used) {
+                    viewer.displaySeedMarker(artifact.result.diagnostics.collision_seed_used);
+                }
+
+                const downloadCollisionBtn = document.getElementById('downloadCollisionBtn') as HTMLButtonElement | null;
+                if (downloadCollisionBtn) {
+                    downloadCollisionBtn.style.display = 'block';
+                }
+
+                console.log(
+                    `[SUCCESS] Collision voxel boundary generated: ${mesh.vertex_count} vertices, ${mesh.face_count} faces.`
+                );
+                console.log(`[INFO] Collision boundary diagnostics: ${collisionBoundaryDiagnosticsSummary(artifact.result.diagnostics)}`);
+                return artifact;
             };
 
             const getVisibleGroundFieldStates = (): Set<GroundFieldCellState> => {
@@ -1347,6 +1397,8 @@ async function main() {
                         // --- NavMesh Generation Logic ---
                         const generateNavBtn = document.getElementById('generateNavBtn') as HTMLButtonElement;
                         const downloadNavBtn = document.getElementById('downloadNavBtn') as HTMLButtonElement;
+                        const generateCollisionBtn = document.getElementById('generateCollisionBtn') as HTMLButtonElement;
+                        const downloadCollisionBtn = document.getElementById('downloadCollisionBtn') as HTMLButtonElement;
                         const addNpcBtn = document.getElementById('addNpcBtn') as HTMLButtonElement;
                         const generateFieldOverlayBtn = document.getElementById('generateFieldOverlayBtn') as HTMLButtonElement;
                         const clearFieldOverlayBtn = document.getElementById('clearFieldOverlayBtn') as HTMLButtonElement;
@@ -1384,6 +1436,16 @@ async function main() {
                             clearFieldOverlayBtn.onclick = () => viewer.clearGroundFieldOverlay();
                         }
 
+                        if (generateCollisionBtn) {
+                            generateCollisionBtn.onclick = async () => {
+                                try {
+                                    await generateCollisionBoundaryFromSplat(bytes);
+                                } catch (e) {
+                                    logError(`Collision boundary generation failed: ${e}`);
+                                }
+                            };
+                        }
+
                         if (generateNavBtn) {
                             generateNavBtn.onclick = async () => {
                                 try {
@@ -1397,14 +1459,22 @@ async function main() {
                         if (downloadNavBtn) {
                             downloadNavBtn.onclick = () => {
                                 if (!generatedNavData) return;
-                                const blob = new Blob([generatedNavData as any], { type: 'application/octet-stream' });
-                                const url = URL.createObjectURL(blob);
-                                const a = document.createElement('a');
-                                a.href = url;
-                                a.download = `${file.name.replace(/\.(ply|spz|splat)$/i, "")}.nav`;
-                                a.click();
-                                URL.revokeObjectURL(url);
+                                exportNavmeshBinary({
+                                    filename: `${file.name.replace(/\.(ply|spz|splat)$/i, "")}.nav`,
+                                    navMeshData: generatedNavData,
+                                });
                                 console.log("[Main] NavMesh binary download started.");
+                            };
+                        }
+
+                        if (downloadCollisionBtn) {
+                            downloadCollisionBtn.onclick = async () => {
+                                if (!generatedCollisionArtifact) return;
+                                await exportCollisionBoundaryGlb({
+                                    artifact: generatedCollisionArtifact,
+                                    filename: `${file.name.replace(/\.(ply|spz|splat)$/i, "")}.collision.glb`,
+                                });
+                                console.log("[Main] Collision mesh GLB download started.");
                             };
                         }
 
