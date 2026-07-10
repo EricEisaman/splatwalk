@@ -26,6 +26,12 @@ Every v2 result advertises a `capabilities` string array. Current flags:
 | `progress_callback` | exposes `set_progress_callback()` (opt-in structured progress) |
 | `splat_ingest` | exposes `splat_to_ply` (antimatter15 `.splat` -> PLY normalization) alongside `spz_to_ply` |
 
+## [0.4.0] - 2026-07-10
+
+### UI and streaming updates
+
+- uniformity ensured
+
 ## [0.3.7] - 2026-07-07
 
 ### Version Bump
