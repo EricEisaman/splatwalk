@@ -75,7 +75,7 @@ const isFullscreen = ref(false);
 const rightHanded = new URLSearchParams(window.location.search).get('rh') === '1';
 
 const babylon = useBabylonViewer(canvasRef, { rightHanded });
-const { status, statusMessage, errorMessage, logs, isBusy, phase, progress, splatCount, maxShDegree, maxChunkExtent, loadAndProcess, loadExample, exportSog, exportNavmesh, generateCollisionBoundary, exportCollisionMesh, setCollisionBoundaryVisible, reset } =
+const { status, statusMessage, errorMessage, logs, isBusy, phase, progress, splatCount, maxShDegree, maxChunkExtent, loadAndProcess, loadExample, exportSog, exportNavmesh, generateCollisionBoundary, exportCollisionMesh, setCollisionBoundaryVisible, setNavMeshVisible, reset } =
   useSplatFastNav(babylon, { recovery: props.recovery, strayTrim: props.strayTrim, prune: props.prune });
 
 // --- Streamed SOG export -------------------------------------------------
@@ -98,6 +98,7 @@ const sogExporting = ref(false);
 const sogSummary = ref<string | null>(null);
 const collisionBoundaryVisible = ref(true);
 const collisionExporting = ref(false);
+const navMeshVisible = ref(true);
 const collisionSummary = ref<string | null>(null);
 const navExporting = ref(false);
 const navSummary = ref<string | null>(null);
@@ -108,6 +109,7 @@ watch(splatCount, () => {
   collisionSummary.value = null;
   navSummary.value = null;
   sogSummary.value = null;
+  navMeshVisible.value = true;
   sogMode.value = isLargeScene.value ? 'streamed' : 'single';
 });
 
@@ -192,6 +194,11 @@ async function runNavmeshExport(): Promise<void> {
   } finally {
     navExporting.value = false;
   }
+}
+
+function onNavMeshVisible(visible: boolean): void {
+  navMeshVisible.value = visible;
+  setNavMeshVisible(visible);
 }
 
 // Human-readable progress suffix (e.g. "Pruning floaters 42%") when the worker
@@ -427,6 +434,39 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
                 </v-btn>
               </div>
 
+              <v-sheet
+                border
+                rounded="lg"
+                class="d-flex align-center flex-wrap ga-4 pa-3 mb-4 navmesh-toggle-bar"
+                color="surface"
+              >
+                <v-icon
+                  :icon="navMeshVisible ? 'mdi-layers' : 'mdi-layers-off'"
+                  :color="navMeshVisible ? 'success' : 'medium-emphasis'"
+                  size="22"
+                />
+                <div class="flex-grow-1">
+                  <div class="text-body-2 font-weight-medium">Navmesh overlay</div>
+                  <div class="text-caption text-medium-emphasis">
+                    {{
+                      navMeshVisible
+                        ? 'Green walkable mesh visible — click it to move the player'
+                        : 'Hidden — splat view only; click-to-move is off'
+                    }}
+                  </div>
+                </div>
+                <v-switch
+                  :model-value="navMeshVisible"
+                  color="success"
+                  density="comfortable"
+                  hide-details
+                  inset
+                  :disabled="isBusy"
+                  :label="navMeshVisible ? 'Shown' : 'Hidden'"
+                  @update:model-value="onNavMeshVisible(Boolean($event))"
+                />
+              </v-sheet>
+
               <v-divider class="mb-4" />
 
               <div v-if="collisionSummary" class="text-caption text-medium-emphasis mb-3">{{ collisionSummary }}</div>
@@ -615,5 +655,13 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
 .logs-scroll {
   max-height: 240px;
   overflow-y: auto;
+}
+
+.navmesh-toggle-bar {
+  background: linear-gradient(
+    120deg,
+    rgba(var(--v-theme-success), 0.08),
+    rgba(var(--v-theme-surface), 1) 42%
+  );
 }
 </style>

@@ -517,6 +517,11 @@ export function useSplatFastNavR3F() {
     [controller]
   );
 
+  const setNavMeshVisible = useCallback(
+    (visible: boolean): void => controller.setNavMeshVisible(visible),
+    [controller]
+  );
+
   return {
     controller,
     status,
@@ -537,6 +542,7 @@ export function useSplatFastNavR3F() {
     generateCollisionBoundary,
     exportCollisionMesh,
     setCollisionBoundaryVisible,
+    setNavMeshVisible,
     reset,
   };
 }

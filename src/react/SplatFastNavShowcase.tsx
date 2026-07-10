@@ -8,12 +8,14 @@ import Button from '@mui/material/Button';
 import Chip from '@mui/material/Chip';
 import CircularProgress from '@mui/material/CircularProgress';
 import Container from '@mui/material/Container';
+import FormControlLabel from '@mui/material/FormControlLabel';
 import Grid from '@mui/material/Grid';
 import IconButton from '@mui/material/IconButton';
 import Menu from '@mui/material/Menu';
 import MenuItem from '@mui/material/MenuItem';
 import Paper from '@mui/material/Paper';
 import Snackbar from '@mui/material/Snackbar';
+import Switch from '@mui/material/Switch';
 import TextField from '@mui/material/TextField';
 import ToggleButton from '@mui/material/ToggleButton';
 import ToggleButtonGroup from '@mui/material/ToggleButtonGroup';
@@ -27,6 +29,8 @@ import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
 import FolderOpenIcon from '@mui/icons-material/FolderOpen';
 import FullscreenIcon from '@mui/icons-material/Fullscreen';
 import FullscreenExitIcon from '@mui/icons-material/FullscreenExit';
+import LayersIcon from '@mui/icons-material/Layers';
+import LayersClearIcon from '@mui/icons-material/LayersClear';
 import RadioButtonUncheckedIcon from '@mui/icons-material/RadioButtonUnchecked';
 import RefreshIcon from '@mui/icons-material/Refresh';
 import ViewInArIcon from '@mui/icons-material/ViewInAr';
@@ -70,6 +74,7 @@ export function SplatFastNavShowcase(): JSX.Element {
     generateCollisionBoundary,
     exportCollisionMesh,
     setCollisionBoundaryVisible,
+    setNavMeshVisible,
     exportSog,
     reset,
   } = nav;
@@ -95,6 +100,7 @@ export function SplatFastNavShowcase(): JSX.Element {
   const [collisionBoundaryVisible, setCollisionBoundaryVisibleState] = useState(true);
   const [collisionExporting, setCollisionExporting] = useState(false);
   const [collisionSummary, setCollisionSummary] = useState<string | null>(null);
+  const [navMeshVisible, setNavMeshVisibleState] = useState(true);
   const [navExporting, setNavExporting] = useState(false);
   const [navSummary, setNavSummary] = useState<string | null>(null);
 
@@ -102,6 +108,7 @@ export function SplatFastNavShowcase(): JSX.Element {
     setCollisionSummary(null);
     setNavSummary(null);
     setSogSummary(null);
+    setNavMeshVisibleState(true);
     setSogMode(isLargeScene ? 'streamed' : 'single');
   }, [splatCount, isLargeScene]);
 
@@ -453,6 +460,50 @@ export function SplatFastNavShowcase(): JSX.Element {
                     Export navmesh (.nav)
                   </Button>
                 </Box>
+
+                <Paper
+                  variant="outlined"
+                  sx={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    flexWrap: 'wrap',
+                    gap: 2,
+                    p: 1.5,
+                    mb: 2,
+                    background: (theme) =>
+                      `linear-gradient(120deg, ${theme.palette.success.main}14, ${theme.palette.background.paper} 42%)`,
+                  }}
+                >
+                  {navMeshVisible ? (
+                    <LayersIcon color="success" />
+                  ) : (
+                    <LayersClearIcon color="disabled" />
+                  )}
+                  <Box sx={{ flexGrow: 1, minWidth: 180 }}>
+                    <Typography variant="body2" fontWeight={600}>
+                      Navmesh overlay
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      {navMeshVisible
+                        ? 'Green walkable mesh visible — click it to move the player'
+                        : 'Hidden — splat view only; click-to-move is off'}
+                    </Typography>
+                  </Box>
+                  <FormControlLabel
+                    control={
+                      <Switch
+                        color="success"
+                        checked={navMeshVisible}
+                        disabled={isBusy}
+                        onChange={(_, checked) => {
+                          setNavMeshVisibleState(checked);
+                          setNavMeshVisible(checked);
+                        }}
+                      />
+                    }
+                    label={navMeshVisible ? 'Shown' : 'Hidden'}
+                  />
+                </Paper>
 
                 {collisionSummary && (
                   <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 2 }}>

@@ -757,7 +757,11 @@ export class Viewer {
     }
 
     public setNavMeshVisible(visible: boolean): void {
-        this.navMeshDebugMesh?.setEnabled(visible);
+        if (!this.navMeshDebugMesh) {
+            return;
+        }
+        this.navMeshDebugMesh.setEnabled(visible);
+        this.navMeshDebugMesh.isPickable = visible;
     }
 
     public setNavMeshOpacity(opacity: number): void {

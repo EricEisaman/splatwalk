@@ -111,6 +111,8 @@ export interface UseSplatFastNav {
   readonly exportCollisionMesh: () => Promise<Uint8Array>;
   /** Show or hide the collision voxel boundary overlay. */
   readonly setCollisionBoundaryVisible: (visible: boolean) => void;
+  /** Show or hide the green walkable navmesh overlay (click-to-move target). */
+  readonly setNavMeshVisible: (visible: boolean) => void;
   /** Reset back to the idle state, clearing logs and errors. */
   readonly reset: () => void;
 }
@@ -366,6 +368,10 @@ export function useSplatFastNav(
     babylon.viewer.value?.setColliderVisible(visible);
   };
 
+  const setNavMeshVisible = (visible: boolean): void => {
+    babylon.viewer.value?.setNavMeshVisible(visible);
+  };
+
   return {
     status,
     statusMessage,
@@ -384,6 +390,7 @@ export function useSplatFastNav(
     generateCollisionBoundary,
     exportCollisionMesh,
     setCollisionBoundaryVisible,
+    setNavMeshVisible,
     reset,
   };
 }

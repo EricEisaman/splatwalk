@@ -245,6 +245,13 @@ export class SplatNavController {
     }
   }
 
+  /** Toggle the green walkable navmesh overlay (also gates click-to-move hits). */
+  public setNavMeshVisible(visible: boolean): void {
+    if (this.navMeshOverlay) {
+      this.navMeshOverlay.visible = visible;
+    }
+  }
+
   /** Show the walkable navmesh overlay (green) and use it as the click target. */
   public showNavMesh(positions: Float32Array, indices: Uint32Array): void {
     if (!this.world) return;
@@ -262,6 +269,7 @@ export class SplatNavController {
     });
     this.navMeshOverlay = new THREE.Mesh(geometry, material);
     this.navMeshOverlay.renderOrder = 2;
+    this.navMeshOverlay.visible = true;
     this.world.add(this.navMeshOverlay);
   }
 
@@ -396,7 +404,7 @@ export class SplatNavController {
   // --- internals ---------------------------------------------------------
 
   private handleTap(e: PointerEvent): void {
-    if (!this.handles || !this.navMeshOverlay || !this.playerAgent) return;
+    if (!this.handles || !this.navMeshOverlay?.visible || !this.playerAgent) return;
     const rect = this.handles.gl.domElement.getBoundingClientRect();
     const ndc = new THREE.Vector2(
       ((e.clientX - rect.left) / rect.width) * 2 - 1,
