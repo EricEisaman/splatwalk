@@ -1,6 +1,20 @@
 // Quick Reference - Storage Adapter Playground
 // ============================================
-// Copy-paste snippets for common use cases
+// Prefer the Vue demo at /storage-adapter and the Playground paste target
+// public/playground/storage-adapter.ts (class Playground + AppendSceneAsync).
+
+// ============================================
+// 0. CDN lod-meta.json (Babylon 9.16 / Playground TS)
+// ============================================
+
+// Inside Playground.CreateScene:
+// void BABYLON.AppendSceneAsync(
+//   "https://code.playcanvas.com/examples_data/example_skatepark_02/lod-meta.json",
+//   scene
+// );
+
+// In the Vite app:
+// import { loadCdnLodMeta, loadLocalSogZip } from '@/storage/sogStreamLoader';
 
 // ============================================
 // 1. LOCAL ZIP UPLOAD (Browser - No Setup)

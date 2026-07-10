@@ -29,6 +29,8 @@ function rewriteCleanUrls(req: Connect.IncomingMessage): void {
     req.url = '/index.html' + query;
   } else if (path === '/vuetify' || path === '/vuetify/') {
     req.url = '/vuetify.html' + query;
+  } else if (path === '/storage-adapter' || path === '/storage-adapter/') {
+    req.url = '/storage-adapter-app.html' + query;
   } else if (path === '/react' || path === '/react/') {
     req.url = '/react.html' + query;
   }
@@ -740,6 +742,7 @@ export default defineConfig({
       input: {
         main: resolve(__dirname, 'index.html'),
         vuetify: resolve(__dirname, 'vuetify.html'),
+        storageAdapter: resolve(__dirname, 'storage-adapter-app.html'),
         react: resolve(__dirname, 'react.html'),
       },
       output: {

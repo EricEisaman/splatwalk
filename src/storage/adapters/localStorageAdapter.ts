@@ -114,27 +114,35 @@ export class LocalStorageAdapter implements StorageAdapter {
    */
   private async unzipBuffer(buffer: Uint8Array): Promise<Map<string, Uint8Array>> {
     const files = new Map<string, Uint8Array>();
-    
-    // This is a simplified unzip that works with store-only (uncompressed) zips
-    // For production, consider using a library like 'unzipit' or 'jszip'
     const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.length);
     let offset = 0;
 
     while (offset < buffer.length - 22) {
-      // Look for local file header signature (0x04034b50)
+      // Local file header signature (0x04034b50)
       if (view.getUint32(offset, true) === 0x04034b50) {
+        const compressionMethod = view.getUint16(offset + 8, true);
+        const compressedSize = view.getUint32(offset + 18, true);
         const filenameLen = view.getUint16(offset + 26, true);
         const extraLen = view.getUint16(offset + 28, true);
-        const compressedSize = view.getUint32(offset + 18, true);
 
         const nameBytes = buffer.slice(offset + 30, offset + 30 + filenameLen);
         const filename = new TextDecoder().decode(nameBytes);
-
         const dataStart = offset + 30 + filenameLen + extraLen;
+
+        if (filename.endsWith('/')) {
+          offset = dataStart + compressedSize;
+          continue;
+        }
+
+        if (compressionMethod !== 0) {
+          throw new Error(
+            `Zip entry "${filename}" uses compression method ${compressionMethod}. ` +
+              'Only store-only (uncompressed) zips from SplatWalk SOD LOD export are supported.'
+          );
+        }
+
         const fileData = buffer.slice(dataStart, dataStart + compressedSize);
-
         files.set(filename, new Uint8Array(fileData));
-
         offset = dataStart + compressedSize;
       } else {
         offset += 1;

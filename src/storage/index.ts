@@ -50,3 +50,18 @@ export {
 // Adapters
 export { LocalStorageAdapter } from './adapters/localStorageAdapter';
 export { CloudinaryStorageAdapter } from './adapters/cloudinaryAdapter';
+
+// Streamed SOG load helpers (CDN lod-meta + local zip)
+export {
+  assertLodMetaCdnUrl,
+  assertNotInterimLodMeta,
+  installSogDownloadResolver,
+  isSogLodMetadata,
+  loadCdnLodMeta,
+  loadLocalSogZip,
+  stripCommonZipRoot,
+  summarizeLodMeta,
+  type LoadCdnLodMetaResult,
+  type LoadLocalSogZipResult,
+  type SogLodManifestSummary,
+} from './sogStreamLoader';
