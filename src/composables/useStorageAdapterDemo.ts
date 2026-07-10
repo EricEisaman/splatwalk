@@ -42,6 +42,53 @@ export type StorageDemoSource = 'cdn' | 'local';
 
 export type StorageDemoNavPhase = FastNavPhase | 'idle' | 'materialize' | 'error';
 
+/**
+ * User-tunable Fast Nav overrides for the Storage Adapter streamed flow.
+ * Applied on top of the outdoor recovery / Recast ladders.
+ */
+export interface StreamedNavSettings {
+  /** Per-cell height band above reference floor (m). */
+  cellBandAbove: number;
+  /** Per-cell height band below reference floor (m). */
+  cellBandBelow: number;
+  /** Hole-fill radius in field cells. */
+  holeFillRadius: number;
+  /** Max local height variance for floor field (m). */
+  maxLocalHeightVariance: number;
+  /** Recast min region area (cells before squaring). */
+  minRegionArea: number;
+  /** Component-median band above seed floor (m) — widen for bowls/ramps. */
+  sameLevelAbove: number;
+  /** Component-median band below seed floor (m). */
+  sameLevelBelow: number;
+  /** SDF cell size (m); larger = coarser outdoor coverage. */
+  sdfCellSize: number;
+  /** SDF density threshold; lower accepts sparser ground. */
+  sdfDensityThreshold: number;
+  /** Recast max climb (m). */
+  walkableClimb: number;
+  /** Recast agent radius (m); smaller = less erosion. */
+  walkableRadius: number;
+  /** Recast max slope (degrees); higher for bowls/ramps. */
+  walkableSlopeAngle: number;
+}
+
+/** Outdoor-friendly defaults (wider height bands + steeper slopes than indoor). */
+export const DEFAULT_STREAMED_NAV_SETTINGS: StreamedNavSettings = {
+  cellBandAbove: 2.5,
+  cellBandBelow: 2.0,
+  holeFillRadius: 4,
+  maxLocalHeightVariance: 0.35,
+  minRegionArea: 2,
+  sameLevelAbove: 2.0,
+  sameLevelBelow: 1.5,
+  sdfCellSize: 0.2,
+  sdfDensityThreshold: 0.03,
+  walkableClimb: 0.65,
+  walkableRadius: 0.35,
+  walkableSlopeAngle: 55,
+};
+
 export interface UseStorageAdapterDemo {
   readonly busy: Ref<boolean>;
   readonly clear: () => void;
@@ -59,6 +106,8 @@ export interface UseStorageAdapterDemo {
   readonly logs: Ref<readonly string[]>;
   readonly navMeshVisible: Ref<boolean>;
   readonly navPhase: Ref<StorageDemoNavPhase>;
+  readonly navSettings: Ref<StreamedNavSettings>;
+  readonly resetNavSettings: () => void;
   readonly resize: () => void;
   readonly restoreStreamVisual: () => void;
   readonly runFastNavFromStream: () => Promise<void>;
@@ -151,6 +200,7 @@ export const useStorageAdapterDemo = (
   const logs = ref<string[]>([]);
   const navMeshVisible = ref(true);
   const navPhase = ref<StorageDemoNavPhase>('idle');
+  const navSettings = ref<StreamedNavSettings>({ ...DEFAULT_STREAMED_NAV_SETTINGS });
   const statusMessage = ref('Ready — load a CDN lod-meta.json URL or a SplatWalk SOD LOD zip.');
   const summary = shallowRef<SogLodManifestSummary | null>(null);
 
@@ -510,6 +560,11 @@ export const useStorageAdapterDemo = (
     viewer?.setNavMeshVisible(visible);
   };
 
+  const resetNavSettings = (): void => {
+    navSettings.value = { ...DEFAULT_STREAMED_NAV_SETTINGS };
+    addLog('[INFO] Navmesh settings reset to outdoor defaults.');
+  };
+
   const generateCollision = async (): Promise<void> => {
     busy.value = true;
     errorMessage.value = null;
@@ -555,8 +610,14 @@ export const useStorageAdapterDemo = (
     errorMessage.value = null;
     try {
       const { plyBytes, activeViewer } = await ensureViewerWithPly();
+      const settings = navSettings.value;
       statusMessage.value = 'Running Fast Nav…';
       navPhase.value = 'prune';
+      addLog(
+        `[INFO] Nav settings: slope=${settings.walkableSlopeAngle}° radius=${settings.walkableRadius}m ` +
+          `climb=${settings.walkableClimb}m band=±${settings.sameLevelBelow}/${settings.sameLevelAbove}m ` +
+          `sdf=${settings.sdfCellSize}/${settings.sdfDensityThreshold}`
+      );
       const fastNav = await runFastNav({
         viewer: activeViewer,
         bytes: plyBytes,
@@ -566,6 +627,24 @@ export const useStorageAdapterDemo = (
         },
         recovery: STREAMED_FAST_NAV_RECOVERY,
         recastAttempts: STREAMED_FAST_NAV_RECAST_ATTEMPTS,
+        meshSettings: {
+          sdf_cell_size: settings.sdfCellSize,
+          sdf_density_threshold: settings.sdfDensityThreshold,
+          max_local_height_variance: settings.maxLocalHeightVariance,
+          hole_fill_radius: settings.holeFillRadius,
+        },
+        floorMesh: {
+          sameLevelBelow: settings.sameLevelBelow,
+          sameLevelAbove: settings.sameLevelAbove,
+          cellBandBelow: settings.cellBandBelow,
+          cellBandAbove: settings.cellBandAbove,
+        },
+        recastOverrides: {
+          walkableSlopeAngle: settings.walkableSlopeAngle,
+          walkableRadius: settings.walkableRadius,
+          walkableClimb: settings.walkableClimb,
+          minRegionArea: settings.minRegionArea,
+        },
       });
       statusMessage.value = 'Framing the player (top-down)…';
       const framing = activeViewer.focusOnPlayer();
@@ -628,6 +707,8 @@ export const useStorageAdapterDemo = (
     logs,
     navMeshVisible,
     navPhase,
+    navSettings,
+    resetNavSettings,
     resize,
     restoreStreamVisual,
     runFastNavFromStream,

@@ -203,6 +203,32 @@ const concatArrayBuffers = (parts: readonly ArrayBuffer[]): Uint8Array => {
   return out;
 };
 
+/**
+ * Keep `takeCount` rows from a `.splat` buffer with even stride (not a prefix).
+ * Prefix truncation biases toward whatever order the encoder wrote — often one
+ * corner of a chunk — which shrinks outdoor floor coverage the same way as
+ * stopping after early octree chunks.
+ */
+const subsampleSplatRows = (
+  part: ArrayBuffer,
+  partCount: number,
+  takeCount: number,
+  rowBytes: number
+): ArrayBuffer => {
+  if (takeCount >= partCount || takeCount <= 0) {
+    return part.slice(0, Math.max(0, takeCount) * rowBytes);
+  }
+  const src = new Uint8Array(part);
+  const out = new Uint8Array(takeCount * rowBytes);
+  for (let i = 0; i < takeCount; i++) {
+    const srcIndex = Math.floor((i * partCount) / takeCount);
+    const srcOff = srcIndex * rowBytes;
+    const dstOff = i * rowBytes;
+    out.set(src.subarray(srcOff, srcOff + rowBytes), dstOff);
+  }
+  return out.buffer;
+};
+
 const boundsFromSplatBuffer = (
   splatBuffer: Uint8Array
 ): { max: [number, number, number]; min: [number, number, number] } => {
@@ -242,6 +268,11 @@ const boundsFromSplatBuffer = (
 
 /**
  * Decode one LOD level into antimatter15 `.splat` bytes (not yet PLY).
+ *
+ * When `maxSplats` is set, the budget is spread across every chunk at this LOD
+ * (remaining / chunksLeft each step). Stopping after the first N chunks would
+ * bias the nav source to a spatial subset of the octree — a tiny local floor on
+ * large outdoor scenes while the streamed visual still shows the full park.
  */
 const decodeLodToSplatBuffer = async (params: {
   access: StreamedBundleAccess;
@@ -254,26 +285,41 @@ const decodeLodToSplatBuffer = async (params: {
   const splatParts: ArrayBuffer[] = [];
   let splatCount = 0;
   const rowBytes = 32;
+  const maxSplats = params.maxSplats;
 
   for (let i = 0; i < chunkMetas.length; i++) {
     const metaPath = chunkMetas[i]!;
-    log(`Decoding chunk ${i + 1}/${chunkMetas.length}: ${metaPath}`);
+    const chunksLeft = chunkMetas.length - i;
+    const remaining =
+      maxSplats === undefined ? Number.POSITIVE_INFINITY : Math.max(0, maxSplats - splatCount);
+    if (remaining <= 0) {
+      log(
+        `Hit maxSplats=${maxSplats} after ${i}/${chunkMetas.length} chunks (${splatCount} splats).`
+      );
+      break;
+    }
+    // Fair share of whatever budget remains so later octants still contribute.
+    const chunkBudget = Math.max(1, Math.ceil(remaining / chunksLeft));
+
+    log(`Decoding chunk ${i + 1}/${chunkMetas.length}: ${metaPath} (budget ≤ ${chunkBudget} splats)`);
     try {
       const fileMap = await loadChunkFileMap(access, metaPath);
       const parsed = await ParseSogMeta(fileMap, '', scene);
       const part = parsed.data;
       const partCount = Math.floor(part.byteLength / rowBytes);
-      if (params.maxSplats !== undefined && splatCount + partCount > params.maxSplats) {
-        const remaining = Math.max(0, params.maxSplats - splatCount);
-        if (remaining > 0) {
-          splatParts.push(part.slice(0, remaining * rowBytes));
-          splatCount += remaining;
-        }
-        log(`Hit maxSplats=${params.maxSplats}; stopping chunk decode.`);
-        break;
+      const take = Math.min(partCount, chunkBudget, remaining);
+      if (take <= 0) {
+        continue;
       }
-      splatParts.push(part);
-      splatCount += partCount;
+      if (take < partCount) {
+        splatParts.push(subsampleSplatRows(part, partCount, take, rowBytes));
+        log(
+          `Chunk ${metaPath}: kept ${take}/${partCount} splats (strided) for spatial coverage under maxSplats.`
+        );
+      } else {
+        splatParts.push(part);
+      }
+      splatCount += take;
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       throw new Error(`Failed decoding ${metaPath}: ${detail}. ${SPLAT_TRANSFORM_HINT}`);
@@ -285,8 +331,16 @@ const decodeLodToSplatBuffer = async (params: {
   }
 
   const splatBytes = concatArrayBuffers(splatParts);
+  const bounds = boundsFromSplatBuffer(splatBytes);
+  const extentX = bounds.max[0] - bounds.min[0];
+  const extentY = bounds.max[1] - bounds.min[1];
+  const extentZ = bounds.max[2] - bounds.min[2];
+  log(
+    `Nav source coverage: ${splatCount} splats from ${splatParts.length} chunk slice(s); ` +
+      `AABB ${extentX.toFixed(1)}×${extentY.toFixed(1)}×${extentZ.toFixed(1)} m`
+  );
   return {
-    bounds: boundsFromSplatBuffer(splatBytes),
+    bounds,
     splatBytes,
     splatCount,
   };

@@ -8,10 +8,11 @@ import { normalizeSplatToPly } from '@/wasm/normalize';
 import {
   extractFloorFieldWithRecovery,
   resolveRecovery,
+  type DenseSeedOptions,
+  type FastFloorMeshOptions,
   type FastNavLogger,
   type FastNavRecoveryConfig,
   type StrayTrimOptions,
-  type DenseSeedOptions,
 } from '@/navigation/floor';
 
 // Re-export the framework-agnostic floor logic so existing imports from this
@@ -66,6 +67,19 @@ export interface FastNavOptions {
    * Streamed / outdoor demos can pass {@link STREAMED_FAST_NAV_RECAST_ATTEMPTS}.
    */
   readonly recastAttempts?: ReadonlyArray<{ label: string; params: RecastParams }>;
+  /**
+   * Merged into every Recast attempt (after the ladder entry). Use for UI knobs
+   * like slope / agent radius without replacing the whole recovery ladder.
+   */
+  readonly recastOverrides?: Partial<RecastParams>;
+  /**
+   * Merged into the base fast-field {@link MeshSettings} before recovery steps.
+   */
+  readonly meshSettings?: Partial<MeshSettings>;
+  /**
+   * Same-level / cell height-band overrides for outdoor bowls and ramps.
+   */
+  readonly floorMesh?: FastFloorMeshOptions;
 }
 
 /** Override for the WASM-side floater prune (statistical outlier removal). */
@@ -655,13 +669,24 @@ export async function runFastNav(options: FastNavOptions): Promise<FastNavResult
 
   log('[WAIT] Fast path: splat -> floor field -> navmesh -> NPC...');
 
-  const base = defaultFastMeshSettings(viewer);
+  const base: MeshSettings = {
+    ...defaultFastMeshSettings(viewer),
+    ...(options.meshSettings ?? {}),
+  };
   if (options.prune) {
     if (options.prune.enabled !== undefined) base.prune_floaters = options.prune.enabled;
     if (options.prune.k !== undefined) base.prune_floaters_k = options.prune.k;
     if (options.prune.stdRatio !== undefined) base.prune_floaters_std_ratio = options.prune.stdRatio;
   }
   const recovery = resolveRecovery(options.recovery);
+
+  const baseAttempts = options.recastAttempts ?? FAST_NAV_RECAST_ATTEMPTS;
+  const attempts = options.recastOverrides
+    ? baseAttempts.map((attempt) => ({
+        label: attempt.label,
+        params: { ...attempt.params, ...options.recastOverrides },
+      }))
+    : baseAttempts;
 
   // Cross-visit cache: if this exact splat + settings produced a navmesh before,
   // restore it and skip parse+prune+field+floor+Recast entirely. The seed and
@@ -672,7 +697,8 @@ export async function runFastNav(options: FastNavOptions): Promise<FastNavResult
     recovery,
     strayTrim: options.strayTrim ?? null,
     denseSeed: options.denseSeed ?? null,
-    recastAttempts: options.recastAttempts ?? FAST_NAV_RECAST_ATTEMPTS,
+    floorMesh: options.floorMesh ?? null,
+    recastAttempts: attempts,
   });
   const cached = await getNavmesh(cacheKey);
   if (cached) {
@@ -684,7 +710,12 @@ export async function runFastNav(options: FastNavOptions): Promise<FastNavResult
   // First touch of the splat bytes parses + prunes floaters in the worker.
   phase('prune');
   const fastSeed = await ensureFastCollisionSeed(viewer, bytes, base, log);
-  const navSettings = buildFastFieldSettings(base, fastSeed);
+  const builtField = buildFastFieldSettings(base, fastSeed);
+  const navSettings: MeshSettings = {
+    ...builtField,
+    ...(options.meshSettings ?? {}),
+    collision_seed: options.meshSettings?.collision_seed ?? builtField.collision_seed,
+  };
 
   phase('floor');
   const extracted = await extractFloorFieldWithRecovery({
@@ -695,6 +726,7 @@ export async function runFastNav(options: FastNavOptions): Promise<FastNavResult
     recovery,
     strayTrim: options.strayTrim,
     denseSeed: options.denseSeed,
+    floorMesh: options.floorMesh,
     log,
   });
   const floorMesh = extracted.floorMesh;
@@ -719,8 +751,6 @@ export async function runFastNav(options: FastNavOptions): Promise<FastNavResult
   const splatBounds = splatBoundsVec
     ? { min: splatBoundsVec.min.asArray(), max: splatBoundsVec.max.asArray() }
     : null;
-
-  const attempts = options.recastAttempts ?? FAST_NAV_RECAST_ATTEMPTS;
 
   let result: NavWorkerResult | null = null;
   let lastError: unknown = null;

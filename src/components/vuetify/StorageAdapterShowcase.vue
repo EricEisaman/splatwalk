@@ -36,6 +36,8 @@ const {
   logs,
   navMeshVisible,
   navPhase,
+  navSettings,
+  resetNavSettings,
   resize,
   restoreStreamVisual,
   runFastNavFromStream,
@@ -381,6 +383,243 @@ const onRestoreStream = (): void => {
                 Navmesh, player, and NPC draw on top of the live stream.
               </p>
 
+              <v-expansion-panels class="mb-4" variant="accordion">
+                <v-expansion-panel>
+                  <template #title>
+                    <div class="d-flex align-center ga-2">
+                      <v-icon icon="mdi-tune-vertical" size="small" color="primary" />
+                      <span>Navmesh settings</span>
+                      <v-chip size="x-small" variant="tonal" color="primary">overrides</v-chip>
+                    </div>
+                  </template>
+                  <template #text>
+                    <p class="text-caption text-medium-emphasis mb-4">
+                      Fast Nav runs on a materialized nav PLY (not the full stream).
+                      If coverage is a small local patch while the visual shows the whole
+                      park, the nav source was spatially truncated — re-run after this
+                      fix, or raise max slope for steep bowls. Height band only clips
+                      vertical outliers, not same-level flats.
+                    </p>
+
+                    <div class="text-subtitle-2 mb-2">Floor coverage</div>
+                    <v-row dense>
+                      <v-col cols="12" sm="6" md="4">
+                        <v-slider
+                          v-model="navSettings.sameLevelBelow"
+                          :min="0.25"
+                          :max="4"
+                          :step="0.05"
+                          color="primary"
+                          density="compact"
+                          thumb-label
+                          hide-details
+                        >
+                          <template #prepend>
+                            <span class="text-caption text-medium-emphasis settings-label">Band below (m)</span>
+                          </template>
+                        </v-slider>
+                      </v-col>
+                      <v-col cols="12" sm="6" md="4">
+                        <v-slider
+                          v-model="navSettings.sameLevelAbove"
+                          :min="0.3"
+                          :max="4"
+                          :step="0.05"
+                          color="primary"
+                          density="compact"
+                          thumb-label
+                          hide-details
+                        >
+                          <template #prepend>
+                            <span class="text-caption text-medium-emphasis settings-label">Band above (m)</span>
+                          </template>
+                        </v-slider>
+                      </v-col>
+                      <v-col cols="12" sm="6" md="4">
+                        <v-slider
+                          v-model="navSettings.holeFillRadius"
+                          :min="0"
+                          :max="8"
+                          :step="1"
+                          color="primary"
+                          density="compact"
+                          thumb-label
+                          hide-details
+                        >
+                          <template #prepend>
+                            <span class="text-caption text-medium-emphasis settings-label">Hole fill (cells)</span>
+                          </template>
+                        </v-slider>
+                      </v-col>
+                      <v-col cols="12" sm="6" md="4">
+                        <v-slider
+                          v-model="navSettings.sdfCellSize"
+                          :min="0.1"
+                          :max="0.4"
+                          :step="0.01"
+                          color="secondary"
+                          density="compact"
+                          thumb-label
+                          hide-details
+                        >
+                          <template #prepend>
+                            <span class="text-caption text-medium-emphasis settings-label">SDF cell (m)</span>
+                          </template>
+                        </v-slider>
+                      </v-col>
+                      <v-col cols="12" sm="6" md="4">
+                        <v-slider
+                          v-model="navSettings.sdfDensityThreshold"
+                          :min="0.01"
+                          :max="0.12"
+                          :step="0.005"
+                          color="secondary"
+                          density="compact"
+                          thumb-label
+                          hide-details
+                        >
+                          <template #prepend>
+                            <span class="text-caption text-medium-emphasis settings-label">Density thresh</span>
+                          </template>
+                        </v-slider>
+                      </v-col>
+                      <v-col cols="12" sm="6" md="4">
+                        <v-slider
+                          v-model="navSettings.maxLocalHeightVariance"
+                          :min="0.08"
+                          :max="0.6"
+                          :step="0.02"
+                          color="secondary"
+                          density="compact"
+                          thumb-label
+                          hide-details
+                        >
+                          <template #prepend>
+                            <span class="text-caption text-medium-emphasis settings-label">Height variance</span>
+                          </template>
+                        </v-slider>
+                      </v-col>
+                    </v-row>
+
+                    <v-divider class="my-4" />
+                    <div class="text-subtitle-2 mb-2">Recast agent</div>
+                    <v-row dense>
+                      <v-col cols="12" sm="6" md="4">
+                        <v-slider
+                          v-model="navSettings.walkableSlopeAngle"
+                          :min="30"
+                          :max="70"
+                          :step="1"
+                          color="success"
+                          density="compact"
+                          thumb-label
+                          hide-details
+                        >
+                          <template #prepend>
+                            <span class="text-caption text-medium-emphasis settings-label">Max slope (°)</span>
+                          </template>
+                        </v-slider>
+                      </v-col>
+                      <v-col cols="12" sm="6" md="4">
+                        <v-slider
+                          v-model="navSettings.walkableRadius"
+                          :min="0.15"
+                          :max="0.6"
+                          :step="0.05"
+                          color="success"
+                          density="compact"
+                          thumb-label
+                          hide-details
+                        >
+                          <template #prepend>
+                            <span class="text-caption text-medium-emphasis settings-label">Agent radius (m)</span>
+                          </template>
+                        </v-slider>
+                      </v-col>
+                      <v-col cols="12" sm="6" md="4">
+                        <v-slider
+                          v-model="navSettings.walkableClimb"
+                          :min="0.25"
+                          :max="1"
+                          :step="0.05"
+                          color="success"
+                          density="compact"
+                          thumb-label
+                          hide-details
+                        >
+                          <template #prepend>
+                            <span class="text-caption text-medium-emphasis settings-label">Max climb (m)</span>
+                          </template>
+                        </v-slider>
+                      </v-col>
+                      <v-col cols="12" sm="6" md="4">
+                        <v-slider
+                          v-model="navSettings.minRegionArea"
+                          :min="0"
+                          :max="24"
+                          :step="1"
+                          color="success"
+                          density="compact"
+                          thumb-label
+                          hide-details
+                        >
+                          <template #prepend>
+                            <span class="text-caption text-medium-emphasis settings-label">Min region</span>
+                          </template>
+                        </v-slider>
+                      </v-col>
+                      <v-col cols="12" sm="6" md="4">
+                        <v-slider
+                          v-model="navSettings.cellBandBelow"
+                          :min="0.5"
+                          :max="4"
+                          :step="0.1"
+                          color="primary"
+                          density="compact"
+                          thumb-label
+                          hide-details
+                        >
+                          <template #prepend>
+                            <span class="text-caption text-medium-emphasis settings-label">Cell band − (m)</span>
+                          </template>
+                        </v-slider>
+                      </v-col>
+                      <v-col cols="12" sm="6" md="4">
+                        <v-slider
+                          v-model="navSettings.cellBandAbove"
+                          :min="0.45"
+                          :max="4"
+                          :step="0.1"
+                          color="primary"
+                          density="compact"
+                          thumb-label
+                          hide-details
+                        >
+                          <template #prepend>
+                            <span class="text-caption text-medium-emphasis settings-label">Cell band + (m)</span>
+                          </template>
+                        </v-slider>
+                      </v-col>
+                    </v-row>
+
+                    <div class="d-flex flex-wrap ga-2 mt-4">
+                      <v-btn
+                        variant="tonal"
+                        color="secondary"
+                        prepend-icon="mdi-restore"
+                        :disabled="busy"
+                        @click="resetNavSettings"
+                      >
+                        Reset defaults
+                      </v-btn>
+                      <span class="text-caption text-medium-emphasis align-self-center">
+                        Re-run Fast Nav to apply changes
+                      </span>
+                    </div>
+                  </template>
+                </v-expansion-panel>
+              </v-expansion-panels>
+
               <div class="d-flex flex-wrap ga-2 mb-3">
                 <v-chip
                   v-for="step in navSteps"
@@ -597,5 +836,10 @@ export { Playground };</pre>
     rgba(var(--v-theme-success), 0.08),
     rgba(var(--v-theme-surface), 1) 42%
   );
+}
+
+.settings-label {
+  display: inline-block;
+  min-width: 7.5rem;
 }
 </style>

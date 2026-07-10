@@ -538,6 +538,26 @@ export interface FastFloorMesh {
   bridgedCellCount: number;
 }
 
+/** Optional height-band / flatten overrides for {@link buildFastFloorMesh}. */
+export interface FastFloorMeshOptions {
+  /** Per-cell band above the reference floor height (metres). Default 0.45. */
+  readonly cellBandAbove?: number;
+  /** Per-cell band below the reference floor height (metres). Default 0.5. */
+  readonly cellBandBelow?: number;
+  /** Corner flatten snap tolerance (metres). Default {@link DEFAULT_FLOOR_FLATTEN_TOLERANCE}. */
+  readonly floorFlattenTolerance?: number;
+  /**
+   * Component-median band above the seed floor (metres). Default 0.30.
+   * Widen for outdoor bowls / ramps so same-level emission keeps terraced walkables.
+   */
+  readonly sameLevelAbove?: number;
+  /**
+   * Component-median band below the seed floor (metres). Default 0.25.
+   * Widen for outdoor bowls / ramps.
+   */
+  readonly sameLevelBelow?: number;
+}
+
 /**
  * Build a planar floor mesh from a walkable ground field by selecting the best
  * connected floor component near the seed. Throws a typed {@link FastNavFloorError}
@@ -554,8 +574,15 @@ export function buildFastFloorMesh(
   // bounds heights via the per-component height gate + local median leveling, so the
   // old global stray-trim is intentionally not applied here.
   _strayTrim?: StrayTrimOptions,
-  floorFlattenTolerance: number = DEFAULT_FLOOR_FLATTEN_TOLERANCE
+  floorFlattenTolerance: number = DEFAULT_FLOOR_FLATTEN_TOLERANCE,
+  options: FastFloorMeshOptions = {}
 ): FastFloorMesh {
+  const flattenTol = options.floorFlattenTolerance ?? floorFlattenTolerance;
+  const sameLevelBelow = options.sameLevelBelow ?? 0.25;
+  const sameLevelAbove = options.sameLevelAbove ?? 0.3;
+  const cellBandBelow = options.cellBandBelow ?? 0.5;
+  const cellBandAbove = options.cellBandAbove ?? 0.45;
+
   const width = field.width;
   const height = field.height;
   const stateCounts = field.cells.reduce<Record<string, number>>((counts, cell) => {
@@ -864,14 +891,14 @@ export function buildFastFloorMesh(
   // elevation levels fall outside the band and remain their own regions, and because
   // walkableClimb is unchanged (0.25) nothing is stitched across a real step.
   const refHeight = medianHeightOf(selected.cells);
-  const sameLevelLow = Number.isFinite(refHeight) ? refHeight - 0.25 : -Infinity;
-  const sameLevelHigh = Number.isFinite(refHeight) ? refHeight + 0.3 : Infinity;
+  const sameLevelLow = Number.isFinite(refHeight) ? refHeight - sameLevelBelow : -Infinity;
+  const sameLevelHigh = Number.isFinite(refHeight) ? refHeight + sameLevelAbove : Infinity;
   // Per-cell band: even within an accepted same-level component, individual cells far
   // below the floor (pool-edge spill, capture noise) must not be emitted or they drag
   // the surface underground. Slightly wider than the component-median gate to keep
   // genuine gentle slope.
-  const cellBandLow = Number.isFinite(refHeight) ? refHeight - 0.5 : -Infinity;
-  const cellBandHigh = Number.isFinite(refHeight) ? refHeight + 0.45 : Infinity;
+  const cellBandLow = Number.isFinite(refHeight) ? refHeight - cellBandBelow : -Infinity;
+  const cellBandHigh = Number.isFinite(refHeight) ? refHeight + cellBandAbove : Infinity;
   const minComponentCells = 20;
   const minComponentArea = 1.2;
   const cellArea = field.cell_size * field.cell_size;
@@ -1019,7 +1046,7 @@ export function buildFastFloorMesh(
       }
     }
     let h = count > 0 ? sum / count : planeUsable ? (floorPlaneHeight as number) : 0;
-    if (planeUsable && Math.abs(h - (floorPlaneHeight as number)) <= floorFlattenTolerance) {
+    if (planeUsable && Math.abs(h - (floorPlaneHeight as number)) <= flattenTol) {
       h = floorPlaneHeight as number;
     }
     cornerHeights.set(key, h);
@@ -1100,6 +1127,8 @@ export interface ExtractFloorFieldArgs {
   readonly strayTrim?: StrayTrimOptions;
   /** Density-aware re-seeding to anchor on the dense floor (on by default). */
   readonly denseSeed?: DenseSeedOptions;
+  /** Optional same-level / cell height-band overrides for outdoor bowls / ramps. */
+  readonly floorMesh?: FastFloorMeshOptions;
   /** Progress sink. */
   readonly log: FastNavLogger;
 }
@@ -1123,7 +1152,8 @@ export interface ExtractFloorFieldResult {
  * step fails it throws an aggregated {@link FastNavFloorError}.
  */
 export async function extractFloorFieldWithRecovery(args: ExtractFloorFieldArgs): Promise<ExtractFloorFieldResult> {
-  const { bytes, buildField, baseSettings, seed, recovery, strayTrim, denseSeed, log } = args;
+  const { bytes, buildField, baseSettings, seed, recovery, strayTrim, denseSeed, floorMesh: floorMeshOptions, log } =
+    args;
   const steps = recovery.steps;
   const reseedThreshold = denseSeed?.reseedThreshold ?? 2.0;
   const denseSeedEnabled = denseSeed?.enabled ?? true;
@@ -1181,7 +1211,9 @@ export async function extractFloorFieldWithRecovery(args: ExtractFloorFieldArgs)
         effectiveSeed,
         step.minRoomFloorArea,
         log,
-        step.strayTrim ?? strayTrim
+        step.strayTrim ?? strayTrim,
+        floorMeshOptions?.floorFlattenTolerance ?? DEFAULT_FLOOR_FLATTEN_TOLERANCE,
+        floorMeshOptions
       );
       if (floorMesh.positions.length === 0 || floorMesh.indices.length === 0) {
         throw new FastNavFloorError('empty_mesh', 'Fast nav produced an empty floor mesh.', {
