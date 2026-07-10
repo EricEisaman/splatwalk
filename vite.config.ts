@@ -563,12 +563,9 @@ function copyWasmModules(): Plugin {
         for (const entry of entries) {
           if (entry.isDirectory()) {
             const moduleName = entry.name;
-            console.log(`[copy-wasm-modules] Copying module: ${moduleName}`);
-            copyDir(
-              join(pkgDir, moduleName),
-              join(distPkgDir, moduleName),
-              moduleName
-            );
+            const sourceDir = resolveWasmModuleDir(moduleName);
+            console.log(`[copy-wasm-modules] Copying module: ${moduleName} from ${sourceDir}`);
+            copyDir(sourceDir, join(distPkgDir, moduleName), moduleName);
 
             // Validate the copied JS file has all expected exports
             const jsFilePath = join(distPkgDir, moduleName, `${moduleName}.js`);
@@ -580,7 +577,23 @@ function copyWasmModules(): Plugin {
 
         console.log(`[copy-wasm-modules] ✓ Copy complete`);
       } else {
-        console.warn(`[copy-wasm-modules] Warning: pkg/ directory not found at ${pkgDir}`);
+        const fallbackCoreDir = resolve(__dirname, 'node_modules', '@splatwalk/core');
+        if (existsSync(fallbackCoreDir)) {
+          console.log(`[copy-wasm-modules] pkg/ directory not found; falling back to ${fallbackCoreDir}`);
+
+          if (existsSync(distPkgDir)) {
+            rmSync(distPkgDir, { recursive: true, force: true });
+          }
+
+          copyDir(fallbackCoreDir, join(distPkgDir, 'wasm_splatwalk'), 'wasm_splatwalk');
+          const jsFilePath = join(distPkgDir, 'wasm_splatwalk', 'wasm_splatwalk.js');
+          if (existsSync(jsFilePath)) {
+            validateWasmModuleExports(jsFilePath, 'wasm_splatwalk');
+          }
+          console.log(`[copy-wasm-modules] ✓ Fallback copy complete`);
+        } else {
+          console.warn(`[copy-wasm-modules] Warning: pkg/ directory not found at ${pkgDir}`);
+        }
       }
     },
     buildEnd() {
@@ -589,6 +602,7 @@ function copyWasmModules(): Plugin {
       // Note: This is a fallback, so we're more lenient with validation here
       const pkgDir = resolve(__dirname, 'pkg');
       const distPkgDir = resolve(__dirname, 'dist', 'pkg');
+      const fallbackCoreDir = resolve(__dirname, 'node_modules', '@splatwalk/core');
 
       // Only run if pkg exists but dist/pkg doesn't (writeBundle didn't copy)
       // OR if dist/pkg exists but is empty (writeBundle may have failed)
@@ -622,12 +636,9 @@ function copyWasmModules(): Plugin {
           for (const entry of entries) {
             if (entry.isDirectory()) {
               const moduleName = entry.name;
+              const sourceDir = resolveWasmModuleDir(moduleName);
               try {
-                copyDir(
-                  join(pkgDir, moduleName),
-                  join(distPkgDir, moduleName),
-                  moduleName
-                );
+                copyDir(sourceDir, join(distPkgDir, moduleName), moduleName);
 
                 // Validate the copied JS file - but only if it exists and has content
                 // In buildEnd (fallback), we log warnings instead of throwing errors
@@ -657,6 +668,12 @@ function copyWasmModules(): Plugin {
           // dist/pkg exists and is not empty - writeBundle likely already copied and validated
           console.log(`[copy-wasm-modules] buildEnd: dist/pkg already exists with content, skipping fallback copy`);
         }
+      } else if (existsSync(fallbackCoreDir)) {
+        console.log(`[copy-wasm-modules] buildEnd: pkg/ missing, using fallback ${fallbackCoreDir}`);
+        if (!existsSync(distPkgDir)) {
+          mkdirSync(distPkgDir, { recursive: true });
+        }
+        copyDir(fallbackCoreDir, join(distPkgDir, 'wasm_splatwalk'), 'wasm_splatwalk');
       } else {
         console.warn(`[copy-wasm-modules] Warning: pkg/ directory not found at ${pkgDir} in buildEnd hook`);
       }
@@ -669,9 +686,31 @@ function copyWasmModules(): Plugin {
 // with a hash of the built wasm binary, so every new wasm build produces a new
 // cache id. The service worker clears all other caches on activation, meaning
 // integrators never have to manually discard cache to pick up a new build.
+function resolveWasmModuleDir(moduleName: string): string {
+  const candidates = [
+    resolve(__dirname, 'pkg', moduleName),
+    resolve(__dirname, 'node_modules', '@splatwalk/core'),
+  ];
+
+  for (const candidate of candidates) {
+    const entryFile = join(candidate, `${moduleName}.js`);
+    const wasmFile = join(candidate, `${moduleName}_bg.wasm`);
+    if (existsSync(entryFile) && existsSync(wasmFile)) {
+      return candidate;
+    }
+  }
+
+  return resolve(__dirname, 'pkg', moduleName);
+}
+
+function resolveWasmModuleEntry(moduleName: string): string {
+  const moduleDir = resolveWasmModuleDir(moduleName);
+  return join(moduleDir, `${moduleName}.js`);
+}
+
 function injectServiceWorkerBuildId(): Plugin {
   const computeBuildId = (): string => {
-    const wasmPath = resolve(__dirname, 'pkg', 'wasm_splatwalk', 'wasm_splatwalk_bg.wasm');
+    const wasmPath = join(resolveWasmModuleDir('wasm_splatwalk'), 'wasm_splatwalk_bg.wasm');
     if (!existsSync(wasmPath)) {
       console.warn(`[inject-sw-build-id] Warning: wasm not found at ${wasmPath}, falling back to timestamp`);
       return `t${Date.now().toString(36)}`;
@@ -723,10 +762,7 @@ export default defineConfig({
       '@': resolve(__dirname, 'src'),
       // Worker imports `@splatwalk/core`. Point at local spatial pkg so streamed
       // SOG export cannot silently use a stale published lod0/lod1 slicer.
-      '@splatwalk/core': resolve(
-        __dirname,
-        'pkg/wasm_splatwalk/wasm_splatwalk.js',
-      ),
+      '@splatwalk/core': resolveWasmModuleEntry('wasm_splatwalk'),
     },
   },
   publicDir: 'public', // Explicitly enable public directory copying
