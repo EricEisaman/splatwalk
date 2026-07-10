@@ -1,0 +1,43 @@
+[build]
+  publish = "dist"
+  command = "npm run build"
+
+[[redirects]]
+  from = "/storage-adapter"
+  to = "/storage-adapter-app.html"
+  status = 200
+
+[[redirects]]
+  from = "/storage-adapter/"
+  to = "/storage-adapter-app.html"
+  status = 200
+
+[[redirects]]
+  from = "/vuetify"
+  to = "/vuetify.html"
+  status = 200
+
+[[redirects]]
+  from = "/vuetify/"
+  to = "/vuetify.html"
+  status = 200
+
+[[redirects]]
+  from = "/react"
+  to = "/react.html"
+  status = 200
+
+[[redirects]]
+  from = "/react/"
+  to = "/react.html"
+  status = 200
+
+[[redirects]]
+  from = "/app"
+  to = "/index.html"
+  status = 200
+
+[[redirects]]
+  from = "/app/"
+  to = "/index.html"
+  status = 200

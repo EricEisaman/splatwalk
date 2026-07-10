@@ -1,0 +1,3 @@
+/storage-adapter /storage-adapter-app.html 200
+/storage-adapter/ /storage-adapter-app.html 200
+/storage-adapter/* /storage-adapter-app.html 200
