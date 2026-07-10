@@ -66,6 +66,32 @@ export {
   type SogLodManifestSummary,
 } from './sogStreamLoader';
 
+// Fixed GPU residency budgets for city-scale streams
+export {
+  applyStreamQualityPreset,
+  DEFAULT_STREAM_MAX_RESIDENT_SPLATS,
+  DEFAULT_STREAM_MEMORY_BUDGET_MB,
+  DEFAULT_STREAM_QUALITY_PRESET,
+  DEFAULT_STREAM_SETTINGS,
+  STREAM_QUALITY_PRESETS,
+  formatStreamBudgetLog,
+  streamOptionsForPreset,
+  streamOptionsFromSettings,
+  streamQualityPresetLabel,
+  streamQualityPresetResidentSplats,
+  type StreamQualityPreset,
+  type StreamSettings,
+} from './streamMemoryBudget';
+
+export {
+  assertStreamEnvironmentLoaded,
+  awaitStreamResidencyReport,
+  ensureActiveCameraForStream,
+  installBudgetSkipLogger,
+  readStreamResidencyStats,
+  type StreamResidencyStats,
+} from './streamResidency';
+
 // Streamed SOG → PLY for collision / FastNav
 export {
   DEFAULT_NAV_MAX_SPLATS,

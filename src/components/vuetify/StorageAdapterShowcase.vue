@@ -4,10 +4,17 @@ import { computed, onBeforeUnmount, onMounted, ref, watch, type ComponentPublicI
 import {
   useStorageAdapterDemo,
   type StorageDemoSource,
+  type StreamQualityPreset,
 } from '@/composables/useStorageAdapterDemo';
+import {
+  STREAM_QUALITY_PRESETS,
+  streamQualityPresetLabel,
+} from '@/storage/streamMemoryBudget';
 
 const PLAYCANVAS_SKATEPARK_LOD_META =
   'https://code.playcanvas.com/examples_data/example_skatepark_02/lod-meta.json';
+const PLAYCANVAS_CHURCH_LOD_META =
+  'https://code.playcanvas.com/examples_data/example_roman_parish_02/lod-meta.json';
 
 const canvasRef = ref<HTMLCanvasElement | null>(null);
 const cardRef = ref<ComponentPublicInstance | null>(null);
@@ -38,14 +45,29 @@ const {
   navPhase,
   navSettings,
   resetNavSettings,
+  resetStreamSettings,
   resize,
   restoreStreamVisual,
   runFastNavFromStream,
   setNavMeshVisible,
+  setStreamQualityPreset,
   showDebugNavPly,
   statusMessage,
+  streamQualityPreset,
+  streamResidency,
+  streamSettings,
   summary,
 } = useStorageAdapterDemo(canvasRef);
+
+const onStreamQualityChange = (value: unknown): void => {
+  if (typeof value !== 'string') {
+    return;
+  }
+  if (!(STREAM_QUALITY_PRESETS as readonly string[]).includes(value)) {
+    return;
+  }
+  setStreamQualityPreset(value as StreamQualityPreset);
+};
 
 const onFullscreenChange = (): void => {
   isFullscreen.value = document.fullscreenElement !== null;
@@ -176,6 +198,11 @@ const useSkateparkExample = (): void => {
   sourceMode.value = 'cdn';
 };
 
+const useChurchExample = (): void => {
+  cdnUrl.value = PLAYCANVAS_CHURCH_LOD_META;
+  sourceMode.value = 'cdn';
+};
+
 const onClear = (): void => {
   selectedZipName.value = null;
   clear();
@@ -218,9 +245,10 @@ const onRestoreStream = (): void => {
         <p class="text-body-2 text-medium-emphasis mb-4">
           Stream PlayCanvas / Babylon SOD LOD from a CDN
           <code class="text-primary">lod-meta.json</code>
-          URL or a local SplatWalk store-only zip — same
-          <code class="text-primary">AppendSceneAsync</code>
-          / GaussianSplattingStream path as Babylon 9.16.
+          URL or a local SplatWalk store-only zip via budgeted
+          <code class="text-primary">GaussianSplattingStream</code>
+          (fixed resident GPU budget — safe for city-scale catalogs up to 200M+ splats).
+          Prefer CDN for large scenes; local zip materializes the full bundle in memory.
         </p>
 
         <v-btn-toggle
@@ -233,6 +261,243 @@ const onRestoreStream = (): void => {
           <v-btn value="cdn" prepend-icon="mdi-cloud-outline">CDN lod-meta</v-btn>
           <v-btn value="local" prepend-icon="mdi-folder-zip-outline">Local ZIP</v-btn>
         </v-btn-toggle>
+
+        <v-card border color="surface" class="mb-4 pa-4">
+          <div class="d-flex align-center flex-wrap ga-2 mb-2">
+            <v-icon icon="mdi-tune-vertical" size="small" color="primary" />
+            <span class="text-subtitle-2">Stream settings</span>
+            <v-chip size="x-small" variant="tonal" color="primary">pre-load</v-chip>
+            <v-spacer />
+            <v-btn
+              size="small"
+              variant="text"
+              color="secondary"
+              :disabled="busy"
+              @click="resetStreamSettings"
+            >
+              Reset defaults
+            </v-btn>
+          </div>
+          <p class="text-caption text-medium-emphasis mb-3">
+            PlayCanvas-style quality presets set the resident GPU budget. Advanced knobs
+            override Babylon <code>GaussianSplattingStream</code> options (LOD distances,
+            frustum bias, decode rate). Tweaks apply on the next <strong>Load stream</strong>
+            — raise resident budget or lower <code>maxDetailLod</code> cap if sky / far
+            nodes look empty.
+          </p>
+
+          <div class="text-caption text-medium-emphasis mb-1">Quality (resident budget)</div>
+          <v-btn-toggle
+            :model-value="streamQualityPreset"
+            mandatory
+            density="comfortable"
+            color="success"
+            class="mb-3"
+            :disabled="busy"
+            @update:model-value="onStreamQualityChange"
+          >
+            <v-btn
+              v-for="preset in STREAM_QUALITY_PRESETS"
+              :key="preset"
+              :value="preset"
+            >
+              {{ streamQualityPresetLabel(preset) }}
+            </v-btn>
+          </v-btn-toggle>
+          <p class="text-caption text-medium-emphasis mb-4">
+            Current:
+            {{ streamSettings.maxResidentSplats.toLocaleString() }} resident ·
+            {{ streamSettings.memoryBudgetMb }} MB · maxDetailLod={{ streamSettings.maxDetailLod }}
+            (0 = full detail allowed; distance LOD still coarsens far nodes).
+            <template v-if="streamResidency">
+              · decoded {{ streamResidency.decodedFiles }}/{{ streamResidency.catalogFiles }}
+              <template v-if="streamResidency.skippedBudgetWarnings > 0">
+                · {{ streamResidency.skippedBudgetWarnings }} budget skips
+              </template>
+            </template>
+          </p>
+
+          <v-expansion-panels variant="accordion" class="mb-0">
+            <v-expansion-panel title="Advanced stream overrides">
+              <template #text>
+                <div class="text-subtitle-2 mb-2">Memory</div>
+                <v-row density="comfortable">
+                  <v-col cols="12" sm="6">
+                    <v-slider
+                      v-model="streamSettings.maxResidentSplats"
+                      :min="500000"
+                      :max="16000000"
+                      :step="250000"
+                      color="success"
+                      density="compact"
+                      thumb-label
+                      hide-details
+                      :disabled="busy"
+                    >
+                      <template #prepend>
+                        <span class="text-caption text-medium-emphasis settings-label">Max resident</span>
+                      </template>
+                    </v-slider>
+                  </v-col>
+                  <v-col cols="12" sm="6">
+                    <v-slider
+                      v-model="streamSettings.memoryBudgetMb"
+                      :min="64"
+                      :max="1536"
+                      :step="32"
+                      color="success"
+                      density="compact"
+                      thumb-label
+                      hide-details
+                      :disabled="busy"
+                    >
+                      <template #prepend>
+                        <span class="text-caption text-medium-emphasis settings-label">Budget MB</span>
+                      </template>
+                    </v-slider>
+                  </v-col>
+                </v-row>
+
+                <div class="text-subtitle-2 mb-2 mt-4">LOD / visibility</div>
+                <v-row density="comfortable">
+                  <v-col cols="12" sm="6" md="4">
+                    <v-slider
+                      v-model="streamSettings.lodBaseDistance"
+                      :min="1"
+                      :max="40"
+                      :step="0.5"
+                      color="primary"
+                      density="compact"
+                      thumb-label
+                      hide-details
+                      :disabled="busy"
+                    >
+                      <template #prepend>
+                        <span class="text-caption text-medium-emphasis settings-label">LOD base dist</span>
+                      </template>
+                    </v-slider>
+                  </v-col>
+                  <v-col cols="12" sm="6" md="4">
+                    <v-slider
+                      v-model="streamSettings.lodMultiplier"
+                      :min="1.5"
+                      :max="6"
+                      :step="0.1"
+                      color="primary"
+                      density="compact"
+                      thumb-label
+                      hide-details
+                      :disabled="busy"
+                    >
+                      <template #prepend>
+                        <span class="text-caption text-medium-emphasis settings-label">LOD multiplier</span>
+                      </template>
+                    </v-slider>
+                  </v-col>
+                  <v-col cols="12" sm="6" md="4">
+                    <v-slider
+                      v-model="streamSettings.lodBehindPenalty"
+                      :min="0"
+                      :max="4"
+                      :step="0.25"
+                      color="primary"
+                      density="compact"
+                      thumb-label
+                      hide-details
+                      :disabled="busy"
+                    >
+                      <template #prepend>
+                        <span class="text-caption text-medium-emphasis settings-label">Behind penalty</span>
+                      </template>
+                    </v-slider>
+                  </v-col>
+                  <v-col cols="12" sm="6" md="4">
+                    <v-slider
+                      v-model="streamSettings.maxDetailLod"
+                      :min="0"
+                      :max="6"
+                      :step="1"
+                      color="primary"
+                      density="compact"
+                      thumb-label
+                      hide-details
+                      :disabled="busy"
+                    >
+                      <template #prepend>
+                        <span class="text-caption text-medium-emphasis settings-label">Max detail LOD</span>
+                      </template>
+                    </v-slider>
+                  </v-col>
+                  <v-col cols="12" sm="6" md="4">
+                    <v-switch
+                      v-model="streamSettings.frustumCulling"
+                      color="primary"
+                      density="compact"
+                      hide-details
+                      label="Frustum LOD bias"
+                      :disabled="busy"
+                    />
+                  </v-col>
+                </v-row>
+
+                <div class="text-subtitle-2 mb-2 mt-4">Streaming throughput</div>
+                <v-row density="comfortable">
+                  <v-col cols="12" sm="6" md="4">
+                    <v-slider
+                      v-model="streamSettings.maxConcurrentDownloads"
+                      :min="1"
+                      :max="8"
+                      :step="1"
+                      color="secondary"
+                      density="compact"
+                      thumb-label
+                      hide-details
+                      :disabled="busy"
+                    >
+                      <template #prepend>
+                        <span class="text-caption text-medium-emphasis settings-label">Downloads</span>
+                      </template>
+                    </v-slider>
+                  </v-col>
+                  <v-col cols="12" sm="6" md="4">
+                    <v-slider
+                      v-model="streamSettings.maxDecodesPerFrame"
+                      :min="1"
+                      :max="4"
+                      :step="1"
+                      color="secondary"
+                      density="compact"
+                      thumb-label
+                      hide-details
+                      :disabled="busy"
+                    >
+                      <template #prepend>
+                        <span class="text-caption text-medium-emphasis settings-label">Decodes / frame</span>
+                      </template>
+                    </v-slider>
+                  </v-col>
+                  <v-col cols="12" sm="6" md="4">
+                    <v-slider
+                      v-model="streamSettings.evictionCooldownFrames"
+                      :min="0"
+                      :max="300"
+                      :step="10"
+                      color="secondary"
+                      density="compact"
+                      thumb-label
+                      hide-details
+                      :disabled="busy"
+                    >
+                      <template #prepend>
+                        <span class="text-caption text-medium-emphasis settings-label">Evict cooldown</span>
+                      </template>
+                    </v-slider>
+                  </v-col>
+                </v-row>
+              </template>
+            </v-expansion-panel>
+          </v-expansion-panels>
+        </v-card>
 
         <v-card v-if="sourceMode === 'cdn'" border color="surface" class="mb-4 pa-4">
           <v-text-field
@@ -266,6 +531,15 @@ const onRestoreStream = (): void => {
               PlayCanvas skatepark
             </v-btn>
             <v-btn
+              variant="tonal"
+              color="secondary"
+              prepend-icon="mdi-church"
+              :disabled="busy"
+              @click="useChurchExample"
+            >
+              PlayCanvas church (~35M)
+            </v-btn>
+            <v-btn
               variant="text"
               color="secondary"
               prepend-icon="mdi-close"
@@ -280,7 +554,9 @@ const onRestoreStream = (): void => {
         <v-card v-else border color="surface" class="mb-4 pa-4">
           <div class="text-body-2 text-medium-emphasis mb-3">
             Upload a streamed SOD LOD zip from SplatWalk FastNav export
-            (<span class="text-primary">(store-only)</span>.
+            (<span class="text-primary">store-only</span>).
+            Fine for small demos — city-scale catalogs should use CDN lod-meta so chunks
+            stay on the network, not fully in RAM.
           </div>
           <div class="d-flex flex-wrap align-center ga-2">
             <v-btn
@@ -402,7 +678,7 @@ const onRestoreStream = (): void => {
                     </p>
 
                     <div class="text-subtitle-2 mb-2">Floor coverage</div>
-                    <v-row dense>
+                    <v-row density="comfortable">
                       <v-col cols="12" sm="6" md="4">
                         <v-slider
                           v-model="navSettings.sameLevelBelow"
@@ -503,7 +779,7 @@ const onRestoreStream = (): void => {
 
                     <v-divider class="my-4" />
                     <div class="text-subtitle-2 mb-2">Recast agent</div>
-                    <v-row dense>
+                    <v-row density="comfortable">
                       <v-col cols="12" sm="6" md="4">
                         <v-slider
                           v-model="navSettings.walkableSlopeAngle"
@@ -565,6 +841,22 @@ const onRestoreStream = (): void => {
                         >
                           <template #prepend>
                             <span class="text-caption text-medium-emphasis settings-label">Min region</span>
+                          </template>
+                        </v-slider>
+                      </v-col>
+                      <v-col cols="12" sm="6" md="4">
+                        <v-slider
+                          v-model="navSettings.maxIslandSeedDistance"
+                          :min="6"
+                          :max="200"
+                          :step="2"
+                          color="warning"
+                          density="compact"
+                          thumb-label
+                          hide-details
+                        >
+                          <template #prepend>
+                            <span class="text-caption text-medium-emphasis settings-label">Island↔seed max (m)</span>
                           </template>
                         </v-slider>
                       </v-col>
@@ -753,10 +1045,25 @@ const onRestoreStream = (): void => {
     camera.attachControl(canvas, true);
     var light = new BABYLON.HemisphericLight("light", new BABYLON.Vector3(0, 1, 0), scene);
     light.intensity = 0.7;
-    void BABYLON.AppendSceneAsync(
-      "https://code.playcanvas.com/examples_data/example_skatepark_02/lod-meta.json",
-      scene
-    );
+    // City-scale: always pass a resident budget. AppendSceneAsync cannot.
+    // Tune like PlayCanvas Medium: ~4M resident, maxDetailLod 0 (distance LOD only).
+    const rootUrl = "https://code.playcanvas.com/examples_data/example_roman_parish_02/";
+    void fetch(rootUrl + "lod-meta.json")
+      .then((r) => r.json())
+      .then((meta) => {
+        new BABYLON.GaussianSplattingStream("GaussianSplattingStream", meta, rootUrl, scene, {
+          maxResidentSplats: 4_000_000,
+          memoryBudgetMb: 384,
+          maxDetailLod: 0,
+          lodBaseDistance: 5,
+          lodMultiplier: 3,
+          lodBehindPenalty: 1,
+          frustumCulling: true,
+          maxConcurrentDownloads: 2,
+          maxDecodesPerFrame: 1,
+          evictionCooldownFrames: 100,
+        });
+      });
     return scene;
   }
 }

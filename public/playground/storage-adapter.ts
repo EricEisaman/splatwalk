@@ -3,41 +3,48 @@
  *
  * Paste into https://playground.babylonjs.com (TypeScript mode).
  * Requires a Babylon build with SPLAT / GaussianSplattingStream (9.16+).
+ *
+ * Always pass maxResidentSplats / memoryBudgetMb so city-scale catalogs
+ * (35M–200M+) do not allocate a full-dataset GPU work buffer. AppendSceneAsync
+ * alone cannot pass those options through SPLATFileLoader.
+ *
+ * Options mirror SplatWalk Storage Adapter → Stream settings (PlayCanvas Medium).
  */
 class Playground {
   public static CreateScene(engine: BABYLON.Engine, canvas: HTMLCanvasElement): BABYLON.Scene {
-    // This creates a basic Babylon Scene object (non-mesh)
     var scene = new BABYLON.Scene(engine);
-
-    // This creates and positions a free camera (non-mesh)
     var camera = new BABYLON.FreeCamera('camera1', new BABYLON.Vector3(0, 5, -10), scene);
-
-    // This targets the camera to scene origin
     camera.setTarget(BABYLON.Vector3.Zero());
-
-    // This attaches the camera to the canvas
     camera.attachControl(canvas, true);
 
-    // This creates a light, aiming 0,1,0 - to the sky (non-mesh)
     var light = new BABYLON.HemisphericLight('light', new BABYLON.Vector3(0, 1, 0), scene);
-    // Default intensity is 1. Let's dim the light a small amount
     light.intensity = 0.7;
 
-    // Our built-in 'sphere' shape.
-    var sphere = BABYLON.MeshBuilder.CreateSphere('sphere', { diameter: 2, segments: 32 }, scene);
-
-    // Move the sphere upward 1/2 its height
-    sphere.position.y = 1;
-
-    // Our built-in 'ground' shape.
-    var ground = BABYLON.MeshBuilder.CreateGround('ground', { width: 6, height: 6 }, scene);
-
-    // Streamed SOD LOD (PlayCanvas / Babylon GaussianSplattingStream).
-    // CreateScene stays sync; AppendSceneAsync continues loading in the background.
-    void BABYLON.AppendSceneAsync(
-      'https://code.playcanvas.com/examples_data/example_skatepark_02/lod-meta.json',
-      scene
-    );
+    const rootUrl = 'https://code.playcanvas.com/examples_data/example_roman_parish_02/';
+    void fetch(`${rootUrl}lod-meta.json`)
+      .then((response) => {
+        if (!response.ok) {
+          throw new Error(`lod-meta fetch failed (${response.status})`);
+        }
+        return response.json();
+      })
+      .then((meta) => {
+        new BABYLON.GaussianSplattingStream('GaussianSplattingStream', meta, rootUrl, scene, {
+          maxResidentSplats: 4_000_000,
+          memoryBudgetMb: 384,
+          maxDetailLod: 0,
+          lodBaseDistance: 5,
+          lodMultiplier: 3,
+          lodBehindPenalty: 1,
+          frustumCulling: true,
+          maxConcurrentDownloads: 2,
+          maxDecodesPerFrame: 1,
+          evictionCooldownFrames: 100,
+        });
+      })
+      .catch((error) => {
+        console.error(error);
+      });
 
     return scene;
   }

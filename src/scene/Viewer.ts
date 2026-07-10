@@ -176,7 +176,9 @@ export class Viewer {
         if (horizontal < 0.5) {
             return;
         }
-        if (sizeY > horizontal * 0.9) {
+        // Fail only when Y is strictly longer than the ground plane (true wall-as-floor).
+        // Near-isotropic outdoor/sky AABBs (e.g. parish_02 environment shell) must not abort nav.
+        if (sizeY > horizontal) {
             throw new Error(
                 `Splat orientation looks wrong: Y extent ${sizeY.toFixed(1)}m ≥ horizontal ${horizontal.toFixed(1)}m ` +
                     `(${sizeX.toFixed(1)}×${sizeY.toFixed(1)}×${sizeZ.toFixed(1)}). ` +
@@ -703,7 +705,7 @@ export class Viewer {
 
         for (const mesh of this.colliderMeshes) {
             mesh.material = this.colliderMaterial;
-            mesh.isPickable = false;
+            this.prepareOverlayMesh(mesh, this.colliderMaterial, { pickable: false, liftY: 0.03 });
         }
 
         const geometry = this.getColliderMeshBuffers();
@@ -728,8 +730,7 @@ export class Viewer {
         this.colliderMaterial.diffuseColor = new Color3(0.0, 0.85, 1.0);
         this.applyAlphaOpacity(this.colliderMaterial, opacity);
         this.colliderMaterial.backFaceCulling = false;
-        mesh.material = this.colliderMaterial;
-        mesh.isPickable = false;
+        this.prepareOverlayMesh(mesh, this.colliderMaterial, { pickable: false, liftY: 0.03 });
         this.colliderMeshes = [mesh];
     }
 
@@ -773,6 +774,28 @@ export class Viewer {
     private applyAlphaOpacity(material: StandardMaterial, alpha: number): void {
         material.alpha = alpha;
         material.transparencyMode = alpha < 1 ? Material.MATERIAL_ALPHABLEND : Material.MATERIAL_OPAQUE;
+    }
+
+    /**
+     * Draw translucent helpers above {@link GaussianSplattingStream} / splat meshes.
+     * Group 0 holds the stream; group 1 draws after without clearing depth so the
+     * overlay composites on top (otherwise dense splat depth fully occludes green nav).
+     */
+    private prepareOverlayMesh(
+        mesh: Mesh,
+        material: StandardMaterial,
+        options: { liftY?: number; pickable: boolean }
+    ): void {
+        const overlayGroup = 1;
+        this.scene.setRenderingAutoClearDepthStencil(overlayGroup, false, false, false);
+        mesh.renderingGroupId = overlayGroup;
+        mesh.isPickable = options.pickable;
+        mesh.material = material;
+        material.disableDepthWrite = true;
+        material.zOffset = -2;
+        if (options.liftY !== undefined && options.liftY !== 0) {
+            mesh.position.y += options.liftY;
+        }
     }
 
     public getColliderBounds(): { min: Vector3, max: Vector3 } | null {
@@ -900,22 +923,26 @@ export class Viewer {
         vertexData.positions = positions;
         vertexData.indices = indices;
         vertexData.applyToMesh(mesh);
-        mesh.position.y = visualOffsetY;
+        // Slight lift above ground splats so the green sheet reads clearly over dense GS depth.
+        const liftY = 0.05;
+        mesh.position.y = visualOffsetY + liftY;
 
         const mat = new StandardMaterial("navmesh_mat", this.scene);
         mat.diffuseColor = new Color3(0, 1, 0);
         this.applyAlphaOpacity(mat, 0.55);
         mat.backFaceCulling = false;
-        mesh.material = mat;
-        mesh.isPickable = true;
+        this.prepareOverlayMesh(mesh, mat, { pickable: true });
 
         this.navMeshDebugMesh = mesh;
         this.navMeshMaterial = mat;
-        this.navMeshVisualOffset = new Vector3(0, visualOffsetY, 0);
+        this.navMeshVisualOffset = new Vector3(0, visualOffsetY + liftY, 0);
         this.navMeshSpawnPoint = this.getMostInteriorNavMeshPoint(positions, indices)
             ?? this.getFirstNavMeshPoint(positions, indices);
 
-        console.log(`[Viewer] Navmesh visualized${visualOffsetY !== 0 ? ` with Y offset ${visualOffsetY.toFixed(3)}` : ""}`);
+        mesh.setEnabled(true);
+        console.log(
+            `[Viewer] Navmesh visualized${visualOffsetY !== 0 ? ` with Y offset ${visualOffsetY.toFixed(3)}` : ""} (overlay group 1)`
+        );
         return this.navMeshSpawnPoint?.clone() ?? null;
     }
 

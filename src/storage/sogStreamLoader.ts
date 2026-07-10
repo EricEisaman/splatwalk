@@ -1,18 +1,25 @@
 /**
  * Load PlayCanvas / Babylon streamed SOG (lod-meta.json) from a CDN URL or a
- * local SplatWalk store-only zip, using Babylon 9.16 GaussianSplattingStream.
+ * local SplatWalk store-only zip, using Babylon 9.16 GaussianSplattingStream
+ * with a fixed resident memory budget (city-scale safe up to 200M+ catalogs).
  */
 
 import type { AbstractMesh, Scene } from '@babylonjs/core';
-import { AppendSceneAsync } from '@babylonjs/core/Loading/sceneLoader';
-// Side-effect: registers DefaultLoadingScreen for AppendSceneAsync
-import '@babylonjs/core/Loading/loadingScreen';
 import {
   GaussianSplattingStream,
+  type IGaussianSplattingStreamOptions,
   type ISOGLODMetadata,
 } from '@babylonjs/loaders/SPLAT/gaussianSplattingStream';
+import * as fflate from 'fflate';
 
 import { createStorageAdapter } from './factory';
+import {
+  applyStreamQualityPreset,
+  DEFAULT_STREAM_SETTINGS,
+  streamOptionsFromSettings,
+  type StreamQualityPreset,
+  type StreamSettings,
+} from './streamMemoryBudget';
 
 const LOD_META_BASENAME = 'lod-meta.json';
 const STORE_COMPRESSION_METHOD = 0;
@@ -25,8 +32,11 @@ export interface SogLodManifestSummary {
 }
 
 export interface LoadCdnLodMetaResult {
+  readonly dispose: () => void;
   readonly lodMetaUrl: string;
   readonly manifest: ISOGLODMetadata;
+  readonly stream: GaussianSplattingStream;
+  readonly streamOptions: IGaussianSplattingStreamOptions;
   readonly summary: SogLodManifestSummary;
 }
 
@@ -35,6 +45,7 @@ export interface LoadLocalSogZipResult {
   readonly files: ReadonlyMap<string, Uint8Array>;
   readonly manifest: ISOGLODMetadata;
   readonly stream: GaussianSplattingStream;
+  readonly streamOptions: IGaussianSplattingStreamOptions;
   readonly summary: SogLodManifestSummary;
   readonly fileCount: number;
 }
@@ -77,6 +88,41 @@ const normalizePath = (path: string): string => {
     }
   }
   return parts.join('/');
+};
+
+const rootUrlFromLodMetaUrl = (lodMetaUrl: string): string => {
+  const parsed = new URL(lodMetaUrl);
+  const path = parsed.pathname;
+  const lastSlash = path.lastIndexOf('/');
+  parsed.pathname = lastSlash >= 0 ? path.slice(0, lastSlash + 1) : '/';
+  parsed.search = '';
+  parsed.hash = '';
+  return parsed.href;
+};
+
+const resolveStreamOptions = (params: {
+  options?: IGaussianSplattingStreamOptions;
+  preset?: StreamQualityPreset;
+  settings?: StreamSettings;
+}): IGaussianSplattingStreamOptions => {
+  const settings =
+    params.settings ??
+    applyStreamQualityPreset(params.preset ?? DEFAULT_STREAM_SETTINGS.preset);
+  const fromSettings = streamOptionsFromSettings(settings);
+  const merged = { ...fromSettings, ...params.options };
+  // Never allow callers to strip the resident budget (city-scale invariant).
+  const maxResidentSplats = Math.max(
+    1,
+    merged.maxResidentSplats ?? fromSettings.maxResidentSplats ?? 4_000_000
+  );
+  const memoryBudgetMb = Math.max(1, merged.memoryBudgetMb ?? fromSettings.memoryBudgetMb ?? 384);
+  return {
+    ...merged,
+    // Bundle fflate so environment/*.sog unzip does not depend on unpkg CDN (sky).
+    fflate: merged.fflate ?? fflate,
+    maxResidentSplats,
+    memoryBudgetMb,
+  };
 };
 
 /**
@@ -252,12 +298,16 @@ const disposeMeshes = (meshes: readonly AbstractMesh[]): void => {
 };
 
 /**
- * Load a CDN-hosted lod-meta.json stream via AppendSceneAsync (Babylon Playground pattern).
+ * Load a CDN-hosted lod-meta.json into a budgeted {@link GaussianSplattingStream}.
+ * Does not use AppendSceneAsync — the scene loader cannot pass memory budgets.
  */
 export const loadCdnLodMeta = async (params: {
   lodMetaUrl: string;
-  scene: Scene;
+  options?: IGaussianSplattingStreamOptions;
+  preset?: StreamQualityPreset;
   previousMeshes?: readonly AbstractMesh[];
+  scene: Scene;
+  settings?: StreamSettings;
 }): Promise<LoadCdnLodMetaResult> => {
   const lodMetaUrl = assertLodMetaCdnUrl(params.lodMetaUrl);
   if (params.previousMeshes?.length) {
@@ -276,21 +326,45 @@ export const loadCdnLodMeta = async (params: {
     );
   }
 
-  await AppendSceneAsync(lodMetaUrl, params.scene);
+  const streamOptions = resolveStreamOptions({
+    options: params.options,
+    preset: params.preset,
+    settings: params.settings,
+  });
+  const rootUrl = rootUrlFromLodMetaUrl(lodMetaUrl);
+  const stream = new GaussianSplattingStream(
+    'GaussianSplattingStream',
+    raw,
+    rootUrl,
+    params.scene,
+    streamOptions
+  );
+
   return {
+    dispose: () => {
+      stream.dispose();
+    },
     lodMetaUrl,
     manifest: raw,
+    stream,
+    streamOptions,
     summary: summarizeLodMeta(raw),
   };
 };
 
 /**
- * Load a SplatWalk-exported store-only SOD LOD zip into a GaussianSplattingStream.
+ * Load a SplatWalk-exported store-only SOD LOD zip into a budgeted stream.
+ *
+ * Note: the zip is fully materialized into blob URLs — fine for small demos.
+ * City-scale (tens–hundreds of millions of splats) should use CDN lod-meta instead.
  */
 export const loadLocalSogZip = async (params: {
   file: File | Blob;
-  scene: Scene;
+  options?: IGaussianSplattingStreamOptions;
+  preset?: StreamQualityPreset;
   previousMeshes?: readonly AbstractMesh[];
+  scene: Scene;
+  settings?: StreamSettings;
 }): Promise<LoadLocalSogZipResult> => {
   if (params.previousMeshes?.length) {
     disposeMeshes(params.previousMeshes);
@@ -322,12 +396,18 @@ export const loadLocalSogZip = async (params: {
   const blobUrls = buildBlobUrlMap(files);
   const sourceFilenames = [...raw.filenames];
   const rewritten = rewriteMetadataUrls(raw, blobUrls);
+  const streamOptions = resolveStreamOptions({
+    options: params.options,
+    preset: params.preset,
+    settings: params.settings,
+  });
 
   const stream = new GaussianSplattingStream(
     'storageAdapterSogStream',
     rewritten,
     '',
-    params.scene
+    params.scene,
+    streamOptions
   );
   installSogDownloadResolver(stream, sourceFilenames, blobUrls);
 
@@ -344,6 +424,7 @@ export const loadLocalSogZip = async (params: {
     files,
     manifest: raw,
     stream,
+    streamOptions,
     summary: summarizeLodMeta(raw),
   };
 };

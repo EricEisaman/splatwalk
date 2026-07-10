@@ -486,7 +486,7 @@ export function SplatFastNavShowcase(): JSX.Element {
                     <Typography variant="caption" color="text.secondary">
                       {navMeshVisible
                         ? 'Green walkable mesh visible — click it to move the player'
-                        : 'Hidden — splat view only; click-to-move is off'}
+                        : 'Hidden — click-to-move still works on the walkable surface'}
                     </Typography>
                   </Box>
                   <FormControlLabel

@@ -80,6 +80,13 @@ export interface FastNavOptions {
    * Same-level / cell height-band overrides for outdoor bowls and ramps.
    */
   readonly floorMesh?: FastFloorMeshOptions;
+  /**
+   * Island safety checks after Recast. Outdoor / streamed scenes often need a
+   * larger {@link maxSeedDistance} than the indoor 6 m default.
+   */
+  readonly islandValidation?: {
+    readonly maxSeedDistance?: number;
+  };
 }
 
 /** Override for the WASM-side floater prune (statistical outlier removal). */
@@ -565,22 +572,31 @@ export function filterNavmeshIslandNearSeed(
   };
 }
 
+/** Indoor default: reject islands whose centroid is farther than this from the seed. */
+export const DEFAULT_MAX_ISLAND_SEED_DISTANCE = 6.0;
+
+/** Outdoor / streamed default — church courtyards and parks exceed 6 m easily. */
+export const STREAMED_MAX_ISLAND_SEED_DISTANCE = 80.0;
+
 export function validateFastNavIsland(
   metadata: NavIslandMetadata | null,
   seed: number[] | null,
   expectedFloorY: number | null,
-  log: FastNavLogger = (message: string): void => console.log(message)
+  log: FastNavLogger = (message: string): void => console.log(message),
+  options?: { maxSeedDistance?: number }
 ): void {
   if (!metadata) {
     log('[WARN] Fast nav island validation skipped because no seed island metadata was available.');
     return;
   }
 
+  const maxSeedDistance = options?.maxSeedDistance ?? DEFAULT_MAX_ISLAND_SEED_DISTANCE;
   const floorDelta = expectedFloorY !== null ? metadata.centroid[1] - expectedFloorY : 0;
   log(
     `[INFO] Fast nav selected island: triangles=${metadata.triangleCount}, area=${metadata.area.toFixed(2)}, ` +
       `seedDistance=${metadata.distanceToSeed.toFixed(2)}, ` +
-      `floorDelta=${expectedFloorY !== null ? floorDelta.toFixed(2) : 'n/a'}`
+      `floorDelta=${expectedFloorY !== null ? floorDelta.toFixed(2) : 'n/a'}, ` +
+      `maxSeedDistance=${maxSeedDistance.toFixed(1)}`
   );
 
   if (metadata.area < 0.35 || metadata.triangleCount < 2) {
@@ -588,7 +604,7 @@ export function validateFastNavIsland(
       'Fast nav rejected a tiny navmesh island. The floor field did not produce a usable room-floor region.'
     );
   }
-  if (seed && metadata.distanceToSeed > 6.0) {
+  if (seed && metadata.distanceToSeed > maxSeedDistance) {
     throw new Error('Fast nav rejected an island too far from the seed.');
   }
   if (expectedFloorY !== null && floorDelta < -0.7) {
@@ -779,7 +795,7 @@ export async function runFastNav(options: FastNavOptions): Promise<FastNavResult
     ? effectiveFastSeed[1] - navSettings.collision_carve_height * 0.5
     : null;
   const safety = filterNavmeshIslandNearSeed(result.debugPositions, result.debugIndices, effectiveFastSeed, log);
-  validateFastNavIsland(safety.metadata, effectiveFastSeed, expectedFloorY, log);
+  validateFastNavIsland(safety.metadata, effectiveFastSeed, expectedFloorY, log, options.islandValidation);
 
   // Persist the validated artifact so an unchanged revisit restores it instead of
   // recomputing. Best-effort: a storage failure never blocks the pipeline, and we

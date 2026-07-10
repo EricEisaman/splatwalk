@@ -1,20 +1,19 @@
 // Quick Reference - Storage Adapter Playground
 // ============================================
 // Prefer the Vue demo at /storage-adapter and the Playground paste target
-// public/playground/storage-adapter.ts (class Playground + AppendSceneAsync).
+// public/playground/storage-adapter.ts (budgeted GaussianSplattingStream).
 
 // ============================================
 // 0. CDN lod-meta.json (Babylon 9.16 / Playground TS)
 // ============================================
 
-// Inside Playground.CreateScene:
-// void BABYLON.AppendSceneAsync(
-//   "https://code.playcanvas.com/examples_data/example_skatepark_02/lod-meta.json",
-//   scene
-// );
-
+// Always pass maxResidentSplats — AppendSceneAsync cannot.
+// See public/playground/storage-adapter.ts for the full Playground snippet.
+//
 // In the Vite app:
 // import { loadCdnLodMeta, loadLocalSogZip } from '@/storage/sogStreamLoader';
+// import { streamOptionsForPreset } from '@/storage/streamMemoryBudget';
+// await loadCdnLodMeta({ lodMetaUrl, scene, preset: 'medium' });
 
 // ============================================
 // 1. LOCAL ZIP UPLOAD (Browser - No Setup)

@@ -1,4 +1,4 @@
-import { onBeforeUnmount, ref, shallowRef, type Ref, type ShallowRef } from 'vue';
+import { computed, onBeforeUnmount, ref, shallowRef, type Ref, type ShallowRef } from 'vue';
 
 import type { FreeCamera, Scene } from '@babylonjs/core';
 import { Engine } from '@babylonjs/core/Engines/engine';
@@ -17,6 +17,7 @@ import {
 import {
   runFastNav,
   STREAMED_FAST_NAV_RECAST_ATTEMPTS,
+  STREAMED_MAX_ISLAND_SEED_DISTANCE,
   type FastNavPhase,
 } from '@/navigation/fastNav';
 import {
@@ -36,9 +37,25 @@ import {
   loadLocalSogZip,
   type SogLodManifestSummary,
 } from '@/storage/sogStreamLoader';
+import {
+  applyStreamQualityPreset,
+  DEFAULT_STREAM_SETTINGS,
+  formatStreamBudgetLog,
+  streamQualityPresetResidentSplats,
+  type StreamQualityPreset,
+  type StreamSettings,
+} from '@/storage/streamMemoryBudget';
+import {
+  assertStreamEnvironmentLoaded,
+  awaitStreamResidencyReport,
+  ensureActiveCameraForStream,
+  installBudgetSkipLogger,
+  type StreamResidencyStats,
+} from '@/storage/streamResidency';
 import { splatwalk } from '@/wasm/bridge';
 
 export type StorageDemoSource = 'cdn' | 'local';
+export type { StreamQualityPreset, StreamSettings };
 
 export type StorageDemoNavPhase = FastNavPhase | 'idle' | 'materialize' | 'error';
 
@@ -71,6 +88,8 @@ export interface StreamedNavSettings {
   walkableRadius: number;
   /** Recast max slope (degrees); higher for bowls/ramps. */
   walkableSlopeAngle: number;
+  /** Max horizontal distance (m) from seed to accepted nav island centroid. */
+  maxIslandSeedDistance: number;
 }
 
 /** Outdoor-friendly defaults (wider height bands + steeper slopes than indoor). */
@@ -87,6 +106,7 @@ export const DEFAULT_STREAMED_NAV_SETTINGS: StreamedNavSettings = {
   walkableClimb: 0.65,
   walkableRadius: 0.35,
   walkableSlopeAngle: 55,
+  maxIslandSeedDistance: STREAMED_MAX_ISLAND_SEED_DISTANCE,
 };
 
 export interface UseStorageAdapterDemo {
@@ -112,8 +132,13 @@ export interface UseStorageAdapterDemo {
   readonly restoreStreamVisual: () => void;
   readonly runFastNavFromStream: () => Promise<void>;
   readonly setNavMeshVisible: (visible: boolean) => void;
+  readonly setStreamQualityPreset: (preset: StreamQualityPreset) => void;
   readonly showDebugNavPly: () => Promise<void>;
   readonly statusMessage: Ref<string>;
+  readonly streamQualityPreset: Ref<StreamQualityPreset>;
+  readonly streamSettings: Ref<StreamSettings>;
+  readonly streamResidency: Ref<StreamResidencyStats | null>;
+  readonly resetStreamSettings: () => void;
   readonly summary: ShallowRef<SogLodManifestSummary | null>;
 }
 
@@ -202,12 +227,21 @@ export const useStorageAdapterDemo = (
   const navPhase = ref<StorageDemoNavPhase>('idle');
   const navSettings = ref<StreamedNavSettings>({ ...DEFAULT_STREAMED_NAV_SETTINGS });
   const statusMessage = ref('Ready — load a CDN lod-meta.json URL or a SplatWalk SOD LOD zip.');
+  const streamSettings = ref<StreamSettings>({ ...DEFAULT_STREAM_SETTINGS });
+  const streamResidency = ref<StreamResidencyStats | null>(null);
+  const streamQualityPreset = computed({
+    get: () => streamSettings.value.preset,
+    set: (preset: StreamQualityPreset) => {
+      streamSettings.value = applyStreamQualityPreset(preset, streamSettings.value);
+    },
+  });
   const summary = shallowRef<SogLodManifestSummary | null>(null);
 
   let engine: Engine | null = null;
   let scene: BabylonScene | null = null;
   let camera: FreeCamera | null = null;
-  let localDispose: (() => void) | null = null;
+  let streamDispose: (() => void) | null = null;
+  let skipLoggerDispose: (() => void) | null = null;
   let viewer: Viewer | null = null;
   let streamManifest: ISOGLODMetadata | null = null;
   let streamAccess: StreamedBundleAccess | null = null;
@@ -218,11 +252,27 @@ export const useStorageAdapterDemo = (
     logs.value = [...logs.value, message].slice(-80);
   };
 
-  const clearLocalResources = (): void => {
-    if (localDispose) {
-      localDispose();
-      localDispose = null;
+  const clearStreamResources = (): void => {
+    if (skipLoggerDispose) {
+      skipLoggerDispose();
+      skipLoggerDispose = null;
     }
+    if (streamDispose) {
+      streamDispose();
+      streamDispose = null;
+    }
+  };
+
+  const setStreamQualityPreset = (preset: StreamQualityPreset): void => {
+    streamSettings.value = applyStreamQualityPreset(preset, streamSettings.value);
+    addLog(
+      `Stream quality preset → ${preset} (${streamQualityPresetResidentSplats(preset).toLocaleString()} resident). Re-load stream to apply.`
+    );
+  };
+
+  const resetStreamSettings = (): void => {
+    streamSettings.value = { ...DEFAULT_STREAM_SETTINGS };
+    addLog('Stream settings reset to Medium defaults. Re-load stream to apply.');
   };
 
   const disposeViewer = (): void => {
@@ -244,6 +294,7 @@ export const useStorageAdapterDemo = (
     const canvas = canvasRef.value;
     engine = new Engine(canvas, true);
     scene = new BabylonScene(engine);
+    // Dark clear — missing environment/sky must not be masked by a sky-like clear color.
     scene.clearColor = new Color3(0.05, 0.05, 0.05).toColor4();
 
     camera = new FreeCameraCtor('flyCamera', new Vector3(0, 5, -10), scene);
@@ -260,6 +311,25 @@ export const useStorageAdapterDemo = (
     addLog('Babylon scene ready (WASD fly · E/Q up/down · mouse look)');
   };
 
+  const settleStreamResidency = async (
+    stream: Parameters<typeof awaitStreamResidencyReport>[0]['stream'],
+    catalogFiles: number,
+    getSkipCount: () => number
+  ): Promise<void> => {
+    if (!scene || !camera) {
+      return;
+    }
+    frameCameraToScene(scene, camera);
+    ensureActiveCameraForStream(scene, camera);
+    statusMessage.value = 'Settling stream residency (camera-framed LOD)…';
+    streamResidency.value = await awaitStreamResidencyReport({
+      catalogFiles,
+      getSkipCount,
+      log: addLog,
+      stream,
+    });
+  };
+
   const resize = (): void => {
     if (viewer) {
       viewer.resize();
@@ -269,7 +339,7 @@ export const useStorageAdapterDemo = (
   };
 
   const clearSceneStreams = (): void => {
-    clearLocalResources();
+    clearStreamResources();
     if (!scene) {
       return;
     }
@@ -297,6 +367,7 @@ export const useStorageAdapterDemo = (
     navMeshVisible.value = true;
     summary.value = null;
     fileCount.value = null;
+    streamResidency.value = null;
     navPhase.value = 'idle';
   };
 
@@ -346,21 +417,51 @@ export const useStorageAdapterDemo = (
     try {
       clearSceneStreams();
       resetStreamState();
+      const skipLogger = installBudgetSkipLogger();
+      skipLoggerDispose = skipLogger.dispose;
       const result = await loadCdnLodMeta({
         lodMetaUrl: url,
+        settings: streamSettings.value,
         scene,
       });
+      streamDispose = result.dispose;
       streamManifest = result.manifest;
       streamAccess = { kind: 'cdn', rootUrl: deriveLodMetaRootUrl(result.lodMetaUrl) };
       summary.value = result.summary;
       fileCount.value = result.summary.filenameCount;
       hasStream.value = true;
-      frameCameraToScene(scene, camera);
-      statusMessage.value = `CDN stream ready · ${result.summary.lodLevels} LOD levels · ${result.summary.filenameCount} chunks`;
       addLog(`Loaded CDN: ${url}`);
       addLog(
-        `Manifest: lodLevels=${result.summary.lodLevels}, filenames=${result.summary.filenameCount}`
+        `Manifest: lodLevels=${result.summary.lodLevels}, filenames=${result.summary.filenameCount}` +
+          (result.summary.environment ? `, environment=${result.summary.environment}` : ', environment=(none)')
       );
+      addLog(
+        formatStreamBudgetLog({
+          chunkCount: result.summary.filenameCount,
+          settings: streamSettings.value,
+        })
+      );
+      await settleStreamResidency(
+        result.stream,
+        result.summary.filenameCount,
+        skipLogger.getSkipCount
+      );
+      assertStreamEnvironmentLoaded({
+        environmentPath: result.summary.environment,
+        stream: result.stream,
+      });
+      const residency = streamResidency.value;
+      const resident = result.streamOptions.maxResidentSplats ?? 0;
+      statusMessage.value =
+        `CDN stream ready · ${result.summary.lodLevels} LOD levels · ` +
+        `decoded ${residency?.decodedFiles ?? '?'}/${result.summary.filenameCount} chunks · ` +
+        `${resident.toLocaleString()} resident` +
+        (residency && residency.environmentSplats > 0
+          ? ` · env ${residency.environmentSplats.toLocaleString()}`
+          : '') +
+        (residency && residency.skippedBudgetWarnings > 0
+          ? ` · ${residency.skippedBudgetWarnings} budget skips`
+          : '');
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       errorMessage.value = message;
@@ -386,22 +487,49 @@ export const useStorageAdapterDemo = (
     try {
       clearSceneStreams();
       resetStreamState();
+      const skipLogger = installBudgetSkipLogger();
+      skipLoggerDispose = skipLogger.dispose;
       const result = await loadLocalSogZip({
         file,
+        settings: streamSettings.value,
         scene,
       });
-      localDispose = result.dispose;
+      streamDispose = result.dispose;
       streamManifest = result.manifest;
       streamAccess = { kind: 'memory', files: result.files };
       summary.value = result.summary;
       fileCount.value = result.fileCount;
       hasStream.value = true;
-      frameCameraToScene(scene, camera);
-      statusMessage.value = `Local zip stream ready · ${result.summary.lodLevels} LOD levels · ${result.fileCount} files`;
       addLog(`Loaded zip: ${file.name} (${(file.size / (1024 * 1024)).toFixed(2)} MB)`);
       addLog(
         `Manifest: lodLevels=${result.summary.lodLevels}, filenames=${result.summary.filenameCount}`
       );
+      addLog(
+        formatStreamBudgetLog({
+          chunkCount: result.summary.filenameCount,
+          settings: streamSettings.value,
+        })
+      );
+      addLog(
+        'Note: local zip materializes the full bundle in memory — use CDN lod-meta for city-scale scenes.'
+      );
+      await settleStreamResidency(result.stream, result.summary.filenameCount, skipLogger.getSkipCount);
+      assertStreamEnvironmentLoaded({
+        environmentPath: result.summary.environment,
+        stream: result.stream,
+      });
+      const residency = streamResidency.value;
+      const resident = result.streamOptions.maxResidentSplats ?? 0;
+      statusMessage.value =
+        `Local zip stream ready · ${result.summary.lodLevels} LOD levels · ` +
+        `decoded ${residency?.decodedFiles ?? '?'}/${result.fileCount} files · ` +
+        `${resident.toLocaleString()} resident` +
+        (residency && residency.environmentSplats > 0
+          ? ` · env ${residency.environmentSplats.toLocaleString()}`
+          : '') +
+        (residency && residency.skippedBudgetWarnings > 0
+          ? ` · ${residency.skippedBudgetWarnings} budget skips`
+          : '');
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       errorMessage.value = message;
@@ -645,6 +773,9 @@ export const useStorageAdapterDemo = (
           walkableClimb: settings.walkableClimb,
           minRegionArea: settings.minRegionArea,
         },
+        islandValidation: {
+          maxSeedDistance: settings.maxIslandSeedDistance,
+        },
       });
       statusMessage.value = 'Framing the player (top-down)…';
       const framing = activeViewer.focusOnPlayer();
@@ -682,7 +813,7 @@ export const useStorageAdapterDemo = (
 
   onBeforeUnmount(() => {
     window.removeEventListener('resize', resize);
-    clearLocalResources();
+    clearStreamResources();
     disposeViewer();
     engine?.dispose();
     engine = null;
@@ -713,8 +844,13 @@ export const useStorageAdapterDemo = (
     restoreStreamVisual,
     runFastNavFromStream,
     setNavMeshVisible,
+    setStreamQualityPreset,
     showDebugNavPly,
     statusMessage,
+    streamQualityPreset,
+    streamResidency,
+    streamSettings,
+    resetStreamSettings,
     summary,
   };
 };

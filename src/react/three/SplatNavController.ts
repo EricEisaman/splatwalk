@@ -28,6 +28,8 @@ const AGENT_PARAMS = {
   npc: { radius: 0.5, height: 2.0, maxAcceleration: 10.0, maxSpeed: 3.0 },
 } as const;
 
+const NAVMESH_OVERLAY_OPACITY = 0.45;
+
 /**
  * Engine-side controller for the R3F FAST NAV demo. It owns the Gaussian splat
  * renderer, the floor/navmesh overlays, and the `recast-navigation` crowd
@@ -75,6 +77,8 @@ export class SplatNavController {
 
   private raycaster = new THREE.Raycaster();
   private pointerDown: { x: number; y: number } | null = null;
+  /** Visual toggle only — overlay stays raycastable for click-to-move when hidden. */
+  private navMeshOverlayShown = true;
   private onPointerDown = (e: PointerEvent): void => {
     this.pointerDown = { x: e.clientX, y: e.clientY };
   };
@@ -245,11 +249,10 @@ export class SplatNavController {
     }
   }
 
-  /** Toggle the green walkable navmesh overlay (also gates click-to-move hits). */
+  /** Toggle the green walkable navmesh overlay (click-to-move still works when hidden). */
   public setNavMeshVisible(visible: boolean): void {
-    if (this.navMeshOverlay) {
-      this.navMeshOverlay.visible = visible;
-    }
+    this.navMeshOverlayShown = visible;
+    this.applyNavMeshOverlayVisibility();
   }
 
   /** Show the walkable navmesh overlay (green) and use it as the click target. */
@@ -263,14 +266,16 @@ export class SplatNavController {
     const material = new THREE.MeshBasicMaterial({
       color: 0x39ff14,
       transparent: true,
-      opacity: 0.45,
+      opacity: NAVMESH_OVERLAY_OPACITY,
       side: THREE.DoubleSide,
       depthWrite: false,
     });
     this.navMeshOverlay = new THREE.Mesh(geometry, material);
     this.navMeshOverlay.renderOrder = 2;
+    // Keep visible=true always so raycasts still hit when the overlay is visually off.
     this.navMeshOverlay.visible = true;
     this.world.add(this.navMeshOverlay);
+    this.applyNavMeshOverlayVisibility();
   }
 
   /** Initialize the recast crowd and spawn the (blue) player agent. */
@@ -404,7 +409,7 @@ export class SplatNavController {
   // --- internals ---------------------------------------------------------
 
   private handleTap(e: PointerEvent): void {
-    if (!this.handles || !this.navMeshOverlay?.visible || !this.playerAgent) return;
+    if (!this.handles || !this.navMeshOverlay || !this.playerAgent) return;
     const rect = this.handles.gl.domElement.getBoundingClientRect();
     const ndc = new THREE.Vector2(
       ((e.clientX - rect.left) / rect.width) * 2 - 1,
@@ -419,6 +424,23 @@ export class SplatNavController {
     const local = this.navMeshOverlay.worldToLocal(hit.point.clone());
     const snapped = this.snapToNavMesh([local.x, local.y, local.z]) ?? [local.x, local.y, local.z];
     this.playerAgent.requestMoveTarget({ x: snapped[0], y: snapped[1], z: snapped[2] });
+  }
+
+  private applyNavMeshOverlayVisibility(): void {
+    if (!this.navMeshOverlay) {
+      return;
+    }
+    const material = this.navMeshOverlay.material;
+    if (Array.isArray(material)) {
+      return;
+    }
+    if (!(material instanceof THREE.MeshBasicMaterial)) {
+      return;
+    }
+    material.opacity = this.navMeshOverlayShown ? NAVMESH_OVERLAY_OPACITY : 0;
+    material.transparent = true;
+    // Mesh stays visible so Three.js raycasts still intersect the walkable surface.
+    this.navMeshOverlay.visible = true;
   }
 
   private snapToNavMesh(point: [number, number, number] | null): [number, number, number] | null {
