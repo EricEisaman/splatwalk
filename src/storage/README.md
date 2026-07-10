@@ -2,6 +2,23 @@
 
 A clean, unified interface for streaming Spatially Ordered Gaussians (SOG) LOD splats from various backends with secure credential management.
 
+## Navigation from stream (collision / Fast Nav)
+
+After a CDN or zip stream is loaded in the Storage Adapter playground
+(`/storage-adapter`):
+
+1. Expand **Navigation from stream**.
+2. **Generate collision** — materializes coarsest-LOD PLY, runs
+   `build_collision_voxel_boundary`, shows the boundary on the Viewer.
+3. **Run Fast Nav** — same materialize step, then floor field → Recast → crowd /
+   NPC / top-down player framing (same end as `/vuetify`).
+
+Implementation:
+
+- `src/storage/materializeNavSourceFromStreamedSog.ts` — LOD select → SOG decode → PLY
+- `src/composables/useStorageAdapterDemo.ts` — stream load + Viewer handoff
+- Fallback format switch: [splat-transform](https://github.com/playcanvas/splat-transform)
+
 ## Overview
 
 The storage adapter system enables SplatWalk to serve SOG bundles from multiple sources:

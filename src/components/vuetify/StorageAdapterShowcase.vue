@@ -22,13 +22,25 @@ const showSnackbar = ref(false);
 const {
   busy,
   clear,
+  clearNavArtifacts,
+  debugShowingNavPly,
   errorMessage,
   fileCount,
+  generateCollision,
+  hasNavMesh,
+  hasNavSession,
+  hasStream,
   initScene,
   loadCdn,
   loadZip,
   logs,
+  navMeshVisible,
+  navPhase,
   resize,
+  restoreStreamVisual,
+  runFastNavFromStream,
+  setNavMeshVisible,
+  showDebugNavPly,
   statusMessage,
   summary,
 } = useStorageAdapterDemo(canvasRef);
@@ -57,6 +69,26 @@ const showDropZone = computed(
 );
 
 const showFullscreenBtn = computed(() => !showDropZone.value && !busy.value);
+
+const canRunNav = computed(() => (hasStream.value || hasNavSession.value) && !busy.value);
+
+const navSteps = computed(() => {
+  const order = ['materialize', 'prune', 'floor', 'navmesh', 'done'] as const;
+  const current = navPhase.value;
+  const curIdx = (order as readonly string[]).indexOf(current);
+  return [
+    { label: 'Materialize PLY', key: 'materialize' },
+    { label: 'Prune', key: 'prune' },
+    { label: 'Floor', key: 'floor' },
+    { label: 'Navmesh', key: 'navmesh' },
+    { label: 'Done', key: 'done' },
+  ].map((step) => {
+    const idx = (order as readonly string[]).indexOf(step.key);
+    const done = curIdx > idx || current === 'done';
+    const active = current === step.key;
+    return { ...step, done, active };
+  });
+});
 
 const manifestLines = computed(() => {
   const s = summary.value;
@@ -145,6 +177,34 @@ const useSkateparkExample = (): void => {
 const onClear = (): void => {
   selectedZipName.value = null;
   clear();
+};
+
+const onGenerateCollision = async (): Promise<void> => {
+  try {
+    await generateCollision();
+  } catch {
+    // errorMessage set in composable
+  }
+};
+
+const onRunFastNav = async (): Promise<void> => {
+  try {
+    await runFastNavFromStream();
+  } catch {
+    // errorMessage set in composable
+  }
+};
+
+const onShowDebugNavPly = async (): Promise<void> => {
+  try {
+    await showDebugNavPly();
+  } catch {
+    // errorMessage set in composable
+  }
+};
+
+const onRestoreStream = (): void => {
+  restoreStreamVisual();
 };
 </script>
 
@@ -311,6 +371,118 @@ const onClear = (): void => {
         </div>
 
         <v-expansion-panels class="mt-4" variant="accordion">
+          <v-expansion-panel title="Navigation from stream">
+            <template #text>
+              <p class="text-body-2 text-medium-emphasis mb-3">
+                Materialize a denser LOD PLY from the streamed SOG as a WASM
+                intermediary only (stream visual stays on canvas), then reuse
+                SplatWalk collision / Fast Nav overlays (same end flow as
+                <code class="text-primary">/vuetify</code>).
+                Navmesh, player, and NPC draw on top of the live stream.
+              </p>
+
+              <div class="d-flex flex-wrap ga-2 mb-3">
+                <v-chip
+                  v-for="step in navSteps"
+                  :key="step.key"
+                  :color="step.done ? 'success' : step.active ? 'primary' : undefined"
+                  :variant="step.done || step.active ? 'flat' : 'outlined'"
+                  size="small"
+                >
+                  <v-icon
+                    start
+                    :icon="step.done ? 'mdi-check-circle' : step.active ? 'mdi-loading mdi-spin' : 'mdi-circle-outline'"
+                  />
+                  {{ step.label }}
+                </v-chip>
+              </div>
+
+              <div class="d-flex flex-wrap ga-2">
+                <v-btn
+                  color="secondary"
+                  prepend-icon="mdi-cube-outline"
+                  :loading="busy && navPhase === 'materialize'"
+                  :disabled="!canRunNav"
+                  @click="onGenerateCollision"
+                >
+                  Generate collision
+                </v-btn>
+                <v-btn
+                  color="primary"
+                  prepend-icon="mdi-navigation-variant"
+                  :loading="busy && ['prune', 'floor', 'navmesh', 'materialize'].includes(navPhase)"
+                  :disabled="!canRunNav"
+                  @click="onRunFastNav"
+                >
+                  Run Fast Nav
+                </v-btn>
+                <v-btn
+                  variant="text"
+                  color="secondary"
+                  prepend-icon="mdi-close"
+                  :disabled="busy"
+                  @click="clearNavArtifacts"
+                >
+                  Clear nav artifacts
+                </v-btn>
+                <v-btn
+                  v-if="!debugShowingNavPly"
+                  variant="outlined"
+                  color="warning"
+                  prepend-icon="mdi-bug"
+                  :disabled="!hasNavSession || busy"
+                  @click="onShowDebugNavPly"
+                >
+                  Show nav PLY (debug)
+                </v-btn>
+                <v-btn
+                  v-else
+                  variant="flat"
+                  color="warning"
+                  prepend-icon="mdi-eye"
+                  :disabled="busy"
+                  @click="onRestoreStream"
+                >
+                  Restore stream
+                </v-btn>
+              </div>
+
+              <v-sheet
+                v-if="hasNavMesh"
+                border
+                rounded="lg"
+                class="d-flex align-center flex-wrap ga-4 pa-3 mt-3 navmesh-toggle-bar"
+                color="surface"
+              >
+                <v-icon
+                  :icon="navMeshVisible ? 'mdi-layers' : 'mdi-layers-off'"
+                  :color="navMeshVisible ? 'success' : 'medium-emphasis'"
+                  size="22"
+                />
+                <div class="flex-grow-1">
+                  <div class="text-body-2 font-weight-medium">Navmesh overlay</div>
+                  <div class="text-caption text-medium-emphasis">
+                    {{ navMeshVisible ? 'Green walkable mesh visible — click it to move the player' : 'Hidden — stream view only; click-to-move is off' }}
+                  </div>
+                </div>
+                <v-switch
+                  :model-value="navMeshVisible"
+                  color="success"
+                  density="comfortable"
+                  hide-details
+                  inset
+                  :disabled="busy"
+                  :label="navMeshVisible ? 'Shown' : 'Hidden'"
+                  @update:model-value="setNavMeshVisible(Boolean($event))"
+                />
+              </v-sheet>
+
+              <div v-if="!hasStream && !hasNavSession && navPhase === 'idle'" class="text-caption text-medium-emphasis mt-3">
+                Load a CDN lod-meta or local SOD LOD zip first.
+              </div>
+            </template>
+          </v-expansion-panel>
+
           <v-expansion-panel title="Manifest">
             <template #text>
               <div v-if="manifestLines.length === 0" class="text-caption text-medium-emphasis">
@@ -417,5 +589,13 @@ export { Playground };</pre>
   white-space: pre-wrap;
   word-break: break-word;
   color: rgba(var(--v-theme-on-surface), 0.85);
+}
+
+.navmesh-toggle-bar {
+  background: linear-gradient(
+    120deg,
+    rgba(var(--v-theme-success), 0.08),
+    rgba(var(--v-theme-surface), 1) 42%
+  );
 }
 </style>

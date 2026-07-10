@@ -25,12 +25,14 @@ export interface SogLodManifestSummary {
 }
 
 export interface LoadCdnLodMetaResult {
+  readonly lodMetaUrl: string;
   readonly manifest: ISOGLODMetadata;
   readonly summary: SogLodManifestSummary;
 }
 
 export interface LoadLocalSogZipResult {
   readonly dispose: () => void;
+  readonly files: ReadonlyMap<string, Uint8Array>;
   readonly manifest: ISOGLODMetadata;
   readonly stream: GaussianSplattingStream;
   readonly summary: SogLodManifestSummary;
@@ -276,6 +278,7 @@ export const loadCdnLodMeta = async (params: {
 
   await AppendSceneAsync(lodMetaUrl, params.scene);
   return {
+    lodMetaUrl,
     manifest: raw,
     summary: summarizeLodMeta(raw),
   };
@@ -338,6 +341,7 @@ export const loadLocalSogZip = async (params: {
       adapter.dispose();
     },
     fileCount: files.size,
+    files,
     manifest: raw,
     stream,
     summary: summarizeLodMeta(raw),

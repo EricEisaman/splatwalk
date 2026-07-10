@@ -65,3 +65,18 @@ export {
   type LoadLocalSogZipResult,
   type SogLodManifestSummary,
 } from './sogStreamLoader';
+
+// Streamed SOG → PLY for collision / FastNav
+export {
+  DEFAULT_NAV_MAX_SPLATS,
+  DEFAULT_NAV_MIN_SPLATS,
+  deriveLodMetaRootUrl,
+  lodIndexFromChunkPath,
+  materializeNavSourceFromStreamedSog,
+  resolveLodIndex,
+  selectChunkMetaPathsForLod,
+  type LodIndexOption,
+  type MaterializeNavSourceOptions,
+  type MaterializeNavSourceResult,
+  type StreamedBundleAccess,
+} from './materializeNavSourceFromStreamedSog';

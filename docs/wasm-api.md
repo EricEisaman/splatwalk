@@ -481,6 +481,32 @@ The fast path:
 
 This is intentionally different from a collider-boundary bake. It avoids the failure mode where Recast finds walkable polygons on the underside or boundary faces of a generated voxel collider.
 
+### Navigation from streamed SOG (lod-meta)
+
+Streamed SOG (`lod-meta.json` + chunk SOGs) is a **delivery / streaming** format.
+WASM collision and Fast Nav still require **PLY** (or PLY-normalized `.spz` /
+`.splat`) bytes — there is no `streamed_sog → navmesh` entry point in WASM.
+
+The Storage Adapter demo (`/storage-adapter`) bridges the gap:
+
+```none
+CDN or zip lod-meta
+  -> GaussianSplattingStream (visual)
+  -> materializeNavSourceFromStreamedSog (coarsest LOD → .splat decode → splat_to_ply)
+  -> build_collision_voxel_boundary / runFastNav (existing PLY pipelines)
+  -> Viewer crowd + NPC + focusOnPlayer
+```
+
+Helper: `src/storage/materializeNavSourceFromStreamedSog.ts`. Default `lodIndex: 'nav'`
+starts at mid LOD and refines toward finest until ~50k splats (capped at 250k) so
+floor extraction has enough density — coarsest-only is typically too sparse for
+Fast Nav.
+
+If in-app decode fails for an asset, convert offline with
+[PlayCanvas splat-transform](https://github.com/playcanvas/splat-transform)
+(streamed SOG / `.sog` → `.ply`, or voxel / collision-mesh export) and feed that
+PLY into the same Fast Nav / collision APIs.
+
 Current results are not yet reliable. On furnished indoor scans (for example `Bedroom.ply`) the field can still fragment the floor and the fast path may relocate to a small off-center island or fail the room-floor minimum. The clearance-band and neighbor-continuity classification above is the in-progress fix for that failure mode; see "Project Status, Philosophy, and Goals".
 
 ### Recast parameter units (metres vs voxels)

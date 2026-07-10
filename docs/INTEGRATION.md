@@ -268,6 +268,24 @@ working integration is `src/scene/Viewer.ts` (UI in `src/vuetify/`, route
 
 **Live demo:** <a href="https://splatwalk.onrender.com/vuetify" target="_blank" rel="noopener noreferrer">splatwalk.onrender.com/vuetify</a>
 
+### Navigation from streamed SOG
+
+For CDN or zip **streamed SOG** (`lod-meta.json`), use the Storage Adapter
+playground (`/storage-adapter`, source under `src/components/vuetify/` and
+`src/storage/`):
+
+1. Load a CDN `…/lod-meta.json` URL or a SplatWalk store-only SOD LOD zip
+   (Babylon `AppendSceneAsync` / `GaussianSplattingStream`).
+2. Open **Navigation from stream**.
+3. **Generate collision** and/or **Run Fast Nav** — the demo materializes a
+   coarsest-LOD PLY, then reuses the same WASM + `Viewer` end flow as `/vuetify`
+   (nav overlay, crowd, NPC, `focusOnPlayer`).
+
+Streamed SOG is not a direct WASM input; see `docs/wasm-api.md` (“Navigation from
+streamed SOG”). Format switching via
+[splat-transform](https://github.com/playcanvas/splat-transform) is supported as
+a fallback when in-app SOG→PLY decode is insufficient.
+
 **Handedness.** Babylon is **left-handed** by default. The WASM core emits
 `splatwalk_oriented` space (right-handed, `+Y` up), and Recast/`recast-navigation`
 is right-handed — but because Babylon's splat loader flips the splat on import

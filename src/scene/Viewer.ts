@@ -21,8 +21,25 @@ import { Crowd, NavMesh as RecastNavMesh, init as initRecast, importNavMesh, Cro
 import type { GroundFieldCellState, WalkableGroundFieldResult } from '../wasm/bridge';
 import { SplatPerfHud, installSplatWalkPerfProbe } from './splatPerfHud';
 
+/** Existing Babylon engine/scene to adopt (e.g. stream → nav handoff). */
+export interface ViewerExistingContext {
+    readonly engine: Engine;
+    /**
+     * Keep streamed SOG / existing visual meshes and only install nav camera +
+     * overlays. PLY materialize stays an off-canvas intermediary for WASM.
+     */
+    readonly preserveVisual?: boolean;
+    readonly scene: Scene;
+}
+
 /** Construction options for {@link Viewer}. */
 export interface ViewerOptions {
+    /**
+     * Adopt an existing engine+scene instead of creating a new WebGL context.
+     * Used by the Storage Adapter stream → Fast Nav handoff so the canvas does
+     * not flicker/black-out from dispose+recreate on the same canvas element.
+     */
+    readonly existing?: ViewerExistingContext;
     /**
      * Render in a right-handed scene (`scene.useRightHandedSystem = true`) instead
      * of Babylon's default left-handed one. Off by default; this is a
@@ -35,32 +52,214 @@ export interface ViewerOptions {
 }
 
 export class Viewer {
-    private engine: Engine;
-    private scene: Scene;
-    private camera: ArcRotateCamera;
-    private readonly rightHanded: boolean;
+  private engine: Engine;
+  private scene: Scene;
+  private camera!: ArcRotateCamera;
+  private readonly rightHanded: boolean;
 
     constructor(canvas: HTMLCanvasElement, options: ViewerOptions = {}) {
         this.rightHanded = options.rightHanded ?? false;
-        this.engine = new Engine(canvas, true);
-        this.scene = this.createScene();
-        this.camera = this.createCamera();
-        this.createLights();
 
-        // Initial dummy mesh
-        // this.createDummyMesh();
+        if (options.existing) {
+            this.engine = options.existing.engine;
+            this.scene = options.existing.scene;
+            this.engine.stopRenderLoop();
+            this.prepareAdoptedScene(options.existing.preserveVisual === true);
+        } else {
+            this.engine = new Engine(canvas, true);
+            this.scene = this.createScene();
+            this.camera = this.createCamera();
+            this.createLights();
+        }
 
-        // Start render loop
         installSplatWalkPerfProbe(this._perfHud);
         this.engine.runRenderLoop(() => {
             this._perfHud.recordFrame();
             this.scene.render();
         });
 
-        // Handle resize
         window.addEventListener('resize', () => {
             this.engine.resize();
         });
+    }
+
+    /**
+     * Install Viewer camera + lighting on an adopted scene. When
+     * `preserveVisual` is set, keep streamed SOG meshes and bind them as the
+     * splat target for bounds / flip / rotation (nav overlays only).
+     */
+    private prepareAdoptedScene(preserveVisual: boolean): void {
+        this.scene.useRightHandedSystem = this.rightHanded;
+        this.scene.clearColor = new Color3(0.1, 0.1, 0.1).toColor4();
+
+        for (const cam of [...this.scene.cameras]) {
+            cam.detachControl();
+            cam.dispose();
+        }
+
+        if (!preserveVisual) {
+            while (this.scene.meshes.length > 0) {
+                this.scene.meshes[0].dispose();
+            }
+        }
+
+        this.camera = this.createCamera();
+        this.scene.activeCamera = this.camera;
+
+        if (this.scene.lights.length === 0) {
+            this.createLights();
+        }
+
+        if (preserveVisual) {
+            this.bindStreamVisualMeshes();
+            this.frameCameraToSplat();
+        }
+    }
+
+    private isStreamVisualMesh(mesh: AbstractMesh): boolean {
+        const className = mesh.getClassName();
+        const name = mesh.name || '';
+        return (
+            className.includes('Gaussian') ||
+            className.includes('Splatting') ||
+            name.includes('Gaussian') ||
+            name.includes('Sog') ||
+            name.includes('SOG') ||
+            name === 'storageAdapterSogStream' ||
+            name === 'GaussianSplattingStream'
+        );
+    }
+
+    /**
+     * Bind existing streamed SOG meshes as the Viewer splat target and sync
+     * rotation / Y-flip from the live mesh (already oriented by the stream loader).
+     */
+    public bindStreamVisualMeshes(): void {
+        const candidates = this.scene.meshes.filter((mesh) => this.isStreamVisualMesh(mesh));
+        const meshes = candidates.length > 0 ? candidates : [...this.scene.meshes];
+        if (meshes.length === 0) {
+            this.splatMesh = null;
+            this.splatMeshes = [];
+            return;
+        }
+        this.splatMeshes = meshes;
+        this.splatMesh = meshes[0]!;
+        this.splatMesh.computeWorldMatrix(true);
+        this.rotation = {
+            x: this.splatMesh.rotation.x,
+            y: this.splatMesh.rotation.y,
+            z: this.splatMesh.rotation.z,
+        };
+    }
+
+    private frameCameraToSplat(): void {
+        const worldExtends = this.scene.getWorldExtends();
+        const center = worldExtends.min.add(worldExtends.max).scale(0.5);
+        const radius = worldExtends.max.subtract(worldExtends.min).length() / 2;
+        this.camera.setTarget(center);
+        this.camera.radius = Math.max(2, radius * 2.0);
+    }
+
+    /**
+     * Fail fast when the splat AABB looks Z-up / wall-as-floor (Y is the long axis).
+     * That weird vertical skatepark view is a transform bug, not a Recast tuning issue.
+     */
+    public assertGroundLooksYUp(): void {
+        const bounds = this.getLoadedSplatBounds();
+        if (!bounds) {
+            throw new Error('No splat bounds available for orientation check.');
+        }
+        const sizeX = bounds.max.x - bounds.min.x;
+        const sizeY = bounds.max.y - bounds.min.y;
+        const sizeZ = bounds.max.z - bounds.min.z;
+        const horizontal = Math.max(sizeX, sizeZ);
+        if (horizontal < 0.5) {
+            return;
+        }
+        if (sizeY > horizontal * 0.9) {
+            throw new Error(
+                `Splat orientation looks wrong: Y extent ${sizeY.toFixed(1)}m ≥ horizontal ${horizontal.toFixed(1)}m ` +
+                    `(${sizeX.toFixed(1)}×${sizeY.toFixed(1)}×${sizeZ.toFixed(1)}). ` +
+                    `A vertical “floor” means a missing Z-up→Y-up bake (stream uses rotation.x = -π/2). ` +
+                    `Use “Show nav PLY (debug)” to inspect the intermediary PLY transform.`
+            );
+        }
+    }
+
+    /**
+     * Hide the live stream visual and show the materialized nav PLY (optional SOG LOD
+     * orientation). For transform debugging only — restore with {@link restoreStreamVisual}.
+     */
+    public async showDebugIntermediaryPly(
+        plyBytes: Uint8Array,
+        options: { applySogLodOrientation?: boolean } = {}
+    ): Promise<void> {
+        const applyOrientation = options.applySogLodOrientation !== false;
+        this._streamMeshesHiddenForDebug = this.splatMeshes.filter((m) => !m.isDisposed());
+        for (const mesh of this._streamMeshesHiddenForDebug) {
+            mesh.setEnabled(false);
+        }
+
+        for (const mesh of this._debugPlyMeshes) {
+            if (!mesh.isDisposed()) {
+                mesh.dispose();
+            }
+        }
+        this._debugPlyMeshes = [];
+
+        const plyFile = new File([plyBytes as BlobPart], 'nav-debug.ply', {
+            type: 'application/octet-stream',
+        });
+        const result = await SceneLoader.ImportMeshAsync('', '', plyFile, this.scene);
+        this._debugPlyMeshes = result.meshes;
+        if (result.meshes.length === 0) {
+            this.restoreStreamVisual();
+            throw new Error('Debug nav PLY produced no meshes.');
+        }
+
+        const root = result.meshes[0]!;
+        if (applyOrientation) {
+            root.rotation.x = -Math.PI / 2;
+            root.computeWorldMatrix(true);
+        }
+        this.splatMesh = root;
+        this.splatMeshes = result.meshes;
+        this.rotation = {
+            x: root.rotation.x,
+            y: root.rotation.y,
+            z: root.rotation.z,
+        };
+        this.frameCameraToSplat();
+        this.scene.render();
+    }
+
+    /** Undo {@link showDebugIntermediaryPly} and show the streamed SOG again. */
+    public restoreStreamVisual(): void {
+        for (const mesh of this._debugPlyMeshes) {
+            if (!mesh.isDisposed()) {
+                mesh.dispose();
+            }
+        }
+        this._debugPlyMeshes = [];
+        for (const mesh of this._streamMeshesHiddenForDebug) {
+            if (!mesh.isDisposed()) {
+                mesh.setEnabled(true);
+            }
+        }
+        const restored = this._streamMeshesHiddenForDebug.filter((m) => !m.isDisposed());
+        this._streamMeshesHiddenForDebug = [];
+        if (restored.length > 0) {
+            this.splatMeshes = restored;
+            this.splatMesh = restored[0]!;
+            this.splatMesh.computeWorldMatrix(true);
+            this.rotation = {
+                x: this.splatMesh.rotation.x,
+                y: this.splatMesh.rotation.y,
+                z: this.splatMesh.rotation.z,
+            };
+        }
+        this.frameCameraToSplat();
+        this.scene.render();
     }
 
     public resize(): void {
@@ -105,6 +304,8 @@ export class Viewer {
 
     private splatMesh: AbstractMesh | null = null;
     private splatMeshes: AbstractMesh[] = [];
+    private _debugPlyMeshes: AbstractMesh[] = [];
+    private _streamMeshesHiddenForDebug: AbstractMesh[] = [];
     private rotation: { x: number, y: number, z: number } = { x: 0, y: 0, z: 0 };
     private readonly _perfHud = new SplatPerfHud();
 
@@ -148,7 +349,7 @@ export class Viewer {
                 const radius = worldExtends.max.subtract(worldExtends.min).length() / 2;
 
                 this.camera.setTarget(center);
-                this.camera.radius = radius * 2.0;
+                this.camera.radius = Math.max(2, radius * 2.0);
             }
 
             this._perfHud.recordSplatLoad(
@@ -158,8 +359,40 @@ export class Viewer {
 
         } catch (e) {
             console.error("Failed to visualize splat:", e);
-            // Non-blocking error - we still want to proceed with conversion
+            // Non-blocking for /vuetify conversion flows; callers that need a
+            // visible splat should check {@link hasLoadedSplat}.
         }
+    }
+
+    /** True when {@link loadGaussianSplat} left at least one mesh in the scene. */
+    public hasLoadedSplat(): boolean {
+        return this.splatMeshes.length > 0 || this.splatMesh !== null;
+    }
+
+    /**
+     * Match {@link GaussianSplattingStream}: PlayCanvas SOG LOD is authored Z-up
+     * with a flipped Y. The PLY loader already applies `scaling.y *= -1`; this adds
+     * the missing `-π/2` about X so the floor is horizontal in Babylon Y-up space.
+     * Updates {@link getSplatRotation} so WASM Fast Nav / collision stay aligned.
+     */
+    public applyStreamedSogLodOrientation(): void {
+        if (!this.splatMesh) {
+            console.warn('No splat mesh to orient for streamed SOG LOD.');
+            return;
+        }
+
+        const angle = -Math.PI / 2;
+        this.rotation = { x: angle, y: 0, z: 0 };
+        this.splatMesh.rotation.x = angle;
+        this.splatMesh.computeWorldMatrix(true);
+
+        const worldExtends = this.scene.getWorldExtends();
+        const center = worldExtends.min.add(worldExtends.max).scale(0.5);
+        const radius = worldExtends.max.subtract(worldExtends.min).length() / 2;
+        this.camera.setTarget(center);
+        this.camera.radius = Math.max(2, radius * 2.0);
+        this.engine.resize();
+        this.scene.render();
     }
 
     /**
@@ -282,7 +515,11 @@ export class Viewer {
         this.camera.setTarget(position.clone());
         // beta near 0 places the camera on the +Y axis above the target looking down.
         this.camera.beta = 0.0001;
-        this.camera.radius = cameraHeight - position.y;
+        const framedRadius = cameraHeight - position.y;
+        this.camera.radius = Number.isFinite(framedRadius) && framedRadius > 0.5
+            ? framedRadius
+            : Math.max(2, this.camera.radius || 8);
+        this.engine.resize();
         this.scene.render();
 
         return {

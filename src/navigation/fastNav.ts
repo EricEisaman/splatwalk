@@ -61,6 +61,11 @@ export interface FastNavOptions {
    * computation. Pass `{ enabled: false }` to keep every splat.
    */
   readonly prune?: PruneFloatersOptions;
+  /**
+   * Optional Recast attempt ladder. Defaults to {@link FAST_NAV_RECAST_ATTEMPTS}.
+   * Streamed / outdoor demos can pass {@link STREAMED_FAST_NAV_RECAST_ATTEMPTS}.
+   */
+  readonly recastAttempts?: ReadonlyArray<{ label: string; params: RecastParams }>;
 }
 
 /** Override for the WASM-side floater prune (statistical outlier removal). */
@@ -185,6 +190,48 @@ export const FAST_NAV_RECAST_ATTEMPTS: ReadonlyArray<{ label: string; params: Re
       maxSimplificationError: 1.0,
       minRegionArea: 2,
       mergeRegionArea: 8,
+    },
+  },
+];
+
+/**
+ * Outdoor / streamed SOG Recast ladder: smaller agent radius (less erosion on
+ * sparse floors), steeper slopes (ramps), and tinier region floors.
+ */
+export const STREAMED_FAST_NAV_RECAST_ATTEMPTS: ReadonlyArray<{
+  label: string;
+  params: RecastParams;
+}> = [
+  ...FAST_NAV_RECAST_ATTEMPTS,
+  {
+    label: 'streamed-outdoor',
+    params: {
+      ...FAST_NAV_BASE_PARAMS,
+      cs: 0.22,
+      ch: 0.15,
+      walkableHeight: 1.2,
+      walkableRadius: 0.3,
+      walkableClimb: 0.6,
+      walkableSlopeAngle: 55,
+      maxSimplificationError: 1.2,
+      minRegionArea: 1,
+      mergeRegionArea: 4,
+    },
+  },
+  {
+    label: 'streamed-last-resort',
+    params: {
+      ...FAST_NAV_BASE_PARAMS,
+      autoCellSize: false,
+      cs: 0.28,
+      ch: 0.16,
+      walkableHeight: 1.0,
+      walkableRadius: 0.15,
+      walkableClimb: 0.75,
+      walkableSlopeAngle: 60,
+      maxSimplificationError: 1.5,
+      minRegionArea: 0,
+      mergeRegionArea: 2,
     },
   },
 ];
@@ -625,7 +672,7 @@ export async function runFastNav(options: FastNavOptions): Promise<FastNavResult
     recovery,
     strayTrim: options.strayTrim ?? null,
     denseSeed: options.denseSeed ?? null,
-    recastAttempts: FAST_NAV_RECAST_ATTEMPTS,
+    recastAttempts: options.recastAttempts ?? FAST_NAV_RECAST_ATTEMPTS,
   });
   const cached = await getNavmesh(cacheKey);
   if (cached) {
@@ -673,7 +720,7 @@ export async function runFastNav(options: FastNavOptions): Promise<FastNavResult
     ? { min: splatBoundsVec.min.asArray(), max: splatBoundsVec.max.asArray() }
     : null;
 
-  const attempts = FAST_NAV_RECAST_ATTEMPTS;
+  const attempts = options.recastAttempts ?? FAST_NAV_RECAST_ATTEMPTS;
 
   let result: NavWorkerResult | null = null;
   let lastError: unknown = null;

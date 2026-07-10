@@ -1,6 +1,7 @@
 import { init, exportNavMesh, getNavMeshPositionsAndIndices } from 'recast-navigation';
 import { generateSoloNavMesh } from 'recast-navigation/generators';
 import { autoNavCellSize, DEFAULT_MAX_NAV_CELLS } from './floor';
+import { generateFloorSheetSoloNavMesh } from './floorSheetNavMesh';
 
 // Web worker context
 const ctx: Worker = self as any;
@@ -245,41 +246,94 @@ ctx.onmessage = async (e: MessageEvent) => {
                 console.log(`[WORKER] Winding flip applied to ${indices.length / 3} triangles.`);
             }
 
-            console.log(`[WORKER] Generating navmesh via generateSoloNavMesh...`);
+            console.log(`[WORKER] Generating navmesh via ${sourceLabel === 'fast_floor_field' ? 'floor-sheet (no ledge filter)' : 'generateSoloNavMesh'}...`);
 
-            // We need to manually calculate the bounding box for parameters to ensure our padding is used
-            const bmin: [number, number, number] = [minX, minY, minZ];
-            const bmax: [number, number, number] = [maxX, paddedMaxY, maxZ];
+            // Headroom must be applied via `bounds` (SoloNavMeshGeneratorConfig).
+            // Passing legacy `bmin`/`bmax` is ignored by @recast-navigation — Recast then
+            // uses the raw mesh AABB. Flat floor sheets (~1m tall) are shorter than
+            // walkableHeight, so filterWalkableLowHeightSpans culls every span.
+            const boundsMin: [number, number, number] = [minX, minY, minZ];
+            const boundsMax: [number, number, number] = [maxX, paddedMaxY, maxZ];
 
-            const { success, navMesh, intermediates } = generateSoloNavMesh(
-                positions,
-                finalIndices,
-                { ...voxelParams, bmin, bmax },
-                true // keepIntermediates
-            );
+            const {
+                autoCellSize: _autoCellSize,
+                maxNavCells: _maxNavCells,
+                ...recastConfig
+            } = voxelParams;
+
+            const navConfig = { ...recastConfig, bounds: [boundsMin, boundsMax] as const };
+
+            // Floor-field meshes are open-sky sheets: Recast's ledge filter treats every
+            // hole/border as a cliff and can wipe the entire walkable surface. Use a
+            // dedicated bake that keeps low-hanging + headroom filters but skips ledges.
+            const { success, navMesh, intermediates, error: bakeError } =
+                sourceLabel === 'fast_floor_field'
+                    ? generateFloorSheetSoloNavMesh(
+                          positions,
+                          finalIndices,
+                          {
+                              bounds: [boundsMin, boundsMax],
+                              ch: recastConfig.ch,
+                              cs: recastConfig.cs,
+                              detailSampleDist: recastConfig.detailSampleDist,
+                              detailSampleMaxError: recastConfig.detailSampleMaxError,
+                              maxEdgeLen: recastConfig.maxEdgeLen,
+                              maxSimplificationError: recastConfig.maxSimplificationError,
+                              maxVertsPerPoly: recastConfig.maxVertsPerPoly,
+                              mergeRegionArea: recastConfig.mergeRegionArea,
+                              minRegionArea: recastConfig.minRegionArea,
+                              walkableClimb: recastConfig.walkableClimb,
+                              walkableHeight: recastConfig.walkableHeight,
+                              walkableRadius: recastConfig.walkableRadius,
+                              walkableSlopeAngle: recastConfig.walkableSlopeAngle,
+                          },
+                          true
+                      )
+                    : {
+                          ...generateSoloNavMesh(positions, finalIndices, navConfig, true),
+                          error: undefined as string | undefined,
+                      };
 
             // Capture build logs
-            const buildLogs = intermediates.buildContext.logs || [];
+            const buildLogs = intermediates?.buildContext?.logs || [];
 
             // High-level pipeline tracing
-            const hasHeightfield = !!intermediates.heightfield;
-            const hasCompactHf = !!intermediates.compactHeightfield;
-            const hasContours = !!intermediates.contourSet;
+            const hasHeightfield = !!intermediates?.heightfield;
+            const hasCompactHf = !!intermediates?.compactHeightfield;
+            const hasContours = !!intermediates?.contourSet;
+            const hasPolyMesh = !!intermediates?.polyMesh;
+            const contourCount =
+                typeof intermediates?.contourSet?.nconts === 'function'
+                    ? intermediates.contourSet.nconts()
+                    : -1;
 
             if (!success || !navMesh) {
-                let errorAdvice = "";
+                let errorAdvice = '';
                 if (avgUpDot < -0.5) {
-                    errorAdvice = "\nADVICE: Mesh normals were INVERTED. An automatic winding flip was attempted but failed to yield walkable areas. Please check if your 'Max Slope' is too restrictive.";
+                    errorAdvice =
+                        "\nADVICE: Mesh normals were INVERTED. An automatic winding flip was attempted but failed to yield walkable areas. Please check if your 'Max Slope' is too restrictive.";
                 } else if (!hasHeightfield) {
-                    errorAdvice = "\nADVICE: Voxelization yielded zero data. Check if your mesh scale is in meters or centimeters.";
+                    errorAdvice =
+                        '\nADVICE: Voxelization yielded zero data. Check if your mesh scale is in meters or centimeters.';
                 } else if (!hasCompactHf) {
-                    errorAdvice = "\nADVICE: Could not build compact heightfield. Agent Height might be too large for the space.";
-                } else if (!hasContours) {
-                    errorAdvice = "\nADVICE: No walkable areas found. Try reducing 'Max Slope' or checking for thin vertical spikes.";
+                    errorAdvice =
+                        '\nADVICE: Could not build compact heightfield. Agent Height might be too large for the space.';
+                } else if (!hasContours || contourCount === 0) {
+                    errorAdvice =
+                        '\nADVICE: No walkable areas found. Try reducing Max Slope, walkableRadius, or check for thin vertical spikes.';
+                } else if (!hasPolyMesh) {
+                    errorAdvice =
+                        '\nADVICE: Contours existed but poly-mesh build failed. Try coarser cell size (cs) or higher maxSimplificationError.';
+                } else if (height + 1e-3 < params.walkableHeight) {
+                    errorAdvice =
+                        `\nADVICE: Floor mesh height (${height.toFixed(2)}m) is below walkableHeight (${params.walkableHeight}m). Vertical headroom padding must be applied via Recast bounds.`;
                 }
 
-                const lastLog = buildLogs.length > 0 ? buildLogs[buildLogs.length - 1].msg : 'No internal Recast messages.';
-                const errorMsg = `Navmesh generation failed: Recast Error: ${lastLog}${errorAdvice}\nFull Diagnostics: - Grid: ${gridW}x${gridD}x${gridH} - Bounds: ${width.toFixed(1)}x${height.toFixed(1)}x${depth.toFixed(1)} - Normal: ${avgUpDot.toFixed(2)} (Flipped=${wasFlipped})`;
+                const lastLog =
+                    buildLogs.length > 0
+                        ? buildLogs[buildLogs.length - 1].msg
+                        : bakeError || 'No internal Recast messages.';
+                const errorMsg = `Navmesh generation failed: Recast Error: ${lastLog}${errorAdvice}\nFull Diagnostics: - Grid: ${gridW}x${gridD}x${gridH} - Bounds: ${width.toFixed(1)}x${height.toFixed(1)}x${depth.toFixed(1)} - PaddedY: ${(paddedMaxY - minY).toFixed(1)} - Normal: ${avgUpDot.toFixed(2)} (Flipped=${wasFlipped})`;
 
                 console.error(`[WORKER] ${errorMsg}`);
                 ctx.postMessage({ type: 'error', payload: errorMsg });
