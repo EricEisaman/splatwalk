@@ -1,13 +1,13 @@
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use wasm_bindgen::prelude::*;
-use serde::{Deserialize, Serialize};
 
-mod splat;
-mod mesh;
-mod sog;
-mod slice;
 mod glb;
+mod mesh;
 mod output_space;
+mod slice;
+mod sog;
+mod splat;
 
 use output_space::OutputSpaceSettings;
 
@@ -311,7 +311,12 @@ impl MeshBuffers {
     pub fn new(vertices: Vec<f32>, indices: Vec<u32>) -> Self {
         let vertex_count = vertices.len() / 3;
         let face_count = indices.len() / 3;
-        Self { vertices, indices, vertex_count, face_count }
+        Self {
+            vertices,
+            indices,
+            vertex_count,
+            face_count,
+        }
     }
 }
 
@@ -754,7 +759,10 @@ fn parse_splats(data: &[u8], settings: &MeshSettings) -> Result<Vec<splat::Point
             p.point.y = -p.point.y;
             p.normal.y = -p.normal.y;
         }
-        log(&format!("Parsed {} splats (Y-flipped to render space)", splats.len()));
+        log(&format!(
+            "Parsed {} splats (Y-flipped to render space)",
+            splats.len()
+        ));
     } else {
         log(&format!("Parsed {} splats", splats.len()));
     }
@@ -791,14 +799,17 @@ pub fn suggest_region(data: &[u8], settings: JsValue) -> Result<JsValue, JsValue
 pub fn convert_splat_to_mesh(data: &[u8], settings: JsValue) -> Result<JsValue, JsValue> {
     let settings = parse_settings(settings)?;
     let mode = settings.mode;
-    
+
     log(&format!("Received {} bytes (Mode: {})", data.len(), mode));
-    
+
     let splats = parse_splats(data, &settings)?;
     let mut result = mesh::reconstruct_mesh(&splats, &settings);
-    log(&format!("Reconstructed mesh with {} vertices", result.mesh.vertex_count));
+    log(&format!(
+        "Reconstructed mesh with {} vertices",
+        result.mesh.vertex_count
+    ));
     output_space::apply_reconstruction(&settings, &mut result);
-    
+
     Ok(serde_wasm_bindgen::to_value(&result)?)
 }
 
@@ -845,7 +856,10 @@ pub fn build_room_floor_mesh(data: &[u8], settings: JsValue) -> Result<JsValue, 
     // get upstream-correct floor extraction without copying the preset. Caller
     // settings override the preset, and the per-step recovery patch overrides both
     // (preset < caller settings < step patch).
-    let preset_obj = fast_nav_preset_json().as_object().cloned().unwrap_or_default();
+    let preset_obj = fast_nav_preset_json()
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
     let base_obj = base_value.as_object().cloned().unwrap_or_default();
     let mut last_err: Option<mesh::RoomFloorError> = None;
     let mut attempted: Vec<String> = Vec::new();
@@ -981,7 +995,10 @@ impl SliceSettings {
         let d = slice::SliceParams::default();
         slice::SliceParams {
             sh_degree: self.sh_degree.unwrap_or(d.sh_degree).min(3),
-            sh_cluster_count: self.sh_cluster_count.unwrap_or(d.sh_cluster_count).clamp(1, 65536),
+            sh_cluster_count: self
+                .sh_cluster_count
+                .unwrap_or(d.sh_cluster_count)
+                .clamp(1, 65536),
             sh_iterations: self.sh_iterations.unwrap_or(d.sh_iterations).max(1),
             chunk_count: self.chunk_count.unwrap_or(d.chunk_count).max(1),
             chunk_extent: self.chunk_extent.unwrap_or(d.chunk_extent).max(0.0),
@@ -1013,10 +1030,7 @@ pub fn slice_splat(data: &[u8], settings: JsValue) -> Result<JsValue, JsValue> {
         params.chunk_count
     ));
     let manifest = slice::slice(&cloud, &params).map_err(|e| JsValue::from_str(&e))?;
-    log(&format!(
-        "Sliced into {} chunk(s)",
-        manifest.chunk_count
-    ));
+    log(&format!("Sliced into {} chunk(s)", manifest.chunk_count));
     Ok(serde_wasm_bindgen::to_value(&manifest)?)
 }
 

@@ -64,7 +64,11 @@ fn det3(m: &[[f64; 3]; 3]) -> f64 {
 
 fn resolve(s: &OutputSpaceSettings) -> OutputTransform {
     let up = s.up_axis.as_deref().unwrap_or("y").to_ascii_lowercase();
-    let hand = s.handedness.as_deref().unwrap_or("right").to_ascii_lowercase();
+    let hand = s
+        .handedness
+        .as_deref()
+        .unwrap_or("right")
+        .to_ascii_lowercase();
 
     // +Y-up -> +Z-up while preserving right-handedness (rotation of -90 deg about X):
     // (x, y, z) -> (x, -z, y).
@@ -82,7 +86,12 @@ fn resolve(s: &OutputSpaceSettings) -> OutputTransform {
 
     let matrix = mat_mul(&m_hand, &m_up);
     let mirrored = det3(&matrix) < 0.0;
-    let flip_winding = match s.winding.as_deref().map(|w| w.to_ascii_lowercase()).as_deref() {
+    let flip_winding = match s
+        .winding
+        .as_deref()
+        .map(|w| w.to_ascii_lowercase())
+        .as_deref()
+    {
         Some("cw") => true,
         Some("ccw") => false,
         _ => mirrored,
@@ -91,7 +100,11 @@ fn resolve(s: &OutputSpaceSettings) -> OutputTransform {
     OutputTransform {
         matrix,
         flip_winding,
-        up_axis: if up == "z" { "z".to_string() } else { "y".to_string() },
+        up_axis: if up == "z" {
+            "z".to_string()
+        } else {
+            "y".to_string()
+        },
         handedness: if hand == "left" {
             "left".to_string()
         } else {
@@ -203,7 +216,8 @@ pub fn apply_ground_field(settings: &MeshSettings, result: &mut WalkableGroundFi
 
 pub fn apply_bounds(settings: &MeshSettings, result: &mut SplatBounds) {
     if let Some(t) = transform_for(settings) {
-        let (lo, hi) = elementwise_minmax(t.apply(result.oriented_min), t.apply(result.oriented_max));
+        let (lo, hi) =
+            elementwise_minmax(t.apply(result.oriented_min), t.apply(result.oriented_max));
         result.oriented_min = lo;
         result.oriented_max = hi;
         result.space = t.coordinate_space();

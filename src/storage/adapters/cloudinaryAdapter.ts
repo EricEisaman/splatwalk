@@ -21,20 +21,9 @@ import type { SecretReference } from '../secrets/types';
 import { getGlobalSecretsResolver } from '../secrets/resolver';
 
 /**
- * Cloudinary URL builder configuration.
- */
-interface CloudinaryUrlConfig {
-  cloudName: string;
-  folder: string;
-  bundleId: string;
-  transformations?: Record<string, unknown>;
-}
-
-/**
  * Handles streaming SOG LOD bundles from Cloudinary CDN.
  */
 export class CloudinaryStorageAdapter implements StorageAdapter {
-  private urlConfig: CloudinaryUrlConfig | null = null;
   private manifestData: unknown | null = null;
   private cloudName: string = '';
   private folder: string = '';
@@ -247,7 +236,7 @@ export class CloudinaryStorageAdapter implements StorageAdapter {
   /**
    * Fetch storage info from Cloudinary Admin API.
    */
-  private async fetchStorageInfoFromAPI(apiKey: string): Promise<StorageInfo> {
+  private async fetchStorageInfoFromAPI(_apiKey: string): Promise<StorageInfo> {
     // Note: This would require authenticated API calls with the API key
     // For now, return basic info as a fallback
     return {

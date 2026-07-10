@@ -11,7 +11,12 @@ import { buildNavmeshKey, getNavmesh, putNavmesh } from '@/navigation/navmeshCac
 import { splatwalk, type MeshSettings } from '@/wasm/bridge';
 import { normalizeSplatToPly, SUPPORTED_SPLAT_EXTENSIONS } from '@/wasm/normalize';
 import { SliceArchive } from '@/wasm/sliceArchive';
-import type { SliceSettings } from '@/wasm/sogTypes';
+import {
+  DEFAULT_SLICE_SETTINGS,
+  inferPlyShDegree,
+  maxChunkExtentFromBounds,
+  type SliceSettings,
+} from '@/wasm/sogTypes';
 import { SplatNavController } from '@/react/three/SplatNavController';
 
 export type SogExportMode = 'streamed' | 'single';
@@ -215,6 +220,8 @@ export function useSplatFastNavR3F() {
   const [phase, setPhase] = useState<FastNavUiPhase>('idle');
   const [progress, setProgress] = useState<FastNavProgress | null>(null);
   const [splatCount, setSplatCount] = useState<number | null>(null);
+  const [maxShDegree, setMaxShDegree] = useState(DEFAULT_SLICE_SETTINGS.sh_degree);
+  const [maxChunkExtent, setMaxChunkExtent] = useState(DEFAULT_SLICE_SETTINGS.chunk_extent);
 
   const wasmReady = useRef(false);
   const currentBytes = useRef<Uint8Array | null>(null);
@@ -241,6 +248,8 @@ export function useSplatFastNavR3F() {
     setPhase('idle');
     setProgress(null);
     setSplatCount(null);
+    setMaxShDegree(DEFAULT_SLICE_SETTINGS.sh_degree);
+    setMaxChunkExtent(DEFAULT_SLICE_SETTINGS.chunk_extent);
     currentBytes.current = null;
     currentName.current = 'splat';
     void controller.reset();
@@ -250,6 +259,7 @@ export function useSplatFastNavR3F() {
     async (bytes: Uint8Array, name: string): Promise<void> => {
       currentBytes.current = bytes;
       currentName.current = name.replace(/\.(ply|spz|splat)$/i, '');
+      setMaxShDegree(inferPlyShDegree(bytes));
 
       if (!wasmReady.current) {
         appendLog('[WAIT] Initializing SplatWalk WASM...');
@@ -267,9 +277,11 @@ export function useSplatFastNavR3F() {
         const bounds = await splatwalk.getSplatBounds(bytes, { ...base, prune_floaters: false });
         setSplatCount(bounds.point_count);
         splatBounds = { min: bounds.oriented_min, max: bounds.oriented_max };
+        setMaxChunkExtent(maxChunkExtentFromBounds(splatBounds));
         controller.setSceneBounds(bounds.oriented_min, bounds.oriented_max);
       } catch {
         setSplatCount(null);
+        setMaxChunkExtent(DEFAULT_SLICE_SETTINGS.chunk_extent);
       }
 
       setStatus('processing');
@@ -430,7 +442,7 @@ export function useSplatFastNavR3F() {
         mode === 'streamed'
           ? await splatwalk.sliceSplat(bytes, settings)
           : await splatwalk.convertToSog(bytes, settings);
-      const archive = new SliceArchive(result);
+      const archive = new SliceArchive(result, { streamed: mode === 'streamed' });
       archive.download(`${currentName.current}-sog`);
       return archive;
     },
@@ -448,6 +460,8 @@ export function useSplatFastNavR3F() {
     phase,
     progress,
     splatCount,
+    maxShDegree,
+    maxChunkExtent,
     loadAndProcess,
     loadExample,
     exportSog,

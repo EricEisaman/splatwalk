@@ -99,7 +99,7 @@ export interface StorageAdapter {
 
   /**
    * Fetch a specific chunk file by its relative path.
-   * @param path - Bundle-relative path (e.g., 'lod0/chunk0/means_l.webp')
+   * @param path - Bundle-relative path (e.g., '0_0/means_l.webp')
    * @returns The chunk data as bytes
    */
   fetchChunk(path: string): Promise<StorageFetchResponse>;

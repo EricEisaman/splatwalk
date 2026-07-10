@@ -78,5 +78,25 @@ if [ ${#FAILED_MODULES[@]} -gt 0 ]; then
 fi
 
 echo "==========================================================="
+echo "SYNCING SPATIAL WASM INTO @splatwalk/core"
+echo "==========================================================="
+
+# Dev/demo worker imports `@splatwalk/core` from node_modules. Without this sync,
+# a stale published binary can emit the old single-leaf `lod0`/`lod1` layout and
+# destroy SOG fidelity vs the source PLY. Always overwrite the WASM/JS from pkg/.
+CORE_DIR="node_modules/@splatwalk/core"
+if [ -d "$CORE_DIR" ]; then
+  cp -f "pkg/wasm_splatwalk/wasm_splatwalk.js" "$CORE_DIR/wasm_splatwalk.js"
+  cp -f "pkg/wasm_splatwalk/wasm_splatwalk.d.ts" "$CORE_DIR/wasm_splatwalk.d.ts"
+  cp -f "pkg/wasm_splatwalk/wasm_splatwalk_bg.wasm" "$CORE_DIR/wasm_splatwalk_bg.wasm"
+  if [ -f "pkg/wasm_splatwalk/wasm_splatwalk_bg.wasm.d.ts" ]; then
+    cp -f "pkg/wasm_splatwalk/wasm_splatwalk_bg.wasm.d.ts" "$CORE_DIR/wasm_splatwalk_bg.wasm.d.ts"
+  fi
+  echo "✓ Synced pkg/wasm_splatwalk → $CORE_DIR (floor.js left as published package)"
+else
+  echo "⚠ $CORE_DIR missing — run npm install, then rebuild WASM"
+fi
+
+echo "==========================================================="
 echo "ALL WASM MODULES BUILT AND VERIFIED SUCCESSFULLY"
 echo "==========================================================="

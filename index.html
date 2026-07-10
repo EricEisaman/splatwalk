@@ -225,11 +225,11 @@
                             <div id="sogExportPanel" class="advanced-settings-panel" style="display: none;">
                                 <div id="sogExportStatus" class="sog-status"></div>
                                 <div class="control-row">
-                                    <label title="Streamed = multi-chunk lod-meta.json for streaming; Single = one SOG meta.json.">Export Mode:</label>
+                                    <label title="Streamed LOD = multi-level lod-meta.json for coarse→fine streaming; Single SOG = one meta.json bundle.">Export Mode:</label>
                                     <div class="radio-cards" id="sogModeGroup">
                                         <label>
                                             <input type="radio" name="sogMode" value="streamed" checked>
-                                            <div class="radio-card-content">LOD</div>
+                                            <div class="radio-card-content">Streamed LOD</div>
                                         </label>
                                         <label>
                                             <input type="radio" name="sogMode" value="single">
@@ -238,8 +238,8 @@
                                     </div>
                                 </div>
                                 <div class="control-row">
-                                    <label title="Spherical-harmonic degree to preserve (0 = base color only, 3 = full).">SH Degree:</label>
-                                    <input type="number" id="paramSogShDegree" value="3" step="1" min="0" max="3">
+                                    <label title="0 = base color only (smaller/faster). Higher degrees keep more view-dependent color. Capped to the highest SH degree in the loaded file.">SH Degree:</label>
+                                    <input type="number" id="paramSogShDegree" value="0" step="1" min="0" max="3">
                                 </div>
                                 <div class="control-row">
                                     <label title="shN k-means palette size (number of clusters). Higher = better SH fidelity, slower.">SH Palette Size:</label>
@@ -254,15 +254,18 @@
                                     <input type="number" id="paramSogChunkCount" value="256000" step="16000" min="1000" max="4000000">
                                 </div>
                                 <div class="control-row sog-streamed-only">
-                                    <label title="Soft cap on a chunk's world-space extent, in meters.">Chunk Extent (m):</label>
+                                    <label title="Soft cap on a chunk's world-space extent, in meters. Capped to half the largest loaded-scene dimension.">Chunk Extent (m):</label>
                                     <input type="number" id="paramSogChunkExtent" value="16" step="1" min="0" max="1000">
                                 </div>
                                 <div class="control-row sog-streamed-only">
-                                    <label title="Number of LOD levels (1 = full detail only; higher adds coarser levels).">LOD Levels:</label>
-                                    <input type="number" id="paramSogLodLevels" value="1" step="1" min="1" max="6">
+                                    <label title="2+ recommended for streaming (coarse base + full detail). 1 = full detail only, no multi-LOD.">LOD Levels:</label>
+                                    <input type="number" id="paramSogLodLevels" value="2" step="1" min="1" max="6">
+                                </div>
+                                <div id="sogLodLevelsWarning" class="sog-warning sog-streamed-only" style="display: none;" role="status">
+                                    LOD Levels is 1 — this export is a single detail level and will not stream coarse→fine.
                                 </div>
                                 <div class="nav-button-group">
-                                    <button id="sogExportBtn" class="cyber-button secondary small">EXPORT SOG (.ZIP)</button>
+                                    <button id="sogExportBtn" class="cyber-button secondary small">EXPORT STREAMED SOG (.ZIP)</button>
                                 </div>
                             </div>
                         </div>

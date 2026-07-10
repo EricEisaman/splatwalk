@@ -1,9 +1,8 @@
 use crate::splat::PointNormal;
 use crate::{
-    CoordinateSpace, FieldBasis, FloorPlane, GroundFieldCell, GroundFieldCellState,
-    MeshBuffers, MeshSettings, NavmeshBasisResult,
-    ReconstructionDiagnostics, ReconstructionResult, SplatBounds, SuggestedRegion,
-    WalkableGroundFieldResult,
+    CoordinateSpace, FieldBasis, FloorPlane, GroundFieldCell, GroundFieldCellState, MeshBuffers,
+    MeshSettings, NavmeshBasisResult, ReconstructionDiagnostics, ReconstructionResult, SplatBounds,
+    SuggestedRegion, WalkableGroundFieldResult,
 };
 use nalgebra::{Point3, UnitQuaternion, Vector3};
 use poisson_reconstruction::{PoissonReconstruction, Real};
@@ -90,11 +89,12 @@ impl VoxelGrid {
     }
 
     fn center(&self, x: usize, y: usize, z: usize) -> Vector3<f64> {
-        self.min + Vector3::new(
-            (x as f64 + 0.5) * self.voxel_size,
-            (y as f64 + 0.5) * self.voxel_size,
-            (z as f64 + 0.5) * self.voxel_size,
-        )
+        self.min
+            + Vector3::new(
+                (x as f64 + 0.5) * self.voxel_size,
+                (y as f64 + 0.5) * self.voxel_size,
+                (z as f64 + 0.5) * self.voxel_size,
+            )
     }
 
     fn point_to_voxel(&self, p: &Vector3<f64>) -> Option<(usize, usize, usize)> {
@@ -102,20 +102,32 @@ impl VoxelGrid {
         let x = rel.x.floor() as isize;
         let y = rel.y.floor() as isize;
         let z = rel.z.floor() as isize;
-        if x < 0 || y < 0 || z < 0 ||
-            x >= self.dims[0] as isize ||
-            y >= self.dims[1] as isize ||
-            z >= self.dims[2] as isize {
+        if x < 0
+            || y < 0
+            || z < 0
+            || x >= self.dims[0] as isize
+            || y >= self.dims[1] as isize
+            || z >= self.dims[2] as isize
+        {
             return None;
         }
         Some((x as usize, y as usize, z as usize))
     }
 }
 
-pub fn get_splat_bounds(points: &[PointNormal], settings: &MeshSettings) -> Result<SplatBounds, wasm_bindgen::JsValue> {
+pub fn get_splat_bounds(
+    points: &[PointNormal],
+    settings: &MeshSettings,
+) -> Result<SplatBounds, wasm_bindgen::JsValue> {
     let context = build_context(points, settings);
-    let min = context.diagnostics.oriented_min.ok_or_else(|| wasm_bindgen::JsValue::from_str("No valid oriented points for bounds"))?;
-    let max = context.diagnostics.oriented_max.ok_or_else(|| wasm_bindgen::JsValue::from_str("No valid oriented points for bounds"))?;
+    let min = context
+        .diagnostics
+        .oriented_min
+        .ok_or_else(|| wasm_bindgen::JsValue::from_str("No valid oriented points for bounds"))?;
+    let max = context
+        .diagnostics
+        .oriented_max
+        .ok_or_else(|| wasm_bindgen::JsValue::from_str("No valid oriented points for bounds"))?;
     let floor_y = context.diagnostics.floor_y_percentile_02.unwrap_or(min[1]);
 
     Ok(SplatBounds {
@@ -130,7 +142,10 @@ pub fn get_splat_bounds(points: &[PointNormal], settings: &MeshSettings) -> Resu
     })
 }
 
-pub fn suggest_region(points: &[PointNormal], settings: &MeshSettings) -> Result<SuggestedRegion, wasm_bindgen::JsValue> {
+pub fn suggest_region(
+    points: &[PointNormal],
+    settings: &MeshSettings,
+) -> Result<SuggestedRegion, wasm_bindgen::JsValue> {
     let bounds = get_splat_bounds(points, settings)?;
     let desired_height = 2.0_f64;
     let available_height = (bounds.oriented_max[1] - bounds.oriented_min[1]).max(0.0);
@@ -163,7 +178,10 @@ pub fn reconstruct_mesh(points: &[PointNormal], settings: &MeshSettings) -> Reco
     let mut diagnostics = context.diagnostics.clone();
 
     let mesh = if context.filtered_points.is_empty() {
-        ReconstructedMesh { vertices: vec![], indices: vec![] }
+        ReconstructedMesh {
+            vertices: vec![],
+            indices: vec![],
+        }
     } else if mode == 1 {
         reconstruct_plane_ransac(&context.filtered_points, &mut diagnostics)
     } else if mode == 2 {
@@ -182,17 +200,31 @@ pub fn reconstruct_mesh(points: &[PointNormal], settings: &MeshSettings) -> Reco
     }
 }
 
-pub fn convert_splat_to_navmesh_basis(points: &[PointNormal], settings: &MeshSettings) -> NavmeshBasisResult {
+pub fn convert_splat_to_navmesh_basis(
+    points: &[PointNormal],
+    settings: &MeshSettings,
+) -> NavmeshBasisResult {
     let context = build_context(points, settings);
     let mut diagnostics = context.diagnostics.clone();
     let collision = build_collision_mesh(&context, settings, &mut diagnostics);
     let (mesh, basis, plane, diagnostics) = if let Some(collision) = collision {
-        (collision.mesh, collision.basis, collision.plane, collision.diagnostics)
+        (
+            collision.mesh,
+            collision.basis,
+            collision.plane,
+            collision.diagnostics,
+        )
     } else {
         (
-            ReconstructedMesh { vertices: vec![], indices: vec![] },
+            ReconstructedMesh {
+                vertices: vec![],
+                indices: vec![],
+            },
             default_field_basis(),
-            FloorPlane { normal: [0.0, 1.0, 0.0], d: 0.0 },
+            FloorPlane {
+                normal: [0.0, 1.0, 0.0],
+                d: 0.0,
+            },
             diagnostics,
         )
     };
@@ -247,7 +279,8 @@ fn build_context(points: &[PointNormal], settings: &MeshSettings) -> Reconstruct
     let max_scale = settings.max_scale.unwrap_or(5.0);
     let rot_matrix = settings.rotation.as_ref().and_then(|rot| {
         if rot.len() == 3 {
-            let q = UnitQuaternion::from_euler_angles(rot[0] as Real, rot[1] as Real, rot[2] as Real);
+            let q =
+                UnitQuaternion::from_euler_angles(rot[0] as Real, rot[1] as Real, rot[2] as Real);
             Some(q.to_rotation_matrix())
         } else {
             None
@@ -304,17 +337,24 @@ fn build_context(points: &[PointNormal], settings: &MeshSettings) -> Reconstruct
     for p in &oriented_points {
         if let (Some(region_min), Some(region_max)) = (&settings.region_min, &settings.region_max) {
             if region_min.len() == 3 && region_max.len() == 3 {
-                if p.point.x < region_min[0] || p.point.x > region_max[0] ||
-                    p.point.y < region_min[1] || p.point.y > region_max[1] ||
-                    p.point.z < region_min[2] || p.point.z > region_max[2] {
+                if p.point.x < region_min[0]
+                    || p.point.x > region_max[0]
+                    || p.point.y < region_min[1]
+                    || p.point.y > region_max[1]
+                    || p.point.z < region_min[2]
+                    || p.point.z > region_max[2]
+                {
                     diagnostics.points_region_discarded += 1;
                     continue;
                 }
             }
         }
 
-        if p.opacity <= min_alpha ||
-            p.scale.x >= max_scale || p.scale.y >= max_scale || p.scale.z >= max_scale {
+        if p.opacity <= min_alpha
+            || p.scale.x >= max_scale
+            || p.scale.y >= max_scale
+            || p.scale.z >= max_scale
+        {
             continue;
         }
 
@@ -346,7 +386,10 @@ fn reconstruct_voxel_navmesh(
     diagnostics: &mut ReconstructionDiagnostics,
 ) -> ReconstructedMesh {
     let Some(collision) = build_collision_mesh(context, settings, diagnostics) else {
-        return ReconstructedMesh { vertices: vec![], indices: vec![] };
+        return ReconstructedMesh {
+            vertices: vec![],
+            indices: vec![],
+        };
     };
 
     *diagnostics = collision.diagnostics;
@@ -385,14 +428,21 @@ fn build_collision_mesh(
             (extent.y / voxel_size).ceil().max(1.0) as usize + 1,
             (extent.z / voxel_size).ceil().max(1.0) as usize + 1,
         ];
-        let grid = VoxelGrid { min: padded_min, dims, voxel_size };
+        let grid = VoxelGrid {
+            min: padded_min,
+            dims,
+            voxel_size,
+        };
         if grid.len() <= max_voxels || voxel_size >= 0.5 {
             break grid;
         }
         voxel_size *= 1.25;
     };
 
-    let threshold = settings.collision_opacity_threshold.unwrap_or(0.1).max(0.001);
+    let threshold = settings
+        .collision_opacity_threshold
+        .unwrap_or(0.1)
+        .max(0.001);
     let mut density = vec![0.0_f64; grid.len()];
     for p in points {
         let center = Vector3::new(p.point.x, p.point.y, p.point.z);
@@ -405,7 +455,9 @@ fn build_collision_mesh(
 
         for y in (cy as isize - vr).max(0)..=(cy as isize + vr).min(grid.dims[1] as isize - 1) {
             for z in (cz as isize - vr).max(0)..=(cz as isize + vr).min(grid.dims[2] as isize - 1) {
-                for x in (cx as isize - vr).max(0)..=(cx as isize + vr).min(grid.dims[0] as isize - 1) {
+                for x in
+                    (cx as isize - vr).max(0)..=(cx as isize + vr).min(grid.dims[0] as isize - 1)
+                {
                     let voxel_center = grid.center(x as usize, y as usize, z as usize);
                     let dist_sq = (voxel_center - center).norm_squared();
                     if dist_sq > radius * radius {
@@ -419,7 +471,10 @@ fn build_collision_mesh(
         }
     }
 
-    let mut solid = density.iter().map(|v| *v >= threshold).collect::<Vec<bool>>();
+    let mut solid = density
+        .iter()
+        .map(|v| *v >= threshold)
+        .collect::<Vec<bool>>();
     let occupied_before = solid.iter().filter(|&&v| v).count();
     if occupied_before == 0 {
         diagnostics.collision_failure_reason = Some("no_occupied_voxels".to_string());
@@ -428,22 +483,52 @@ fn build_collision_mesh(
 
     let seed = collision_seed(settings, diagnostics, &grid);
     diagnostics.collision_seed_used = Some([seed.x, seed.y, seed.z]);
-    diagnostics.collision_seed_state = seed_state(&grid, &solid, seed, settings.collision_carve_height.unwrap_or(1.6), settings.collision_carve_radius.unwrap_or(0.25));
+    diagnostics.collision_seed_state = seed_state(
+        &grid,
+        &solid,
+        seed,
+        settings.collision_carve_height.unwrap_or(1.6),
+        settings.collision_carve_radius.unwrap_or(0.25),
+    );
     let (cluster_kept, cluster_discarded) = filter_occupied_seed_cluster(&grid, &mut solid, seed);
-    let scene_type = settings.collision_scene_type.as_deref().unwrap_or("outdoor").to_string();
-    let (filled, external_fill_leaked) = apply_collision_fill(&grid, &mut solid, &scene_type, settings.collision_fill_size.unwrap_or(1.2), seed);
-    let reachable = carve_reachable_empty(&grid, &solid, seed, settings.collision_carve_height.unwrap_or(1.6), settings.collision_carve_radius.unwrap_or(0.25));
+    let scene_type = settings
+        .collision_scene_type
+        .as_deref()
+        .unwrap_or("outdoor")
+        .to_string();
+    let (filled, external_fill_leaked) = apply_collision_fill(
+        &grid,
+        &mut solid,
+        &scene_type,
+        settings.collision_fill_size.unwrap_or(1.2),
+        seed,
+    );
+    let reachable = carve_reachable_empty(
+        &grid,
+        &solid,
+        seed,
+        settings.collision_carve_height.unwrap_or(1.6),
+        settings.collision_carve_radius.unwrap_or(0.25),
+    );
     let carved = reachable.iter().filter(|&&v| v).count();
     if carved == 0 {
-        diagnostics.collision_failure_reason = Some("seed_not_reachable_or_capsule_blocked".to_string());
+        diagnostics.collision_failure_reason =
+            Some("seed_not_reachable_or_capsule_blocked".to_string());
         return None;
     }
 
-    let mesh_mode = settings.collision_mesh_mode.as_deref().unwrap_or("faces").to_string();
+    let mesh_mode = settings
+        .collision_mesh_mode
+        .as_deref()
+        .unwrap_or("faces")
+        .to_string();
     let mesh = mesh_from_voxels(&grid, &solid, &reachable);
     let surface_faces = mesh.indices.len() / 3;
 
-    diagnostics.floor_plane = Some(FloorPlane { normal: [0.0, 1.0, 0.0], d: -seed.y });
+    diagnostics.floor_plane = Some(FloorPlane {
+        normal: [0.0, 1.0, 0.0],
+        d: -seed.y,
+    });
     diagnostics.floor_plane_source = "voxel_collision".to_string();
     diagnostics.floor_plane_normal_y = 1.0;
     diagnostics.floor_plane_height = seed.y;
@@ -462,7 +547,13 @@ fn build_collision_mesh(
     diagnostics.collision_filled_voxels = filled;
     diagnostics.collision_carved_voxels = carved;
     diagnostics.collision_surface_faces = surface_faces;
-    diagnostics.collision_seed_state = seed_state(&grid, &solid, seed, settings.collision_carve_height.unwrap_or(1.6), settings.collision_carve_radius.unwrap_or(0.25));
+    diagnostics.collision_seed_state = seed_state(
+        &grid,
+        &solid,
+        seed,
+        settings.collision_carve_height.unwrap_or(1.6),
+        settings.collision_carve_radius.unwrap_or(0.25),
+    );
     diagnostics.collision_scene_type = scene_type;
     diagnostics.collision_mesh_mode = mesh_mode;
     diagnostics.collision_external_fill_leaked = external_fill_leaked;
@@ -479,7 +570,10 @@ fn build_collision_mesh(
         bitangent: [0.0, 0.0, 1.0],
         up: [0.0, 1.0, 0.0],
     };
-    let plane = diagnostics.floor_plane.clone().unwrap_or(FloorPlane { normal: [0.0, 1.0, 0.0], d: -seed.y });
+    let plane = diagnostics.floor_plane.clone().unwrap_or(FloorPlane {
+        normal: [0.0, 1.0, 0.0],
+        d: -seed.y,
+    });
 
     Some(CollisionBuild {
         mesh,
@@ -489,15 +583,23 @@ fn build_collision_mesh(
     })
 }
 
-fn collision_seed(settings: &MeshSettings, diagnostics: &ReconstructionDiagnostics, grid: &VoxelGrid) -> Vector3<f64> {
+fn collision_seed(
+    settings: &MeshSettings,
+    diagnostics: &ReconstructionDiagnostics,
+    grid: &VoxelGrid,
+) -> Vector3<f64> {
     if let Some(seed) = &settings.collision_seed {
         if seed.len() == 3 && seed.iter().all(|v| v.is_finite()) {
             return Vector3::new(seed[0], seed[1], seed[2]);
         }
     }
 
-    let min = diagnostics.oriented_min.unwrap_or([grid.min.x, grid.min.y, grid.min.z]);
-    let max = diagnostics.oriented_max.unwrap_or([grid.min.x, grid.min.y, grid.min.z]);
+    let min = diagnostics
+        .oriented_min
+        .unwrap_or([grid.min.x, grid.min.y, grid.min.z]);
+    let max = diagnostics
+        .oriented_max
+        .unwrap_or([grid.min.x, grid.min.y, grid.min.z]);
     Vector3::new(
         (min[0] + max[0]) * 0.5,
         diagnostics.floor_y_percentile_02.unwrap_or(min[1]) + 1.0,
@@ -505,7 +607,11 @@ fn collision_seed(settings: &MeshSettings, diagnostics: &ReconstructionDiagnosti
     )
 }
 
-fn filter_occupied_seed_cluster(grid: &VoxelGrid, solid: &mut [bool], seed: Vector3<f64>) -> (usize, usize) {
+fn filter_occupied_seed_cluster(
+    grid: &VoxelGrid,
+    solid: &mut [bool],
+    seed: Vector3<f64>,
+) -> (usize, usize) {
     let Some(seed_idx) = nearest_solid_voxel(grid, solid, seed) else {
         let occupied = solid.iter().filter(|&&v| v).count();
         return (occupied, 0);
@@ -540,12 +646,22 @@ fn filter_occupied_seed_cluster(grid: &VoxelGrid, solid: &mut [bool], seed: Vect
 }
 
 fn nearest_solid_voxel(grid: &VoxelGrid, solid: &[bool], seed: Vector3<f64>) -> Option<usize> {
-    let seed_voxel = grid.point_to_voxel(&seed).unwrap_or((grid.dims[0] / 2, grid.dims[1] / 2, grid.dims[2] / 2));
+    let seed_voxel = grid.point_to_voxel(&seed).unwrap_or((
+        grid.dims[0] / 2,
+        grid.dims[1] / 2,
+        grid.dims[2] / 2,
+    ));
     let max_radius = grid.dims.iter().copied().max().unwrap_or(0).min(64) as isize;
     for radius in 0..=max_radius {
-        for y in (seed_voxel.1 as isize - radius).max(0)..=(seed_voxel.1 as isize + radius).min(grid.dims[1] as isize - 1) {
-            for z in (seed_voxel.2 as isize - radius).max(0)..=(seed_voxel.2 as isize + radius).min(grid.dims[2] as isize - 1) {
-                for x in (seed_voxel.0 as isize - radius).max(0)..=(seed_voxel.0 as isize + radius).min(grid.dims[0] as isize - 1) {
+        for y in (seed_voxel.1 as isize - radius).max(0)
+            ..=(seed_voxel.1 as isize + radius).min(grid.dims[1] as isize - 1)
+        {
+            for z in (seed_voxel.2 as isize - radius).max(0)
+                ..=(seed_voxel.2 as isize + radius).min(grid.dims[2] as isize - 1)
+            {
+                for x in (seed_voxel.0 as isize - radius).max(0)
+                    ..=(seed_voxel.0 as isize + radius).min(grid.dims[0] as isize - 1)
+                {
                     let idx = grid.idx(x as usize, y as usize, z as usize);
                     if solid[idx] {
                         return Some(idx);
@@ -557,7 +673,13 @@ fn nearest_solid_voxel(grid: &VoxelGrid, solid: &[bool], seed: Vector3<f64>) -> 
     None
 }
 
-fn apply_collision_fill(grid: &VoxelGrid, solid: &mut [bool], scene_type: &str, fill_size: f64, seed: Vector3<f64>) -> (usize, bool) {
+fn apply_collision_fill(
+    grid: &VoxelGrid,
+    solid: &mut [bool],
+    scene_type: &str,
+    fill_size: f64,
+    seed: Vector3<f64>,
+) -> (usize, bool) {
     match scene_type {
         "indoor" => apply_external_fill(grid, solid, fill_size, seed),
         "object" => (0, false),
@@ -591,11 +713,19 @@ fn apply_floor_fill(grid: &VoxelGrid, solid: &mut [bool], fill_size: f64) -> usi
     filled
 }
 
-fn floor_column_has_local_support(grid: &VoxelGrid, solid: &[bool], x: usize, z: usize, radius: isize) -> bool {
+fn floor_column_has_local_support(
+    grid: &VoxelGrid,
+    solid: &[bool],
+    x: usize,
+    z: usize,
+    radius: isize,
+) -> bool {
     let mut supported = 0usize;
     let mut checked = 0usize;
     for zz in (z as isize - radius).max(0)..=(z as isize + radius).min(grid.dims[2] as isize - 1) {
-        for xx in (x as isize - radius).max(0)..=(x as isize + radius).min(grid.dims[0] as isize - 1) {
+        for xx in
+            (x as isize - radius).max(0)..=(x as isize + radius).min(grid.dims[0] as isize - 1)
+        {
             checked += 1;
             if (0..grid.dims[1]).any(|y| solid[grid.idx(xx as usize, y, zz as usize)]) {
                 supported += 1;
@@ -606,8 +736,17 @@ fn floor_column_has_local_support(grid: &VoxelGrid, solid: &[bool], x: usize, z:
     checked > 0 && supported as f64 / checked as f64 >= 0.35
 }
 
-fn apply_external_fill(grid: &VoxelGrid, solid: &mut [bool], fill_size: f64, seed: Vector3<f64>) -> (usize, bool) {
-    let dilated = dilate_solid(grid, solid, (fill_size / grid.voxel_size).ceil().max(1.0) as usize);
+fn apply_external_fill(
+    grid: &VoxelGrid,
+    solid: &mut [bool],
+    fill_size: f64,
+    seed: Vector3<f64>,
+) -> (usize, bool) {
+    let dilated = dilate_solid(
+        grid,
+        solid,
+        (fill_size / grid.voxel_size).ceil().max(1.0) as usize,
+    );
 
     let mut exterior = vec![false; solid.len()];
     let mut queue = std::collections::VecDeque::new();
@@ -649,9 +788,15 @@ fn dilate_solid(grid: &VoxelGrid, solid: &[bool], radius: usize) -> Vec<bool> {
             continue;
         }
         let (x, y, z) = grid.coords(idx);
-        for yy in (y as isize - radius_i).max(0)..=(y as isize + radius_i).min(grid.dims[1] as isize - 1) {
-            for zz in (z as isize - radius_i).max(0)..=(z as isize + radius_i).min(grid.dims[2] as isize - 1) {
-                for xx in (x as isize - radius_i).max(0)..=(x as isize + radius_i).min(grid.dims[0] as isize - 1) {
+        for yy in
+            (y as isize - radius_i).max(0)..=(y as isize + radius_i).min(grid.dims[1] as isize - 1)
+        {
+            for zz in (z as isize - radius_i).max(0)
+                ..=(z as isize + radius_i).min(grid.dims[2] as isize - 1)
+            {
+                for xx in (x as isize - radius_i).max(0)
+                    ..=(x as isize + radius_i).min(grid.dims[0] as isize - 1)
+                {
                     out[grid.idx(xx as usize, yy as usize, zz as usize)] = true;
                 }
             }
@@ -665,8 +810,13 @@ fn boundary_empty_voxels(grid: &VoxelGrid, solid: &[bool]) -> Vec<usize> {
     for y in 0..grid.dims[1] {
         for z in 0..grid.dims[2] {
             for x in 0..grid.dims[0] {
-                if x != 0 && y != 0 && z != 0 &&
-                    x + 1 != grid.dims[0] && y + 1 != grid.dims[1] && z + 1 != grid.dims[2] {
+                if x != 0
+                    && y != 0
+                    && z != 0
+                    && x + 1 != grid.dims[0]
+                    && y + 1 != grid.dims[1]
+                    && z + 1 != grid.dims[2]
+                {
                     continue;
                 }
                 let idx = grid.idx(x, y, z);
@@ -679,7 +829,13 @@ fn boundary_empty_voxels(grid: &VoxelGrid, solid: &[bool]) -> Vec<usize> {
     out
 }
 
-fn seed_state(grid: &VoxelGrid, solid: &[bool], seed: Vector3<f64>, height: f64, radius: f64) -> String {
+fn seed_state(
+    grid: &VoxelGrid,
+    solid: &[bool],
+    seed: Vector3<f64>,
+    height: f64,
+    radius: f64,
+) -> String {
     let Some((x, y, z)) = grid.point_to_voxel(&seed) else {
         return "outside_grid".to_string();
     };
@@ -695,7 +851,13 @@ fn seed_state(grid: &VoxelGrid, solid: &[bool], seed: Vector3<f64>, height: f64,
     }
 }
 
-fn carve_reachable_empty(grid: &VoxelGrid, solid: &[bool], seed: Vector3<f64>, height: f64, radius: f64) -> Vec<bool> {
+fn carve_reachable_empty(
+    grid: &VoxelGrid,
+    solid: &[bool],
+    seed: Vector3<f64>,
+    height: f64,
+    radius: f64,
+) -> Vec<bool> {
     let mut reachable = vec![false; solid.len()];
     let Some(seed_empty) = nearest_capsule_fit_voxel(grid, solid, seed, height, radius) else {
         return reachable;
@@ -718,14 +880,32 @@ fn carve_reachable_empty(grid: &VoxelGrid, solid: &[bool], seed: Vector3<f64>, h
     reachable
 }
 
-fn nearest_capsule_fit_voxel(grid: &VoxelGrid, solid: &[bool], seed: Vector3<f64>, height: f64, radius: f64) -> Option<usize> {
-    let seed_voxel = grid.point_to_voxel(&seed).unwrap_or((grid.dims[0] / 2, grid.dims[1] / 2, grid.dims[2] / 2));
+fn nearest_capsule_fit_voxel(
+    grid: &VoxelGrid,
+    solid: &[bool],
+    seed: Vector3<f64>,
+    height: f64,
+    radius: f64,
+) -> Option<usize> {
+    let seed_voxel = grid.point_to_voxel(&seed).unwrap_or((
+        grid.dims[0] / 2,
+        grid.dims[1] / 2,
+        grid.dims[2] / 2,
+    ));
     let max_radius = grid.dims.iter().copied().max().unwrap_or(0).min(64) as isize;
     for search in 0..=max_radius {
-        for y in (seed_voxel.1 as isize - search).max(0)..=(seed_voxel.1 as isize + search).min(grid.dims[1] as isize - 1) {
-            for z in (seed_voxel.2 as isize - search).max(0)..=(seed_voxel.2 as isize + search).min(grid.dims[2] as isize - 1) {
-                for x in (seed_voxel.0 as isize - search).max(0)..=(seed_voxel.0 as isize + search).min(grid.dims[0] as isize - 1) {
-                    if capsule_fits(grid, solid, x as usize, y as usize, z as usize, height, radius) {
+        for y in (seed_voxel.1 as isize - search).max(0)
+            ..=(seed_voxel.1 as isize + search).min(grid.dims[1] as isize - 1)
+        {
+            for z in (seed_voxel.2 as isize - search).max(0)
+                ..=(seed_voxel.2 as isize + search).min(grid.dims[2] as isize - 1)
+            {
+                for x in (seed_voxel.0 as isize - search).max(0)
+                    ..=(seed_voxel.0 as isize + search).min(grid.dims[0] as isize - 1)
+                {
+                    if capsule_fits(
+                        grid, solid, x as usize, y as usize, z as usize, height, radius,
+                    ) {
                         return Some(grid.idx(x as usize, y as usize, z as usize));
                     }
                 }
@@ -735,7 +915,15 @@ fn nearest_capsule_fit_voxel(grid: &VoxelGrid, solid: &[bool], seed: Vector3<f64
     None
 }
 
-fn capsule_fits(grid: &VoxelGrid, solid: &[bool], x: usize, y: usize, z: usize, height: f64, radius: f64) -> bool {
+fn capsule_fits(
+    grid: &VoxelGrid,
+    solid: &[bool],
+    x: usize,
+    y: usize,
+    z: usize,
+    height: f64,
+    radius: f64,
+) -> bool {
     if solid[grid.idx(x, y, z)] {
         return false;
     }
@@ -747,7 +935,9 @@ fn capsule_fits(grid: &VoxelGrid, solid: &[bool], x: usize, y: usize, z: usize, 
             for xx in (x as isize - rx).max(0)..=(x as isize + rx).min(grid.dims[0] as isize - 1) {
                 let dx = (xx - x as isize) as f64 * grid.voxel_size;
                 let dz = (zz - z as isize) as f64 * grid.voxel_size;
-                if dx * dx + dz * dz <= r_sq && solid[grid.idx(xx as usize, yy as usize, zz as usize)] {
+                if dx * dx + dz * dz <= r_sq
+                    && solid[grid.idx(xx as usize, yy as usize, zz as usize)]
+                {
                     return false;
                 }
             }
@@ -778,8 +968,13 @@ fn mesh_from_voxels(grid: &VoxelGrid, solid: &[bool], reachable: &[bool]) -> Rec
             let nx = x as isize + dir.0;
             let ny = y as isize + dir.1;
             let nz = z as isize + dir.2;
-            let expose = if nx < 0 || ny < 0 || nz < 0 ||
-                nx >= grid.dims[0] as isize || ny >= grid.dims[1] as isize || nz >= grid.dims[2] as isize {
+            let expose = if nx < 0
+                || ny < 0
+                || nz < 0
+                || nx >= grid.dims[0] as isize
+                || ny >= grid.dims[1] as isize
+                || nz >= grid.dims[2] as isize
+            {
                 false
             } else {
                 reachable[grid.idx(nx as usize, ny as usize, nz as usize)]
@@ -795,11 +990,12 @@ fn mesh_from_voxels(grid: &VoxelGrid, solid: &[bool], reachable: &[bool]) -> Rec
                     face_indices[slot] = *existing;
                     continue;
                 }
-                let p = grid.min + Vector3::new(
-                    key.0 as f64 * grid.voxel_size,
-                    key.1 as f64 * grid.voxel_size,
-                    key.2 as f64 * grid.voxel_size,
-                );
+                let p = grid.min
+                    + Vector3::new(
+                        key.0 as f64 * grid.voxel_size,
+                        key.1 as f64 * grid.voxel_size,
+                        key.2 as f64 * grid.voxel_size,
+                    );
                 let new_idx = (vertices.len() / 3) as u32;
                 vertices.push(p.x as f32);
                 vertices.push(p.y as f32);
@@ -825,12 +1021,24 @@ fn mesh_from_voxels(grid: &VoxelGrid, solid: &[bool], reachable: &[bool]) -> Rec
 fn voxel_neighbors6(grid: &VoxelGrid, idx: usize) -> Vec<usize> {
     let (x, y, z) = grid.coords(idx);
     let mut out = Vec::with_capacity(6);
-    if x > 0 { out.push(grid.idx(x - 1, y, z)); }
-    if x + 1 < grid.dims[0] { out.push(grid.idx(x + 1, y, z)); }
-    if y > 0 { out.push(grid.idx(x, y - 1, z)); }
-    if y + 1 < grid.dims[1] { out.push(grid.idx(x, y + 1, z)); }
-    if z > 0 { out.push(grid.idx(x, y, z - 1)); }
-    if z + 1 < grid.dims[2] { out.push(grid.idx(x, y, z + 1)); }
+    if x > 0 {
+        out.push(grid.idx(x - 1, y, z));
+    }
+    if x + 1 < grid.dims[0] {
+        out.push(grid.idx(x + 1, y, z));
+    }
+    if y > 0 {
+        out.push(grid.idx(x, y - 1, z));
+    }
+    if y + 1 < grid.dims[1] {
+        out.push(grid.idx(x, y + 1, z));
+    }
+    if z > 0 {
+        out.push(grid.idx(x, y, z - 1));
+    }
+    if z + 1 < grid.dims[2] {
+        out.push(grid.idx(x, y, z + 1));
+    }
     out
 }
 
@@ -866,7 +1074,12 @@ fn build_field(
     let obstacle_clearance_max = settings
         .obstacle_clearance_max
         .filter(|v| v.is_finite() && *v > obstacle_clearance_min)
-        .unwrap_or_else(|| settings.collision_carve_height.unwrap_or(1.7).max(obstacle_clearance_min + 0.1));
+        .unwrap_or_else(|| {
+            settings
+                .collision_carve_height
+                .unwrap_or(1.7)
+                .max(obstacle_clearance_min + 0.1)
+        });
     // Local floor continuity: a cell whose floor height departs from the neighbor median by more
     // than this step is treated as a discontinuity (wall base, ledge) rather than walkable floor.
     let continuity_threshold = obstacle_height_epsilon.max(0.2);
@@ -877,7 +1090,10 @@ fn build_field(
     let sdf_density_threshold = settings.sdf_density_threshold.unwrap_or(0.08).max(0.0001);
     let sdf_max_layers = settings.sdf_max_layers.unwrap_or(2).max(1);
     let sdf_smoothing_radius = settings.sdf_smoothing_radius.unwrap_or(1);
-    let influence_radius_scale = settings.sdf_influence_radius_scale.unwrap_or(2.5).clamp(0.5, 6.0);
+    let influence_radius_scale = settings
+        .sdf_influence_radius_scale
+        .unwrap_or(2.5)
+        .clamp(0.5, 6.0);
 
     let p_coords: Vec<Point3<Real>> = points
         .iter()
@@ -952,8 +1168,8 @@ fn build_field(
     let y_padding = obstacle_height_epsilon.max(floor_projection_epsilon) * 2.0;
     let profile_min_y = min_y - y_padding;
     let profile_max_y = max_y + y_padding;
-    let profile_bins = (((profile_max_y - profile_min_y) / sdf_vertical_cell_size).ceil() as usize)
-        .clamp(2, 256);
+    let profile_bins =
+        (((profile_max_y - profile_min_y) / sdf_vertical_cell_size).ceil() as usize).clamp(2, 256);
     let mut profiles = vec![0.0_f64; num_cells * profile_bins];
     let mut normal_weight = vec![0.0_f64; num_cells];
     let mut sample_weight = vec![0.0_f64; num_cells];
@@ -961,14 +1177,22 @@ fn build_field(
     for p in points {
         let normal_y = p.normal.y.abs().min(1.0);
         let scale_avg = ((p.scale.x + p.scale.y + p.scale.z) / 3.0).max(0.001);
-        let influence_radius = (scale_avg * influence_radius_scale).max(cell_size * 0.5).min(cell_size * 4.0);
-        let col_min = (((p.point.x - influence_radius - min_u) / cell_size).floor() as isize).max(0);
-        let col_max = (((p.point.x + influence_radius - min_u) / cell_size).floor() as isize).min(width as isize - 1);
-        let row_min = (((p.point.z - influence_radius - min_v) / cell_size).floor() as isize).max(0);
-        let row_max = (((p.point.z + influence_radius - min_v) / cell_size).floor() as isize).min(height as isize - 1);
+        let influence_radius = (scale_avg * influence_radius_scale)
+            .max(cell_size * 0.5)
+            .min(cell_size * 4.0);
+        let col_min =
+            (((p.point.x - influence_radius - min_u) / cell_size).floor() as isize).max(0);
+        let col_max = (((p.point.x + influence_radius - min_u) / cell_size).floor() as isize)
+            .min(width as isize - 1);
+        let row_min =
+            (((p.point.z - influence_radius - min_v) / cell_size).floor() as isize).max(0);
+        let row_max = (((p.point.z + influence_radius - min_v) / cell_size).floor() as isize)
+            .min(height as isize - 1);
         let bin_center = ((p.point.y - profile_min_y) / sdf_vertical_cell_size).round() as isize;
         let y_sigma = scale_avg.max(sdf_vertical_cell_size * 0.5);
-        let bin_radius = ((y_sigma * influence_radius_scale / sdf_vertical_cell_size).ceil() as isize).clamp(1, 8);
+        let bin_radius = ((y_sigma * influence_radius_scale / sdf_vertical_cell_size).ceil()
+            as isize)
+            .clamp(1, 8);
         let base_density = p.opacity.max(0.0) * (0.35 + 0.65 * normal_y);
 
         for row in row_min..=row_max {
@@ -995,7 +1219,8 @@ fn build_field(
                     let bin_y = profile_min_y + (bin as f64 + 0.5) * sdf_vertical_cell_size;
                     let dy = bin_y - p.point.y;
                     let y_falloff = (-(dy * dy) / (2.0 * y_sigma * y_sigma)).exp();
-                    profiles[cell_idx * profile_bins + bin as usize] += base_density * xz_falloff * y_falloff;
+                    profiles[cell_idx * profile_bins + bin as usize] +=
+                        base_density * xz_falloff * y_falloff;
                 }
             }
         }
@@ -1091,7 +1316,8 @@ fn build_field(
                 }
             }
             if neighbor_heights.len() >= 3 {
-                neighbor_heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                neighbor_heights
+                    .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 let median = neighbor_heights[neighbor_heights.len() / 2];
                 let delta = (primary_height - median).abs();
                 if delta > continuity_threshold {
@@ -1141,7 +1367,11 @@ fn build_field(
         cells.push(GroundFieldCell {
             height: primary_height as f32,
             confidence: confidence as f32,
-            variance: if variance.is_finite() { variance as f32 } else { f32::NAN },
+            variance: if variance.is_finite() {
+                variance as f32
+            } else {
+                f32::NAN
+            },
             normal_alignment: normal_alignment as f32,
             obstacle_score: obstacle_score as f32,
             primary_layer_height: primary_height as f32,
@@ -1157,15 +1387,44 @@ fn build_field(
 
     apply_gradients(&mut cells, &surface_heights, width, height, cell_size);
 
-    let holes_filled = fill_low_confidence_holes(&mut cells, width, height, settings.hole_fill_radius.unwrap_or(1));
-    let cells_eroded = erode_agent_radius(&mut cells, width, height, settings.agent_radius_erode.unwrap_or(0.0), cell_size);
+    let holes_filled = fill_low_confidence_holes(
+        &mut cells,
+        width,
+        height,
+        settings.hole_fill_radius.unwrap_or(1),
+    );
+    let cells_eroded = erode_agent_radius(
+        &mut cells,
+        width,
+        height,
+        settings.agent_radius_erode.unwrap_or(0.0),
+        cell_size,
+    );
     let (component_count, largest_component_cells, selected_component_id, discarded_cells) =
-        select_connected_component(&mut cells, width, height, settings.component_mode.as_deref());
+        select_connected_component(
+            &mut cells,
+            width,
+            height,
+            settings.component_mode.as_deref(),
+        );
     let selected_cells = cells
         .iter()
-        .map(|cell| matches!(cell.state, GroundFieldCellState::Walkable | GroundFieldCellState::Filled))
+        .map(|cell| {
+            matches!(
+                cell.state,
+                GroundFieldCellState::Walkable | GroundFieldCellState::Filled
+            )
+        })
         .collect::<Vec<bool>>();
-    let rejected_cells = cells.iter().filter(|cell| !matches!(cell.state, GroundFieldCellState::Walkable | GroundFieldCellState::Filled)).count();
+    let rejected_cells = cells
+        .iter()
+        .filter(|cell| {
+            !matches!(
+                cell.state,
+                GroundFieldCellState::Walkable | GroundFieldCellState::Filled
+            )
+        })
+        .count();
 
     diagnostics.grid_width = width;
     diagnostics.grid_height = height;
@@ -1183,7 +1442,8 @@ fn build_field(
     diagnostics.connected_components = component_count;
     diagnostics.largest_component_faces = largest_component_cells * 2;
     diagnostics.selected_component_id = selected_component_id;
-    diagnostics.selected_component_area = selected_cells.iter().filter(|&&selected| selected).count() as f64 * cell_size * cell_size;
+    diagnostics.selected_component_area =
+        selected_cells.iter().filter(|&&selected| selected).count() as f64 * cell_size * cell_size;
     diagnostics.points_after_filter = points.len();
     diagnostics.sdf_density_threshold = sdf_density_threshold;
     diagnostics.sdf_vertical_cell_size = sdf_vertical_cell_size;
@@ -1214,7 +1474,10 @@ fn build_field(
     ).into());
 
     let origin_vec = tangent_64 * min_u + bitangent_64 * min_v;
-    let plane = diagnostics.floor_plane.clone().unwrap_or(FloorPlane { normal: [0.0, 1.0, 0.0], d: 0.0 });
+    let plane = diagnostics.floor_plane.clone().unwrap_or(FloorPlane {
+        normal: [0.0, 1.0, 0.0],
+        d: 0.0,
+    });
     let basis = FieldBasis {
         origin: [origin_vec.x, origin_vec.y, origin_vec.z],
         tangent: [tangent_64.x, tangent_64.y, tangent_64.z],
@@ -1233,7 +1496,12 @@ fn build_field(
     })
 }
 
-fn fill_low_confidence_holes(cells: &mut [GroundFieldCell], width: usize, height: usize, radius: usize) -> usize {
+fn fill_low_confidence_holes(
+    cells: &mut [GroundFieldCell],
+    width: usize,
+    height: usize,
+    radius: usize,
+) -> usize {
     if radius == 0 || width == 0 || height == 0 {
         return 0;
     }
@@ -1523,7 +1791,11 @@ fn extract_density_surfaces(
             peak_density,
             surface_confidence: primary.3,
             obstacle_density,
-            height_variance: if variance_weight > 0.0 { variance_sum / variance_weight } else { 0.0 },
+            height_variance: if variance_weight > 0.0 {
+                variance_sum / variance_weight
+            } else {
+                0.0
+            },
             signed_distance_proxy,
             floor_bins: primary.1 - primary.0 + 1,
             obstacle_bins,
@@ -1598,7 +1870,13 @@ fn smooth_surface_heights(
     count
 }
 
-fn apply_gradients(cells: &mut [GroundFieldCell], heights: &[Option<f64>], width: usize, height: usize, cell_size: f64) {
+fn apply_gradients(
+    cells: &mut [GroundFieldCell],
+    heights: &[Option<f64>],
+    width: usize,
+    height: usize,
+    cell_size: f64,
+) {
     if width == 0 || height == 0 || cell_size <= 0.0 {
         return;
     }
@@ -1610,10 +1888,26 @@ fn apply_gradients(cells: &mut [GroundFieldCell], heights: &[Option<f64>], width
                 continue;
             };
 
-            let left = if col > 0 { heights[row * width + col - 1].unwrap_or(center) } else { center };
-            let right = if col + 1 < width { heights[row * width + col + 1].unwrap_or(center) } else { center };
-            let down = if row > 0 { heights[(row - 1) * width + col].unwrap_or(center) } else { center };
-            let up = if row + 1 < height { heights[(row + 1) * width + col].unwrap_or(center) } else { center };
+            let left = if col > 0 {
+                heights[row * width + col - 1].unwrap_or(center)
+            } else {
+                center
+            };
+            let right = if col + 1 < width {
+                heights[row * width + col + 1].unwrap_or(center)
+            } else {
+                center
+            };
+            let down = if row > 0 {
+                heights[(row - 1) * width + col].unwrap_or(center)
+            } else {
+                center
+            };
+            let up = if row + 1 < height {
+                heights[(row + 1) * width + col].unwrap_or(center)
+            } else {
+                center
+            };
 
             cells[idx].gradient = [
                 ((right - left) / (2.0 * cell_size)) as f32,
@@ -1624,7 +1918,10 @@ fn apply_gradients(cells: &mut [GroundFieldCell], heights: &[Option<f64>], width
 }
 
 fn is_accepted_state(state: &GroundFieldCellState) -> bool {
-    matches!(state, GroundFieldCellState::Walkable | GroundFieldCellState::Filled)
+    matches!(
+        state,
+        GroundFieldCellState::Walkable | GroundFieldCellState::Filled
+    )
 }
 
 /// Cell states that may be closed by [`fill_low_confidence_holes`] when they form a
@@ -1648,7 +1945,13 @@ fn is_blocking_state(state: &GroundFieldCellState) -> bool {
     )
 }
 
-fn erode_agent_radius(cells: &mut [GroundFieldCell], width: usize, height: usize, agent_radius: f64, cell_size: f64) -> usize {
+fn erode_agent_radius(
+    cells: &mut [GroundFieldCell],
+    width: usize,
+    height: usize,
+    agent_radius: f64,
+    cell_size: f64,
+) -> usize {
     if agent_radius <= 0.0 || cell_size <= 0.0 || width == 0 || height == 0 {
         return 0;
     }
@@ -1824,7 +2127,9 @@ fn select_connected_component(
 
     (
         component_sizes.len(),
-        *component_sizes.get(selected_component as usize).unwrap_or(&0),
+        *component_sizes
+            .get(selected_component as usize)
+            .unwrap_or(&0),
         selected_component,
         discarded,
     )
@@ -1860,7 +2165,13 @@ fn find_floor_plane(
     let mut sample_indices = points
         .iter()
         .enumerate()
-        .filter_map(|(idx, p)| if (p.y as f64) <= lower_limit { Some(idx) } else { None })
+        .filter_map(|(idx, p)| {
+            if (p.y as f64) <= lower_limit {
+                Some(idx)
+            } else {
+                None
+            }
+        })
         .collect::<Vec<usize>>();
 
     if sample_indices.len() < 3 {
@@ -1883,7 +2194,8 @@ fn find_floor_plane(
             continue;
         }
 
-        let Some(mut plane) = Plane::from_points(&points[idx1], &points[idx2], &points[idx3]) else {
+        let Some(mut plane) = Plane::from_points(&points[idx1], &points[idx2], &points[idx3])
+        else {
             continue;
         };
 
@@ -1929,7 +2241,11 @@ fn find_floor_plane(
     (best_plane, best_inliers)
 }
 
-fn find_ransac_plane(points: &[Point3<Real>], threshold: f64, iterations: usize) -> (Option<Plane>, usize) {
+fn find_ransac_plane(
+    points: &[Point3<Real>],
+    threshold: f64,
+    iterations: usize,
+) -> (Option<Plane>, usize) {
     let mut rng = rand::thread_rng();
     let mut best_plane = None;
     let mut max_inliers = 0;
@@ -1948,7 +2264,10 @@ fn find_ransac_plane(points: &[Point3<Real>], threshold: f64, iterations: usize)
         }
 
         if let Some(plane) = Plane::from_points(&points[idx1], &points[idx2], &points[idx3]) {
-            let inliers = points.iter().filter(|p| plane.distance(p) < threshold).count();
+            let inliers = points
+                .iter()
+                .filter(|p| plane.distance(p) < threshold)
+                .count();
             if inliers > max_inliers {
                 max_inliers = inliers;
                 best_plane = Some(plane);
@@ -1959,14 +2278,20 @@ fn find_ransac_plane(points: &[Point3<Real>], threshold: f64, iterations: usize)
     (best_plane, max_inliers)
 }
 
-fn reconstruct_plane_ransac(points: &[PointNormal], diagnostics: &mut ReconstructionDiagnostics) -> ReconstructedMesh {
+fn reconstruct_plane_ransac(
+    points: &[PointNormal],
+    diagnostics: &mut ReconstructionDiagnostics,
+) -> ReconstructedMesh {
     let p_coords: Vec<Point3<Real>> = points
         .iter()
         .map(|p| Point3::new(p.point.x as Real, p.point.y as Real, p.point.z as Real))
         .collect();
 
     if p_coords.len() < 3 {
-        return ReconstructedMesh { vertices: vec![], indices: vec![] };
+        return ReconstructedMesh {
+            vertices: vec![],
+            indices: vec![],
+        };
     }
 
     let (best_plane, max_inliers) = find_ransac_plane(&p_coords, 0.2, 2000);
@@ -1975,11 +2300,18 @@ fn reconstruct_plane_ransac(points: &[PointNormal], diagnostics: &mut Reconstruc
     if let Some(plane) = best_plane {
         generate_plane_mesh(&plane, &p_coords, 0.2)
     } else {
-        ReconstructedMesh { vertices: vec![], indices: vec![] }
+        ReconstructedMesh {
+            vertices: vec![],
+            indices: vec![],
+        }
     }
 }
 
-fn generate_plane_mesh(plane: &Plane, points: &[Point3<Real>], threshold: Real) -> ReconstructedMesh {
+fn generate_plane_mesh(
+    plane: &Plane,
+    points: &[Point3<Real>],
+    threshold: Real,
+) -> ReconstructedMesh {
     let normal = plane.normal;
     let mut tangent = if normal.x.abs() < 0.9 {
         Vector3::new(1.0, 0.0, 0.0)
@@ -2007,10 +2339,18 @@ fn generate_plane_mesh(plane: &Plane, points: &[Point3<Real>], threshold: Real) 
     }
 
     if count == 0 {
-        return ReconstructedMesh { vertices: vec![], indices: vec![] };
+        return ReconstructedMesh {
+            vertices: vec![],
+            indices: vec![],
+        };
     }
 
-    let corners_uv = [(min_u, min_v), (max_u, min_v), (max_u, max_v), (min_u, max_v)];
+    let corners_uv = [
+        (min_u, min_v),
+        (max_u, min_v),
+        (max_u, max_v),
+        (min_u, max_v),
+    ];
     let mut vertices = Vec::new();
 
     for (u, v) in corners_uv {
@@ -2037,10 +2377,14 @@ fn reconstruct_poisson(points: &[PointNormal]) -> ReconstructedMesh {
         .collect();
 
     if p_coords.is_empty() {
-        return ReconstructedMesh { vertices: vec![], indices: vec![] };
+        return ReconstructedMesh {
+            vertices: vec![],
+            indices: vec![],
+        };
     }
 
-    let poisson = PoissonReconstruction::from_points_and_normals(&p_coords, &p_normals, 0.0, 4, 4, 10);
+    let poisson =
+        PoissonReconstruction::from_points_and_normals(&p_coords, &p_normals, 0.0, 4, 4, 10);
     let mesh_buffers = poisson.reconstruct_mesh_buffers();
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
@@ -2157,10 +2501,22 @@ fn trim_stray_floor_cells(field: &FieldBuild, cells: &[usize]) -> Vec<usize> {
             let row = idx / width;
             let col = idx % width;
             let mut neighbors: Vec<isize> = Vec::with_capacity(4);
-            neighbors.push(if row > 0 { idx as isize - width as isize } else { -1 });
-            neighbors.push(if row + 1 < height { idx as isize + width as isize } else { -1 });
+            neighbors.push(if row > 0 {
+                idx as isize - width as isize
+            } else {
+                -1
+            });
+            neighbors.push(if row + 1 < height {
+                idx as isize + width as isize
+            } else {
+                -1
+            });
             neighbors.push(if col > 0 { idx as isize - 1 } else { -1 });
-            neighbors.push(if col + 1 < width { idx as isize + 1 } else { -1 });
+            neighbors.push(if col + 1 < width {
+                idx as isize + 1
+            } else {
+                -1
+            });
             for n in neighbors {
                 if n >= 0 {
                     let nu = n as usize;
@@ -2178,7 +2534,8 @@ fn trim_stray_floor_cells(field: &FieldBuild, cells: &[usize]) -> Vec<usize> {
 
     let dropped_peripheral = within_band.len() - best.len();
     let total_dropped = dropped_height_outliers + dropped_peripheral;
-    if best.len() < min_keep_cells || (total_dropped as f64) > max_stray_fraction * cells.len() as f64
+    if best.len() < min_keep_cells
+        || (total_dropped as f64) > max_stray_fraction * cells.len() as f64
     {
         return cells.to_vec();
     }
@@ -2196,12 +2553,13 @@ pub fn extract_room_floor(
 ) -> Result<RoomFloorBuild, RoomFloorError> {
     let context = build_context(points, settings);
     let mut diagnostics = context.diagnostics.clone();
-    let field = build_field(&context, settings, &mut diagnostics).ok_or_else(|| RoomFloorError {
-        reason: "no_component".to_string(),
-        message: "Unable to build walkable ground field".to_string(),
-        area: 0.0,
-        components: 0,
-    })?;
+    let field =
+        build_field(&context, settings, &mut diagnostics).ok_or_else(|| RoomFloorError {
+            reason: "no_component".to_string(),
+            message: "Unable to build walkable ground field".to_string(),
+            area: 0.0,
+            components: 0,
+        })?;
 
     let cs = field.cell_size;
     let width = field.width;
@@ -2271,10 +2629,14 @@ pub fn extract_room_floor(
                         cell.variance <= 0.18 && cell.obstacle_score <= 0.42
                     }
                     GroundFieldCellState::HeightVariance => {
-                        cell.confidence >= 0.01 && cell.variance <= 0.08 && cell.obstacle_score <= 0.35
+                        cell.confidence >= 0.01
+                            && cell.variance <= 0.08
+                            && cell.obstacle_score <= 0.35
                     }
                     GroundFieldCellState::Obstacle => {
-                        cell.confidence >= 0.02 && cell.variance <= 0.05 && cell.obstacle_score <= 0.52
+                        cell.confidence >= 0.02
+                            && cell.variance <= 0.05
+                            && cell.obstacle_score <= 0.52
                     }
                     _ => false,
                 }
@@ -2303,10 +2665,22 @@ pub fn extract_room_floor(
                 let row = idx / width;
                 let col = idx % width;
                 let mut neighbors: Vec<isize> = Vec::with_capacity(4);
-                neighbors.push(if row > 0 { idx as isize - width as isize } else { -1 });
-                neighbors.push(if row + 1 < height { idx as isize + width as isize } else { -1 });
+                neighbors.push(if row > 0 {
+                    idx as isize - width as isize
+                } else {
+                    -1
+                });
+                neighbors.push(if row + 1 < height {
+                    idx as isize + width as isize
+                } else {
+                    -1
+                });
                 neighbors.push(if col > 0 { idx as isize - 1 } else { -1 });
-                neighbors.push(if col + 1 < width { idx as isize + 1 } else { -1 });
+                neighbors.push(if col + 1 < width {
+                    idx as isize + 1
+                } else {
+                    -1
+                });
                 for n in neighbors {
                     if n >= 0 {
                         let nu = n as usize;
@@ -2328,7 +2702,10 @@ pub fn extract_room_floor(
                 }
                 None => 0.0,
             };
-            components.push(FloorComponent { cells, distance_to_seed });
+            components.push(FloorComponent {
+                cells,
+                distance_to_seed,
+            });
         }
         components
     };
@@ -2357,7 +2734,11 @@ pub fn extract_room_floor(
             viable.clone()
         };
         let used_largest_fallback = seed.is_some() && seed_near.is_empty();
-        let mut candidates = if !seed_near.is_empty() { seed_near.clone() } else { viable.clone() };
+        let mut candidates = if !seed_near.is_empty() {
+            seed_near.clone()
+        } else {
+            viable.clone()
+        };
         if seed.is_none() || seed_near.is_empty() {
             candidates.sort_by(|&a, &b| components[b].cells.len().cmp(&components[a].cells.len()));
         } else {

@@ -1,8 +1,8 @@
-use std::collections::HashMap;
-use std::io::Cursor;
+use nalgebra::{Point3, Quaternion, UnitQuaternion, Vector3};
 use ply_rs::parser::Parser;
 use ply_rs::ply::{Property, PropertyAccess};
-use nalgebra::{Point3, Vector3, Quaternion, UnitQuaternion};
+use std::collections::HashMap;
+use std::io::Cursor;
 use web_sys::console;
 
 /// First spherical-harmonic basis constant (`Y_0^0`). Shared with the SOG
@@ -32,9 +32,16 @@ pub struct Splat {
 impl PropertyAccess for Splat {
     fn new() -> Self {
         Splat {
-            x: 0.0, y: 0.0, z: 0.0,
-            rot_0: 1.0, rot_1: 0.0, rot_2: 0.0, rot_3: 0.0,
-            scale_0: 0.1, scale_1: 0.1, scale_2: 0.1,
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            rot_0: 1.0,
+            rot_1: 0.0,
+            rot_2: 0.0,
+            rot_3: 0.0,
+            scale_0: 0.1,
+            scale_1: 0.1,
+            scale_2: 0.1,
             opacity: 1.0,
         }
     }
@@ -51,10 +58,10 @@ impl PropertyAccess for Splat {
             ("scale_0", Property::Float(v)) => self.scale_0 = v,
             ("scale_1", Property::Float(v)) => self.scale_1 = v,
             ("scale_2", Property::Float(v)) => self.scale_2 = v,
-            ("opacity", Property::Float(v)) | 
-            ("alpha", Property::Float(v)) | 
-            ("scalar_opacity", Property::Float(v)) => self.opacity = v,
-            _ => {} 
+            ("opacity", Property::Float(v))
+            | ("alpha", Property::Float(v))
+            | ("scalar_opacity", Property::Float(v)) => self.opacity = v,
+            _ => {}
         }
     }
 }
@@ -148,7 +155,9 @@ pub fn prune_floaters(
     let mut grid: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
     for (i, p) in points.iter().enumerate() {
         if p.point.x.is_finite() && p.point.y.is_finite() && p.point.z.is_finite() {
-            grid.entry(key(&[p.point.x, p.point.y, p.point.z])).or_default().push(i);
+            grid.entry(key(&[p.point.x, p.point.y, p.point.z]))
+                .or_default()
+                .push(i);
         }
     }
 
@@ -184,7 +193,9 @@ pub fn prune_floaters(
                                     continue;
                                 }
                                 let q = &points[j].point;
-                                let d = (q.x - pc[0]).powi(2) + (q.y - pc[1]).powi(2) + (q.z - pc[2]).powi(2);
+                                let d = (q.x - pc[0]).powi(2)
+                                    + (q.y - pc[1]).powi(2)
+                                    + (q.z - pc[2]).powi(2);
                                 squared.push(d);
                             }
                         }
@@ -212,7 +223,11 @@ pub fn prune_floaters(
     }
 
     // Global statistics over finite per-point mean distances.
-    let finite: Vec<f64> = mean_dists.iter().copied().filter(|d| d.is_finite()).collect();
+    let finite: Vec<f64> = mean_dists
+        .iter()
+        .copied()
+        .filter(|d| d.is_finite())
+        .collect();
     if finite.len() < 2 {
         return PruneResult {
             input_count: n,
@@ -262,7 +277,7 @@ pub fn prune_floaters(
 }
 
 pub fn parse_ply(data: &[u8]) -> Result<Vec<PointNormal>, String> {
-        // Check for "NGSP" magic number (Niantic SPZ format)
+    // Check for "NGSP" magic number (Niantic SPZ format)
     if data.len() >= 4 && &data[0..4] == b"NGSP" {
         console::log_1(&"Detected NGSP/SPZ format. Parsing with spz_rs...".into());
         let cursor = std::io::Cursor::new(data);
@@ -275,32 +290,42 @@ pub fn parse_ply(data: &[u8]) -> Result<Vec<PointNormal>, String> {
 
                 for i in 0..num_points {
                     let g = packed.unpack(i);
-                    let pos = Point3::new(g.position[0] as f64, g.position[1] as f64, g.position[2] as f64);
-                    let scale = Vector3::new(g.scale[0] as f64, g.scale[1] as f64, g.scale[2] as f64);
+                    let pos = Point3::new(
+                        g.position[0] as f64,
+                        g.position[1] as f64,
+                        g.position[2] as f64,
+                    );
+                    let scale =
+                        Vector3::new(g.scale[0] as f64, g.scale[1] as f64, g.scale[2] as f64);
                     let opacity = g.alpha as f64;
-                    
+
                     // rotation is [w, x, y, z]
                     let r0 = g.rotation[0] as f64; // w
                     let r1 = g.rotation[1] as f64; // x
                     let r2 = g.rotation[2] as f64; // y
                     let r3 = g.rotation[3] as f64; // z
-                    
+
                     // Rotate Z-axis (0, 0, 1) by this quaternion
                     let nx = 2.0 * (r1 * r3 + r2 * r0);
                     let ny = 2.0 * (r2 * r3 - r1 * r0);
                     let nz = 1.0 - 2.0 * (r1 * r1 + r2 * r2);
-                    
+
                     let normal = Vector3::new(nx, ny, nz);
-                    
-                    points.push(PointNormal { point: pos, normal, scale, opacity });
+
+                    points.push(PointNormal {
+                        point: pos,
+                        normal,
+                        scale,
+                        opacity,
+                    });
                 }
-                
+
                 return Ok(points);
             }
             Err(e) => {
-                 let err_msg = format!("Failed to parse SPZ: {:?}", e);
-                 console::log_1(&err_msg.clone().into());
-                 return Err(err_msg);
+                let err_msg = format!("Failed to parse SPZ: {:?}", e);
+                console::log_1(&err_msg.clone().into());
+                return Err(err_msg);
             }
         }
     }
@@ -308,9 +333,9 @@ pub fn parse_ply(data: &[u8]) -> Result<Vec<PointNormal>, String> {
     // Default to PLY parser
     let mut cursor = Cursor::new(data);
     let parser = Parser::<Splat>::new();
-    
+
     let header = parser.read_header(&mut cursor).map_err(|e| e.to_string())?;
-    
+
     // Check if vertex element exists
     if !header.elements.contains_key("vertex") {
         return Err("PLY file missing 'vertex' element".to_string());
@@ -319,7 +344,9 @@ pub fn parse_ply(data: &[u8]) -> Result<Vec<PointNormal>, String> {
     let mut splats = Vec::new();
     for (_key, element) in &header.elements {
         if _key == "vertex" {
-             splats = parser.read_payload_for_element(&mut cursor, element, &header).map_err(|e| e.to_string())?;
+            splats = parser
+                .read_payload_for_element(&mut cursor, element, &header)
+                .map_err(|e| e.to_string())?;
         }
     }
 
@@ -327,10 +354,19 @@ pub fn parse_ply(data: &[u8]) -> Result<Vec<PointNormal>, String> {
 
     for splat in splats {
         let p = Point3::new(splat.x as f64, splat.y as f64, splat.z as f64);
-        let scale = Vector3::new(splat.scale_0 as f64, splat.scale_1 as f64, splat.scale_2 as f64);
+        let scale = Vector3::new(
+            splat.scale_0 as f64,
+            splat.scale_1 as f64,
+            splat.scale_2 as f64,
+        );
         let opacity = splat.opacity as f64;
-        
-        let q = UnitQuaternion::new_normalize(Quaternion::new(splat.rot_0, splat.rot_1, splat.rot_2, splat.rot_3));
+
+        let q = UnitQuaternion::new_normalize(Quaternion::new(
+            splat.rot_0,
+            splat.rot_1,
+            splat.rot_2,
+            splat.rot_3,
+        ));
         let normal = q.transform_vector(&Vector3::z_axis());
 
         points.push(PointNormal {
@@ -429,7 +465,8 @@ impl FullSplatCloud {
             out.opacity_logit.push(self.opacity_logit[i]);
             out.sh0.push(self.sh0[i]);
             if stride > 0 {
-                out.sh_rest.extend_from_slice(&self.sh_rest[i * stride..(i + 1) * stride]);
+                out.sh_rest
+                    .extend_from_slice(&self.sh_rest[i * stride..(i + 1) * stride]);
             }
         }
         out
@@ -486,7 +523,10 @@ impl PropertyAccess for FullSplatRecord {
             "f_dc_1" => self.f_dc[1] = v,
             "f_dc_2" => self.f_dc[2] = v,
             _ => {
-                if let Some(idx) = key.strip_prefix("f_rest_").and_then(|s| s.parse::<usize>().ok()) {
+                if let Some(idx) = key
+                    .strip_prefix("f_rest_")
+                    .and_then(|s| s.parse::<usize>().ok())
+                {
                     if idx < self.f_rest.len() {
                         self.f_rest[idx] = v;
                     }
@@ -696,13 +736,17 @@ pub fn write_ply(cloud: &FullSplatCloud) -> Vec<u8> {
     header.push_str("ply\n");
     header.push_str("format binary_little_endian 1.0\n");
     header.push_str(&format!("element vertex {}\n", n));
-    for prop in ["x", "y", "z", "nx", "ny", "nz", "f_dc_0", "f_dc_1", "f_dc_2"] {
+    for prop in [
+        "x", "y", "z", "nx", "ny", "nz", "f_dc_0", "f_dc_1", "f_dc_2",
+    ] {
         header.push_str(&format!("property float {}\n", prop));
     }
     for i in 0..rest_total {
         header.push_str(&format!("property float f_rest_{}\n", i));
     }
-    for prop in ["opacity", "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3"] {
+    for prop in [
+        "opacity", "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3",
+    ] {
         header.push_str(&format!("property float {}\n", prop));
     }
     header.push_str("end_header\n");
@@ -778,14 +822,21 @@ mod tests {
     #[wasm_bindgen_test]
     fn splat_buffer_parses_to_cloud_in_ply_conventions() {
         // Linear scale 1.0 -> log 0; identity quaternion (w byte clamps to 255).
-        let buf = splat_record([1.0, 2.0, 3.0], [1.0, 1.0, 1.0], [128, 64, 32, 255], [255, 128, 128, 128]);
+        let buf = splat_record(
+            [1.0, 2.0, 3.0],
+            [1.0, 1.0, 1.0],
+            [128, 64, 32, 255],
+            [255, 128, 128, 128],
+        );
         let cloud = parse_splat_buffer(&buf).expect("valid .splat record");
 
         assert_eq!(cloud.len(), 1);
         assert_eq!(cloud.sh_degree, 0);
 
         let p = cloud.positions[0];
-        assert!((p[0] - 1.0).abs() < 1e-6 && (p[1] - 2.0).abs() < 1e-6 && (p[2] - 3.0).abs() < 1e-6);
+        assert!(
+            (p[0] - 1.0).abs() < 1e-6 && (p[1] - 2.0).abs() < 1e-6 && (p[2] - 3.0).abs() < 1e-6
+        );
 
         // Linear scale 1.0 -> ln(1.0) == 0 in log space.
         for s in cloud.scales[0] {
@@ -801,8 +852,18 @@ mod tests {
     #[wasm_bindgen_test]
     fn splat_round_trips_through_write_ply() {
         let mut buf = Vec::new();
-        buf.extend(splat_record([1.0, 2.0, 3.0], [0.5, 0.5, 0.5], [200, 100, 50, 200], [255, 128, 128, 128]));
-        buf.extend(splat_record([-4.0, 5.0, -6.0], [2.0, 1.0, 0.25], [10, 20, 30, 40], [128, 255, 128, 128]));
+        buf.extend(splat_record(
+            [1.0, 2.0, 3.0],
+            [0.5, 0.5, 0.5],
+            [200, 100, 50, 200],
+            [255, 128, 128, 128],
+        ));
+        buf.extend(splat_record(
+            [-4.0, 5.0, -6.0],
+            [2.0, 1.0, 0.25],
+            [10, 20, 30, 40],
+            [128, 255, 128, 128],
+        ));
 
         let cloud = parse_splat_buffer(&buf).expect("valid .splat buffer");
         let ply = write_ply(&cloud);

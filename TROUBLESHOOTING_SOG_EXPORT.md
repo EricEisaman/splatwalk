@@ -1,5 +1,17 @@
 # Troubleshooting: SOG Export "Unreachable" Error
 
+## Soft / mushy SOG vs sharp PLY preview (fidelity)
+
+If the SplatWalk viewport looks sharp but the exported SOG looks soft (or Frame looks nothing like the PLY):
+
+1. Check `lod-meta.json` inside the zip.
+2. **Bad (legacy):** `filenames` like `lod0/meta.json`, `lod1/meta.json` and `tree` with **no** `children` — one WebP over the whole scene AABB.
+3. **Good (spatial, PlayCanvas-like):** `filenames` like `0_0/meta.json`, `1_0/meta.json`, … and `tree.children` with multiple leaves.
+
+**Fix:** from the splatwalk repo run `npm run build:wasm` (syncs spatial WASM into `@splatwalk/core`), restart `npm run dev`, then re-export **Streamed LOD**. The demos reject the legacy single-leaf layout before download.
+
+---
+
 ## Your Issue
 ```
 Loading file: gothic_church.ply (269628213 bytes)
@@ -54,7 +66,7 @@ Reduce memory pressure by lowering SH settings:
 If you don't need detailed color variations:
 
 1. In **SOG Export** → **Settings**:
-   - **SH Degree**: Change from `3` → `0`
+   - **SH Degree**: Keep at `0` (the default) or set it to `0` if you raised it
 
 **What this does:**
 - Skips expensive SH encoding completely
@@ -111,22 +123,22 @@ Process the scene in sections:
 
 ### For 4.4M Splats
 ```
-SH Degree:        2 or 3 (quality preference)
+SH Degree:        0 (default; raise to 2–3 only if you need view-dependent color)
 SH Palette Size:  1024 or 2048  
 SH Iterations:    5 or 3
 Chunk Count:      256000 (default, OK)
-Chunk Extent:     16 (default, OK)
-LOD Levels:       1 (default, OK)
+Chunk Extent:     16 or less (capped to half the largest scene dimension)
+LOD Levels:       2 (default; use 2+ for coarse→fine streaming)
 ```
 
 ### For Maximum Compatibility
 ```
-SH Degree:        0  (base color only)
+SH Degree:        0  (base color only; default)
 SH Palette Size:  1024
 SH Iterations:    1
 Chunk Count:      256000
 Chunk Extent:     16
-LOD Levels:       1
+LOD Levels:       2  (multi-LOD streaming; set to 1 only if you want a single detail level)
 ```
 
 ---
@@ -182,12 +194,13 @@ If Test 3 succeeds:
 ## 📈 Next Steps
 
 ### Short Term
-1. Try **Single SOG export** with these settings:
-   - SH Degree: **2**
-   - SH Palette Size: **2048**
-   - SH Iterations: **5**
+1. Try **Streamed LOD export** with these settings:
+   - SH Degree: **0**
+   - LOD Levels: **2**
+   - SH Palette Size: **2048** (only matters if SH Degree > 0)
+   - SH Iterations: **5** (only matters if SH Degree > 0)
 
-2. If that works, gradually increase SH Palette Size and Degree
+2. If that works and you need more color fidelity, gradually increase SH Degree
 
 ### Medium Term (If Issues Persist)
 - File a bug report with:

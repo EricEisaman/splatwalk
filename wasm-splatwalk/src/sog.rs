@@ -48,18 +48,35 @@ impl RawPlane {
     /// VP8L (lossless), so the quantized codebook indices survive byte-exact.
     pub fn encode_webp(&self) -> Result<Vec<u8>, String> {
         if self.width == 0 || self.height == 0 {
-            return Err(format!("Invalid plane dimensions for {}: {}x{}", self.name, self.width, self.height));
+            return Err(format!(
+                "Invalid plane dimensions for {}: {}x{}",
+                self.name, self.width, self.height
+            ));
         }
         let expected_len = self.width * self.height * 4;
         if self.rgba.len() != expected_len {
-            return Err(format!("Plane {} has incorrect buffer size: got {}, expected {}", 
-                self.name, self.rgba.len(), expected_len));
+            return Err(format!(
+                "Plane {} has incorrect buffer size: got {}, expected {}",
+                self.name,
+                self.rgba.len(),
+                expected_len
+            ));
         }
         let mut out = Vec::new();
         let encoder = image_webp::WebPEncoder::new(&mut out);
         encoder
-            .encode(&self.rgba, self.width as u32, self.height as u32, image_webp::ColorType::Rgba8)
-            .map_err(|e| format!("WebP encode failed for {} ({}x{}): {}", self.name, self.width, self.height, e))?;
+            .encode(
+                &self.rgba,
+                self.width as u32,
+                self.height as u32,
+                image_webp::ColorType::Rgba8,
+            )
+            .map_err(|e| {
+                format!(
+                    "WebP encode failed for {} ({}x{}): {}",
+                    self.name, self.width, self.height, e
+                )
+            })?;
         Ok(out)
     }
 }
@@ -317,7 +334,9 @@ fn encode_quats(
                 continue;
             }
             // Inverse of decode `toComp(c) = ((c/255 - 0.5) * 2) / SQRT2`.
-            let byte = ((q[idx] * sqrt2 / 2.0 + 0.5) * 255.0).round().clamp(0.0, 255.0);
+            let byte = ((q[idx] * sqrt2 / 2.0 + 0.5) * 255.0)
+                .round()
+                .clamp(0.0, 255.0);
             rgba[base + out] = byte as u8;
             out += 1;
         }
@@ -362,7 +381,9 @@ fn encode_sh0(
             rgba[base + a] = nearest_codebook_index(&codebook, c[a]);
         }
         // v2 stores the already-sigmoided opacity byte directly in alpha.
-        let alpha = (sigmoid(cloud.opacity_logit[i]) * 255.0).round().clamp(0.0, 255.0);
+        let alpha = (sigmoid(cloud.opacity_logit[i]) * 255.0)
+            .round()
+            .clamp(0.0, 255.0);
         rgba[base + 3] = alpha as u8;
     }
 
@@ -412,7 +433,7 @@ fn encode_sh_n(
     // converting from the cloud's channel-major storage.
     crate::emit_progress("sh", Some(0.0));
     let mut vectors = vec![0.0f32; count * dim];
-    
+
     for i in 0..count {
         let src = i * src_stride;
         let dst = i * dim;
@@ -443,15 +464,17 @@ fn encode_sh_n(
     }
 
     // --- centroids plane (64 palette columns wide, `coeffs` texels each) ---
-    let centroids_width = SH_PALETTE_COLUMNS.checked_mul(coeffs)
+    let centroids_width = SH_PALETTE_COLUMNS
+        .checked_mul(coeffs)
         .unwrap_or(SH_PALETTE_COLUMNS);
     let centroids_height = clusters.div_ceil(SH_PALETTE_COLUMNS).max(1);
-    
+
     // Check for potential overflow in allocation
-    let centroids_pixel_count = centroids_width.checked_mul(centroids_height)
+    let centroids_pixel_count = centroids_width
+        .checked_mul(centroids_height)
         .and_then(|w| w.checked_mul(4))
         .unwrap_or(0);
-    
+
     if centroids_pixel_count == 0 || centroids_pixel_count > 512 * 1024 * 1024 {
         // Centroids plane too large; skip shN encoding
         crate::emit_progress("sh", Some(1.0));
@@ -466,7 +489,7 @@ fn encode_sh_n(
             bands: Some(degree),
         });
     }
-    
+
     let mut centroids_rgba = vec![0u8; centroids_pixel_count];
     for n in 0..clusters {
         let col = n % SH_PALETTE_COLUMNS;
@@ -506,7 +529,10 @@ fn encode_sh_n(
         codebook: Some(codebook),
         encoding: "kmeans-codebook".to_string(),
         // Decoder reads centroids first (index 5), then labels (index 6).
-        files: vec!["shN_centroids.webp".to_string(), "shN_labels.webp".to_string()],
+        files: vec![
+            "shN_centroids.webp".to_string(),
+            "shN_labels.webp".to_string(),
+        ],
         bands: Some(degree),
     })
 }
@@ -558,16 +584,21 @@ fn nearest_codebook_index(codebook: &[f32], value: f32) -> u8 {
 /// Minimal k-means over `count` vectors of length `dim`. Centroids are trained
 /// on a capped random-ish sample for speed, then every vector is assigned to its
 /// nearest centroid. Returns `(centroids[clusters * dim], labels[count])`.
-fn kmeans(vectors: &[f32], dim: usize, clusters: usize, iterations: usize) -> (Vec<f32>, Vec<usize>) {
+fn kmeans(
+    vectors: &[f32],
+    dim: usize,
+    clusters: usize,
+    iterations: usize,
+) -> (Vec<f32>, Vec<usize>) {
     if dim == 0 {
         return (vec![], vec![0; vectors.len()]);
     }
-    
+
     let count = vectors.len() / dim;
     if count == 0 {
         return (vec![], vec![]);
     }
-    
+
     let clusters = clusters.clamp(1, count.max(1));
 
     // Deterministic, well-spread initial centroids by striding the input.

@@ -213,7 +213,7 @@ export interface MeshSettings {
 }
 
 export interface SliceSettings {
-  /** Exported SH degree cap, 0..3 (default 3). */
+  /** Exported SH degree cap, 0..3 (default 0). */
   sh_degree?: number;
   /** shN k-means palette size (default 4096). */
   sh_cluster_count?: number;
@@ -223,7 +223,7 @@ export interface SliceSettings {
   chunk_count?: number;
   /** Soft chunk extent in meters (default 16). */
   chunk_extent?: number;
-  /** LOD levels, >= 1 (default 1). */
+  /** LOD levels, >= 1 (default 2). */
   lod_levels?: number;
 }
 

@@ -44,7 +44,7 @@
  *
  * // Stream chunks
  * const manifest = await adapter.getManifest();
- * const chunk = await adapter.fetchChunk('lod0/chunk0/means_l.webp');
+ * const chunk = await adapter.fetchChunk('0_0/means_l.webp');
  * ```
  *
  * ### Cloudinary with GitHub Secrets (Production)

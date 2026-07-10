@@ -13,7 +13,13 @@ import {
 import { splatwalk, type MeshSettings } from '@/wasm/bridge';
 import { SUPPORTED_SPLAT_EXTENSIONS } from '@/wasm/normalize';
 import { SliceArchive } from '@/wasm/sliceArchive';
-import type { SliceSettings } from '@/wasm/sogTypes';
+import {
+  clampSliceSettingsForScene,
+  DEFAULT_SLICE_SETTINGS,
+  inferPlyShDegree,
+  maxChunkExtentFromBounds,
+  type SliceSettings,
+} from '@/wasm/sogTypes';
 import type { UseBabylonViewer } from '@/composables/useBabylonViewer';
 
 /** Which SOG export to produce. */
@@ -74,6 +80,10 @@ export interface UseSplatFastNav {
   readonly progress: Ref<FastNavProgress | null>;
   /** Raw splat count of the loaded scene, or null before/while loading. */
   readonly splatCount: Ref<number | null>;
+  /** Highest SH degree present in the loaded file. */
+  readonly maxShDegree: Ref<number>;
+  /** Maximum chunk extent allowed for the loaded scene. */
+  readonly maxChunkExtent: Ref<number>;
   /** Validate, load, auto-run FAST NAV, then frame the player top-down. */
   readonly loadAndProcess: (file: File) => Promise<void>;
   /** Fetch an example splat from a URL, then run the same pipeline. */
@@ -114,6 +124,8 @@ export function useSplatFastNav(
   const phase = ref<FastNavUiPhase>('idle');
   const progress = ref<FastNavProgress | null>(null);
   const splatCount = ref<number | null>(null);
+  const maxShDegree = ref(DEFAULT_SLICE_SETTINGS.sh_degree);
+  const maxChunkExtent = ref(DEFAULT_SLICE_SETTINGS.chunk_extent);
   const isBusy = computed(() => status.value === 'loading' || status.value === 'processing');
 
   let wasmReady = false;
@@ -138,6 +150,8 @@ export function useSplatFastNav(
     phase.value = 'idle';
     progress.value = null;
     splatCount.value = null;
+    maxShDegree.value = DEFAULT_SLICE_SETTINGS.sh_degree;
+    maxChunkExtent.value = DEFAULT_SLICE_SETTINGS.chunk_extent;
     currentBytes = null;
     currentName = 'splat';
   };
@@ -166,6 +180,7 @@ export function useSplatFastNav(
       // Normalize to PLY once (WASM is ready above), then reuse the same bytes
       // for both the viewer and the nav pipeline.
       const bytes = await readSplatBytes(file);
+      maxShDegree.value = inferPlyShDegree(bytes);
       await viewer.loadGaussianSplat(bytes);
       appendLog('[INFO] Splat visualized.');
 
@@ -176,8 +191,13 @@ export function useSplatFastNav(
       try {
         const bounds = await splatwalk.getSplatBounds(bytes, { mode: 2, prune_floaters: false } as MeshSettings);
         splatCount.value = bounds.point_count;
+        maxChunkExtent.value = maxChunkExtentFromBounds({
+          min: bounds.oriented_min,
+          max: bounds.oriented_max,
+        });
       } catch {
         splatCount.value = null;
+        maxChunkExtent.value = DEFAULT_SLICE_SETTINGS.chunk_extent;
       }
 
       status.value = 'processing';
@@ -265,11 +285,15 @@ export function useSplatFastNav(
     if (!currentBytes) {
       throw new Error('No splat loaded to export.');
     }
+    const cappedSettings = clampSliceSettingsForScene(settings, {
+      maxShDegree: maxShDegree.value,
+      maxChunkExtent: maxChunkExtent.value,
+    });
     const result =
       mode === 'streamed'
-        ? await splatwalk.sliceSplat(currentBytes, settings)
-        : await splatwalk.convertToSog(currentBytes, settings);
-    const archive = new SliceArchive(result);
+        ? await splatwalk.sliceSplat(currentBytes, cappedSettings)
+        : await splatwalk.convertToSog(currentBytes, cappedSettings);
+    const archive = new SliceArchive(result, { streamed: mode === 'streamed' });
     archive.download(`${currentName}-sog`);
     return archive;
   };
@@ -283,6 +307,8 @@ export function useSplatFastNav(
     phase,
     progress,
     splatCount,
+    maxShDegree,
+    maxChunkExtent,
     loadAndProcess,
     loadExample,
     exportSog,

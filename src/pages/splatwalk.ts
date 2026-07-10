@@ -3,7 +3,14 @@ import { DropZone } from '../components/DropZone';
 import { splatwalk, type GroundFieldCellState, type MeshSettings } from '../wasm/bridge';
 import { normalizeSplatToPly, isSupportedSplatFile } from '../wasm/normalize';
 import { SliceArchive } from '../wasm/sliceArchive';
-import { DEFAULT_AUTO_SLICE_THRESHOLD, type SliceSettings } from '../wasm/sogTypes';
+import {
+    clampSliceSettingsForScene,
+    DEFAULT_AUTO_SLICE_THRESHOLD,
+    DEFAULT_SLICE_SETTINGS,
+    inferPlyShDegree,
+    maxChunkExtentFromBounds,
+    type SliceSettings,
+} from '../wasm/sogTypes';
 import { Mesh, VertexData, StandardMaterial, Color3, Tools, Material } from '@babylonjs/core';
 /// <reference types="vite/client" />
 import NavWorker from '../navigation/navmesh.worker?worker';
@@ -260,15 +267,30 @@ async function main() {
         });
     }
     const sogModeRadios = Array.from(document.getElementsByName('sogMode')) as HTMLInputElement[];
+    const sogLodLevelsInput = document.getElementById('paramSogLodLevels') as HTMLInputElement | null;
+    const sogLodLevelsWarning = document.getElementById('sogLodLevelsWarning');
     const isStreamedSogMode = (): boolean => sogModeRadios.find(r => r.checked)?.value !== 'single';
-    const updateSogModeVisibility = (): void => {
+    const updateSogExportUi = (): void => {
         const streamed = isStreamedSogMode();
         document.querySelectorAll('.sog-streamed-only').forEach(el => {
             (el as HTMLElement).style.display = streamed ? '' : 'none';
         });
+        const lodLevels = sogLodLevelsInput ? Number(sogLodLevelsInput.value) : NaN;
+        const showLodWarning = streamed && lodLevels === 1;
+        if (sogLodLevelsWarning) {
+            sogLodLevelsWarning.style.display = showLodWarning ? '' : 'none';
+        }
+        const exportBtn = document.getElementById('sogExportBtn') as HTMLButtonElement | null;
+        if (exportBtn && !exportBtn.disabled) {
+            exportBtn.textContent = streamed
+                ? 'EXPORT STREAMED SOG (.ZIP)'
+                : 'EXPORT SINGLE SOG (.ZIP)';
+        }
     };
-    sogModeRadios.forEach(r => r.addEventListener('change', updateSogModeVisibility));
-    updateSogModeVisibility();
+    sogModeRadios.forEach(r => r.addEventListener('change', updateSogExportUi));
+    sogLodLevelsInput?.addEventListener('input', updateSogExportUi);
+    sogLodLevelsInput?.addEventListener('change', updateSogExportUi);
+    updateSogExportUi();
 
     // Read the homepage SOG controls into a typed SliceSettings (omitted values
     // fall back to the WASM defaults).
@@ -415,8 +437,30 @@ async function main() {
                 return splatBytesPromise;
             };
 
+            let loadedShDegree = DEFAULT_SLICE_SETTINGS.sh_degree;
+            let maxChunkExtent = DEFAULT_SLICE_SETTINGS.chunk_extent;
+            const applySogCaps = (): void => {
+                const shInput = document.getElementById('paramSogShDegree') as HTMLInputElement | null;
+                if (shInput) {
+                    shInput.max = String(loadedShDegree);
+                    if (Number(shInput.value) > loadedShDegree) {
+                        shInput.value = String(loadedShDegree);
+                    }
+                }
+                const extentInput = document.getElementById('paramSogChunkExtent') as HTMLInputElement | null;
+                if (extentInput) {
+                    extentInput.max = String(maxChunkExtent);
+                    if (Number(extentInput.value) > maxChunkExtent) {
+                        extentInput.value = String(maxChunkExtent);
+                    }
+                }
+            };
+
             // 1. Visualize input splat (from the normalized PLY bytes).
-            await viewer.loadGaussianSplat(await readSplatBytes());
+            const visualBytes = await readSplatBytes();
+            loadedShDegree = inferPlyShDegree(visualBytes);
+            applySogCaps();
+            await viewer.loadGaussianSplat(visualBytes);
             currentMesh = null;
             currentMat = null;
             importedColliderGeometry = null;
@@ -437,18 +481,20 @@ async function main() {
                 const sogBtn = existingSogBtn.cloneNode(true) as HTMLButtonElement;
                 existingSogBtn.replaceWith(sogBtn);
                 sogBtn.addEventListener('click', async () => {
-                    const label = sogBtn.textContent;
                     try {
                         sogBtn.disabled = true;
                         sogBtn.textContent = 'EXPORTING…';
                         const bytes = await readSplatBytes();
-                        const settings = buildSliceSettings();
+                        const settings = clampSliceSettingsForScene(buildSliceSettings(), {
+                            maxShDegree: loadedShDegree,
+                            maxChunkExtent,
+                        });
                         const streamed = isStreamedSogMode();
                         console.log(`[INFO] Exporting ${streamed ? 'streamed LOD' : 'single'} SOG...`);
                         const result = streamed
                             ? await splatwalk.sliceSplat(bytes, settings)
                             : await splatwalk.convertToSog(bytes, settings);
-                        const archive = new SliceArchive(result);
+                        const archive = new SliceArchive(result, { streamed });
                         const base = file.name.replace(/\.(ply|spz|splat)$/i, '');
                         archive.download(`${base}-sog`);
                         const mb = (archive.byteLength / 1e6).toFixed(1);
@@ -460,7 +506,7 @@ async function main() {
                         setSogStatus(`Export failed: ${message}`);
                     } finally {
                         sogBtn.disabled = false;
-                        sogBtn.textContent = label;
+                        updateSogExportUi();
                     }
                 });
             }
@@ -471,6 +517,11 @@ async function main() {
                     const bytes = await readSplatBytes();
                     const bounds = await splatwalk.getSplatBounds(bytes, { mode: 2, prune_floaters: false } as MeshSettings);
                     const count = bounds.point_count;
+                    maxChunkExtent = maxChunkExtentFromBounds({
+                        min: bounds.oriented_min,
+                        max: bounds.oriented_max,
+                    });
+                    applySogCaps();
                     const large = count > DEFAULT_AUTO_SLICE_THRESHOLD;
                     setSogStatus(
                         large
@@ -481,7 +532,7 @@ async function main() {
                     if (large) {
                         const streamedRadio = sogModeRadios.find(r => r.value === 'streamed');
                         if (streamedRadio) streamedRadio.checked = true;
-                        updateSogModeVisibility();
+                        updateSogExportUi();
                         if (sogExportPanel && sogExportToggle && sogExportPanel.style.display === 'none') {
                             sogExportPanel.style.display = 'flex';
                             sogExportToggle.classList.add('open');

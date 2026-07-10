@@ -719,6 +719,12 @@ export default defineConfig({
   resolve: {
     alias: {
       '@': resolve(__dirname, 'src'),
+      // Worker imports `@splatwalk/core`. Point at local spatial pkg so streamed
+      // SOG export cannot silently use a stale published lod0/lod1 slicer.
+      '@splatwalk/core': resolve(
+        __dirname,
+        'pkg/wasm_splatwalk/wasm_splatwalk.js',
+      ),
     },
   },
   publicDir: 'public', // Explicitly enable public directory copying

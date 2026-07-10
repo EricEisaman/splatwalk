@@ -9,6 +9,7 @@ import type {
   StorageConfig,
   LocalStorageConfig,
   CloudinaryStorageConfig,
+  StorageAdapter,
   GitHubSecretReference,
   RenderSecretReference,
   NetlifySecretReference,
@@ -48,11 +49,11 @@ export async function exampleLocalZipUpload(file: File) {
   console.log('Storage info:', info);
 
   // Fetch a specific chunk
-  const chunkResponse = await adapter.fetchChunk('lod0/chunk0/means_l.webp');
+  const chunkResponse = await adapter.fetchChunk('0_0/means_l.webp');
   console.log('Fetched chunk:', chunkResponse.data.length, 'bytes');
 
   // For preview/caching, extract the entire bundle
-  const bundleMap = await adapter.extractBundle();
+  const bundleMap = await adapter.extractBundle?.();
   console.log('Extracted bundle with', bundleMap?.size, 'files');
 
   return { adapter, manifestUrl };
@@ -312,9 +313,7 @@ export async function exampleProductionSetup(
  * Efficiently stream chunks from storage, with caching.
  */
 export async function exampleStreamingChunks(
-  adapter: ReturnType<typeof createStorageAdapter> extends Promise<infer T> 
-    ? T['adapter']
-    : never
+  adapter: StorageAdapter
 ) {
   console.log('Fetching manifest...');
   const manifest = (await adapter.getManifest()) as {
@@ -374,6 +373,7 @@ export async function exampleSupersplatIntegration() {
 
   // Fetch experience settings (similar to supersplat flow)
   const manifest = await adapter.getManifest();
+  console.log('Supersplat integration manifest:', manifest);
 
   // Stream chunks similar to supersplat's streaming loader:
   // 1. Fetch lowest LOD first

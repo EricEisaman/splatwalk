@@ -34,7 +34,11 @@ import ViewInArIcon from '@mui/icons-material/ViewInAr';
 import { SceneCanvas } from '@/react/SceneCanvas';
 import { DEFAULT_EXAMPLE_SCENES } from '@/react/exampleScenes';
 import { useSplatFastNavR3F, type LogTag, type SogExportMode } from '@/react/useSplatFastNavR3F';
-import { DEFAULT_AUTO_SLICE_THRESHOLD, DEFAULT_SLICE_SETTINGS } from '@/wasm/sogTypes';
+import {
+  clampSliceSettingsForScene,
+  DEFAULT_AUTO_SLICE_THRESHOLD,
+  DEFAULT_SLICE_SETTINGS,
+} from '@/wasm/sogTypes';
 
 const tagColor: Record<LogTag, 'info' | 'warning' | 'error' | 'success' | 'secondary'> = {
   info: 'info',
@@ -58,6 +62,8 @@ export function SplatFastNavShowcase(): JSX.Element {
     phase,
     progress,
     splatCount,
+    maxShDegree,
+    maxChunkExtent,
     loadAndProcess,
     loadExample,
     exportSog,
@@ -87,6 +93,14 @@ export function SplatFastNavShowcase(): JSX.Element {
     setSogSummary(null);
     setSogMode(isLargeScene ? 'streamed' : 'single');
   }, [splatCount, isLargeScene]);
+
+  useEffect(() => {
+    setSliceForm((prev) => ({
+      ...prev,
+      sh_degree: Math.min(prev.sh_degree, maxShDegree),
+      chunk_extent: Math.min(prev.chunk_extent, maxChunkExtent),
+    }));
+  }, [maxChunkExtent, maxShDegree]);
 
   const progressText = useMemo(() => {
     if (!progress) return null;
@@ -121,6 +135,10 @@ export function SplatFastNavShowcase(): JSX.Element {
       ? `${splatCount.toLocaleString()} splats - large scene. Streamed LOD export recommended.`
       : `${splatCount.toLocaleString()} splats. Streamed or single SOG export available.`;
   }, [sogSummary, splatCount, isLargeScene]);
+
+  const showLodLevelsWarning = sogMode === 'streamed' && sliceForm.lod_levels === 1;
+  const sogExportButtonLabel =
+    sogMode === 'streamed' ? 'Export streamed SOG (.zip)' : 'Export single SOG (.zip)';
 
   const showDropZone = status === 'idle' || status === 'error';
 
@@ -160,7 +178,10 @@ export function SplatFastNavShowcase(): JSX.Element {
     setSogExporting(true);
     setSogSummary(null);
     try {
-      const archive = await exportSog(sogMode, { ...sliceForm });
+      const archive = await exportSog(
+        sogMode,
+        clampSliceSettingsForScene(sliceForm, { maxShDegree, maxChunkExtent })
+      );
       const mb = (archive.byteLength / 1e6).toFixed(1);
       setSogSummary(`Exported ${archive.chunkCount} chunk(s), ${archive.fileCount} files (${mb} MB).`);
     } catch (error) {
@@ -168,23 +189,28 @@ export function SplatFastNavShowcase(): JSX.Element {
     } finally {
       setSogExporting(false);
     }
-  }, [exportSog, sliceForm, sogExporting, sogMode]);
+  }, [exportSog, maxChunkExtent, maxShDegree, sliceForm, sogExporting, sogMode]);
 
   const numberField = (
     key: keyof typeof sliceForm,
     label: string,
-    props: { min?: number; max?: number; step?: number } = {}
-  ): JSX.Element => (
-    <TextField
-      type="number"
-      size="small"
-      fullWidth
-      label={label}
-      value={sliceForm[key]}
-      inputProps={props}
-      onChange={(e) => setSliceForm((prev) => ({ ...prev, [key]: Number(e.target.value) }))}
-    />
-  );
+    props: { min?: number; max?: number; step?: number; helperText?: string } = {}
+  ): JSX.Element => {
+    const { helperText, ...inputProps } = props;
+    return (
+      <TextField
+        type="number"
+        size="small"
+        fullWidth
+        label={label}
+        value={sliceForm[key]}
+        inputProps={inputProps}
+        helperText={helperText}
+        FormHelperTextProps={helperText ? { sx: { mx: 0 } } : undefined}
+        onChange={(e) => setSliceForm((prev) => ({ ...prev, [key]: Number(e.target.value) }))}
+      />
+    );
+  };
 
   return (
     <Container maxWidth="lg" sx={{ py: 4 }}>
@@ -379,13 +405,19 @@ export function SplatFastNavShowcase(): JSX.Element {
                   onChange={(_, value) => value && setSogMode(value as SogExportMode)}
                   sx={{ mb: 3 }}
                 >
-                  <ToggleButton value="streamed">LOD</ToggleButton>
+                  <ToggleButton value="streamed">Streamed LOD</ToggleButton>
                   <ToggleButton value="single">Single SOG</ToggleButton>
                 </ToggleButtonGroup>
 
                 <Grid container spacing={2}>
                   <Grid item xs={12} sm={4}>
-                    {numberField('sh_degree', 'SH Degree', { min: 0, max: 3, step: 1 })}
+                    {numberField('sh_degree', 'SH Degree', {
+                      min: 0,
+                      max: maxShDegree,
+                      step: 1,
+                      helperText:
+                        '0 = base color only (smaller/faster). Higher degrees keep more view-dependent color.',
+                    })}
                   </Grid>
                   <Grid item xs={12} sm={4}>
                     {numberField('sh_cluster_count', 'SH Palette Size', { min: 1, max: 65536, step: 256 })}
@@ -399,14 +431,26 @@ export function SplatFastNavShowcase(): JSX.Element {
                         {numberField('chunk_count', 'Splats / Chunk', { min: 1000, max: 4000000, step: 16000 })}
                       </Grid>
                       <Grid item xs={12} sm={4}>
-                        {numberField('chunk_extent', 'Chunk Extent (m)', { min: 0, max: 1000, step: 1 })}
+                        {numberField('chunk_extent', 'Chunk Extent (m)', { min: 0, max: maxChunkExtent, step: 1 })}
                       </Grid>
                       <Grid item xs={12} sm={4}>
-                        {numberField('lod_levels', 'LOD Levels', { min: 1, max: 6, step: 1 })}
+                        {numberField('lod_levels', 'LOD Levels', {
+                          min: 1,
+                          max: 6,
+                          step: 1,
+                          helperText:
+                            '2+ recommended for streaming (coarse base + full detail). 1 = full detail only, no multi-LOD.',
+                        })}
                       </Grid>
                     </>
                   )}
                 </Grid>
+
+                {showLodLevelsWarning && (
+                  <Alert severity="warning" sx={{ mt: 2 }}>
+                    LOD Levels is 1 — this export is a single detail level and will not stream coarse→fine.
+                  </Alert>
+                )}
 
                 <Button
                   sx={{ mt: 3 }}
@@ -414,7 +458,7 @@ export function SplatFastNavShowcase(): JSX.Element {
                   disabled={sogExporting}
                   onClick={() => void runSogExport()}
                 >
-                  {sogExporting ? 'Exporting...' : 'Export SOG (.zip)'}
+                  {sogExporting ? 'Exporting...' : sogExportButtonLabel}
                 </Button>
               </AccordionDetails>
             </Accordion>

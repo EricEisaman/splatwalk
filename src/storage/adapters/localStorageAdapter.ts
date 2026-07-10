@@ -22,12 +22,19 @@ export class LocalStorageAdapter implements StorageAdapter {
   private bundleFiles: Map<string, Uint8Array> | null = null;
   private manifestData: unknown | null = null;
   private objectUrls = new Map<string, string>();
+  private _metadata: StorageSourceMetadata;
 
   public constructor(
     public readonly config: LocalStorageConfig,
-    public readonly metadata: StorageSourceMetadata,
+    metadata: StorageSourceMetadata,
     private options: Required<StorageAdapterOptions>
-  ) {}
+  ) {
+    this._metadata = metadata;
+  }
+
+  public get metadata(): StorageSourceMetadata {
+    return this._metadata;
+  }
 
   /**
    * Create a local storage adapter from configuration.
@@ -94,8 +101,8 @@ export class LocalStorageAdapter implements StorageAdapter {
     // Update manifest URL to point to the extracted manifest
     const manifestPath = this.findManifestPath(files);
     if (manifestPath) {
-      this.metadata = {
-        ...this.metadata,
+      this._metadata = {
+        ...this._metadata,
         manifestUrl: this.createBlobUrl(manifestPath),
       };
     }
@@ -169,7 +176,8 @@ export class LocalStorageAdapter implements StorageAdapter {
       throw new Error(`File not found in bundle: ${path}`);
     }
 
-    const blob = new Blob([fileData], { type: this.getMimeType(path) });
+    const blobPart = new Uint8Array(fileData).buffer;
+    const blob = new Blob([blobPart], { type: this.getMimeType(path) });
     const url = URL.createObjectURL(blob);
     this.objectUrls.set(path, url);
     return url;

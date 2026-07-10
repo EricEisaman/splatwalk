@@ -16,6 +16,7 @@
 
 import { zipStore } from './zip';
 import type { SliceResult } from './sogTypes';
+import { assertStreamedSogFidelity } from './sogTypes';
 
 /** A live object-URL view of an archive. Call {@link BlobDirectory.dispose}
  *  when done to revoke every URL and free memory. */
@@ -29,7 +30,14 @@ export interface BlobDirectory {
 }
 
 export class SliceArchive {
-  public constructor(private readonly result: SliceResult) {}
+  public constructor(
+    private readonly result: SliceResult,
+    options: { streamed?: boolean } = {},
+  ) {
+    if (options.streamed) {
+      assertStreamedSogFidelity(this.manifest);
+    }
+  }
 
   /** All bundle files keyed by bundle-relative path. */
   public get files(): ReadonlyMap<string, Uint8Array> {

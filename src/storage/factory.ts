@@ -69,7 +69,10 @@ export function validateStorageConfig(config: StorageConfig): void {
           'Cloudinary storage requires cloudName and folder'
         );
       }
-      if (!/^[a-z0-9_-]+$/.test(config.cloudName)) {
+      if (
+        typeof config.cloudName === 'string' &&
+        !/^[a-z0-9_-]+$/.test(config.cloudName)
+      ) {
         throw new Error('Invalid Cloudinary cloud name');
       }
       break;

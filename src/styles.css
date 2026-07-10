@@ -1086,6 +1086,17 @@ input[type="radio"] {
   background: rgb(var(--neon-blue-rgb) / 0.06);
 }
 
+.sog-warning {
+  font-size: 0.72rem;
+  line-height: 1.4;
+  color: #f0c14b;
+  padding: 8px 10px;
+  border-radius: 4px;
+  background: rgba(240, 193, 75, 0.08);
+  border: 1px solid rgba(240, 193, 75, 0.35);
+  margin-bottom: var(--space-3);
+}
+
 .settings-panel input[type="number"] {
   background: rgba(0, 0, 0, 0.5);
   border: 1px solid #444;

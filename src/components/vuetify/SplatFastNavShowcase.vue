@@ -25,7 +25,12 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref, watch, type Compon
 
 import { useBabylonViewer } from '@/composables/useBabylonViewer';
 import { useSplatFastNav, type LogTag, type SogExportMode } from '@/composables/useSplatFastNav';
-import { DEFAULT_AUTO_SLICE_THRESHOLD, DEFAULT_SLICE_SETTINGS, type SliceSettings } from '@/wasm/sogTypes';
+import {
+  clampSliceSettingsForScene,
+  DEFAULT_AUTO_SLICE_THRESHOLD,
+  DEFAULT_SLICE_SETTINGS,
+  type SliceSettings,
+} from '@/wasm/sogTypes';
 
 const props = withDefaults(
   defineProps<{
@@ -70,12 +75,12 @@ const isFullscreen = ref(false);
 const rightHanded = new URLSearchParams(window.location.search).get('rh') === '1';
 
 const babylon = useBabylonViewer(canvasRef, { rightHanded });
-const { status, statusMessage, errorMessage, logs, isBusy, phase, progress, splatCount, loadAndProcess, loadExample, exportSog, reset } =
+const { status, statusMessage, errorMessage, logs, isBusy, phase, progress, splatCount, maxShDegree, maxChunkExtent, loadAndProcess, loadExample, exportSog, reset } =
   useSplatFastNav(babylon, { recovery: props.recovery, strayTrim: props.strayTrim, prune: props.prune });
 
 // --- Streamed SOG export -------------------------------------------------
 // Reactive slice settings seeded from the defaults + any `slice` prop override.
-const sliceForm = reactive<Required<SliceSettings>>({
+const sliceForm = reactive({
   sh_degree: props.slice.sh_degree ?? DEFAULT_SLICE_SETTINGS.sh_degree,
   sh_cluster_count: props.slice.sh_cluster_count ?? DEFAULT_SLICE_SETTINGS.sh_cluster_count,
   sh_iterations: props.slice.sh_iterations ?? DEFAULT_SLICE_SETTINGS.sh_iterations,
@@ -99,6 +104,11 @@ watch(splatCount, () => {
   sogMode.value = isLargeScene.value ? 'streamed' : 'single';
 });
 
+watch([maxShDegree, maxChunkExtent], () => {
+  sliceForm.sh_degree = Math.min(sliceForm.sh_degree, maxShDegree.value);
+  sliceForm.chunk_extent = Math.min(sliceForm.chunk_extent, maxChunkExtent.value);
+});
+
 const sogStatusText = computed(() => {
   if (sogSummary.value) return sogSummary.value;
   if (splatCount.value === null) return null;
@@ -107,12 +117,26 @@ const sogStatusText = computed(() => {
     : `${splatCount.value.toLocaleString()} splats. Streamed or single SOG export available.`;
 });
 
+const showLodLevelsWarning = computed(
+  () => sogMode.value === 'streamed' && sliceForm.lod_levels === 1,
+);
+
+const sogExportButtonLabel = computed(() =>
+  sogMode.value === 'streamed' ? 'Export streamed SOG (.zip)' : 'Export single SOG (.zip)',
+);
+
 async function runSogExport(): Promise<void> {
   if (sogExporting.value) return;
   sogExporting.value = true;
   sogSummary.value = null;
   try {
-    const archive = await exportSog(sogMode.value, { ...sliceForm });
+    const archive = await exportSog(
+      sogMode.value,
+      clampSliceSettingsForScene(sliceForm, {
+        maxShDegree: maxShDegree.value,
+        maxChunkExtent: maxChunkExtent.value,
+      })
+    );
     const mb = (archive.byteLength / 1e6).toFixed(1);
     sogSummary.value = `Exported ${archive.chunkCount} chunk(s), ${archive.fileCount} files (${mb} MB).`;
   } catch (error) {
@@ -348,7 +372,7 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
               </div>
 
               <v-btn-toggle v-model="sogMode" mandatory density="comfortable" color="primary" class="mb-4">
-                <v-btn value="streamed" prepend-icon="mdi-layers-triple">LOD</v-btn>
+                <v-btn value="streamed" prepend-icon="mdi-layers-triple">Streamed LOD</v-btn>
                 <v-btn value="single" prepend-icon="mdi-file-outline">Single SOG</v-btn>
               </v-btn-toggle>
 
@@ -356,8 +380,10 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
                 <v-col cols="12" sm="4">
                   <v-text-field
                     v-model.number="sliceForm.sh_degree"
-                    type="number" min="0" max="3" step="1"
-                    label="SH Degree" density="compact" variant="outlined" hide-details
+                    type="number" min="0" :max="maxShDegree" step="1"
+                    label="SH Degree" density="compact" variant="outlined"
+                    hint="0 = base color only (smaller/faster). Higher degrees keep more view-dependent color."
+                    persistent-hint
                   />
                 </v-col>
                 <v-col cols="12" sm="4">
@@ -385,7 +411,7 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
                   <v-col cols="12" sm="4">
                     <v-text-field
                       v-model.number="sliceForm.chunk_extent"
-                      type="number" min="0" max="1000" step="1"
+                      type="number" min="0" :max="maxChunkExtent" step="1"
                       label="Chunk Extent (m)" density="compact" variant="outlined" hide-details
                     />
                   </v-col>
@@ -393,11 +419,23 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
                     <v-text-field
                       v-model.number="sliceForm.lod_levels"
                       type="number" min="1" max="6" step="1"
-                      label="LOD Levels" density="compact" variant="outlined" hide-details
+                      label="LOD Levels" density="compact" variant="outlined"
+                      hint="2+ recommended for streaming (coarse base + full detail). 1 = full detail only, no multi-LOD."
+                      persistent-hint
                     />
                   </v-col>
                 </template>
               </v-row>
+
+              <v-alert
+                v-if="showLodLevelsWarning"
+                class="mt-3"
+                type="warning"
+                density="compact"
+                variant="tonal"
+              >
+                LOD Levels is 1 — this export is a single detail level and will not stream coarse→fine.
+              </v-alert>
 
               <v-btn
                 class="mt-4"
@@ -406,7 +444,7 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
                 prepend-icon="mdi-download"
                 @click="runSogExport"
               >
-                Export SOG (.zip)
+                {{ sogExportButtonLabel }}
               </v-btn>
             </template>
           </v-expansion-panel>

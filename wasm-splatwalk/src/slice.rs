@@ -31,19 +31,19 @@ pub struct SliceParams {
     /// Soft cap on a chunk's world-space extent (meters); chunks are cut early
     /// when exceeded to preserve spatial locality.
     pub chunk_extent: f64,
-    /// Number of LOD levels (>=1). Level 0 is coarsest; the last is full detail.
+    /// Number of LOD levels (>=1). Level 0 is finest; higher levels are coarser.
     pub lod_levels: usize,
 }
 
 impl Default for SliceParams {
     fn default() -> Self {
         Self {
-            sh_degree: 3,
+            sh_degree: 0,
             sh_cluster_count: 4096,
             sh_iterations: 10,
             chunk_count: 256_000,
             chunk_extent: 16.0,
-            lod_levels: 1,
+            lod_levels: 2,
         }
     }
 }
@@ -100,7 +100,7 @@ pub struct SliceManifest {
 
 use std::collections::HashMap;
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct BjsLodEntry {
     file: usize,
     offset: usize,
@@ -138,11 +138,10 @@ struct BjsLodMeta {
 
 /// Slice a full-fidelity cloud into a BJS 9.15-compatible streamed-SOG manifest.
 ///
-/// Each LOD level maps to one SOG meta.json + WebP planes. The `lod-meta.json`
-/// `tree` is a single root leaf node whose `lods` map covers all levels, so BJS
-/// can stream the finest available level based on camera distance. For multi-GB
-/// source files the slicing stride thins the cloud at coarser levels without
-/// holding the full cloud twice in memory.
+/// Each finest-level spatial chunk becomes a renderable leaf. Every leaf carries
+/// all available LOD levels, and each `(level, leaf)` pair maps to one SOG v2
+/// `meta.json` + WebP plane directory. Babylon streams the highest numeric LOD
+/// as each leaf's permanent base layer, then refines toward LOD 0 near camera.
 pub fn slice(cloud: &FullSplatCloud, params: &SliceParams) -> Result<SliceManifest, String> {
     let total = cloud.len();
     if total == 0 {
@@ -152,90 +151,89 @@ pub fn slice(cloud: &FullSplatCloud, params: &SliceParams) -> Result<SliceManife
     // Guard against overflow on very large clouds (multi-GB source files).
     let levels = params.lod_levels.max(1).min(8);
 
-    let order = morton_order(cloud);
+    let chunks = {
+        let order = morton_order(cloud);
+        chunk_indices(cloud, &order, params)
+    };
+    if chunks.is_empty() {
+        return Err("Slice produced no chunks — cloud may be too small.".to_string());
+    }
 
     let mut files: Vec<SliceTextFile> = Vec::new();
     let mut binaries: Vec<SliceBinaryFile> = Vec::new();
-    let mut filenames: Vec<String> = Vec::with_capacity(levels);
-    let mut lods: HashMap<String, BjsLodEntry> = HashMap::with_capacity(levels);
+    let mut filenames: Vec<String> = Vec::with_capacity(levels * chunks.len());
+    let mut chunk_lods: Vec<HashMap<String, BjsLodEntry>> = (0..chunks.len())
+        .map(|_| HashMap::with_capacity(levels))
+        .collect();
     let mut per_level_counts: Vec<usize> = Vec::with_capacity(levels);
-    let mut global_chunk_count = 0usize;
     let mut file_index = 0usize;
 
     for level in 0..levels {
         // Level 0 = finest (BJS/PC convention). Coarser levels subsample.
         // stride = 1 at finest level; doubles per coarser step.
         let stride = 1usize << level;
-        // Clamp to avoid zero-length level on very small clouds.
-        let level_indices: Vec<usize> = order
-            .iter()
-            .copied()
-            .step_by(stride.max(1))
-            .take(total.saturating_div(stride.max(1)).max(1))
-            .collect();
+        let mut level_count = 0usize;
 
-        if level_indices.is_empty() {
-            continue;
-        }
+        for (chunk_index, chunk) in chunks.iter().enumerate() {
+            // Clamp to at least one splat so tiny chunks still provide every LOD
+            // Babylon expects when it installs each leaf's permanent base layer.
+            let level_indices: Vec<usize> = chunk.iter().copied().step_by(stride.max(1)).collect();
 
-        let dir = format!("lod{}", level);
-        let sub = cloud.select(&level_indices);
-        let dataset = encode_sog(
-            &sub,
-            params.sh_degree,
-            params.sh_cluster_count,
-            params.sh_iterations,
-        );
+            if level_indices.is_empty() {
+                continue;
+            }
 
-        let meta_path = format!("{}/meta.json", dir);
-        let meta_json = serde_json::to_string(&dataset.meta)
-            .map_err(|e| format!("Failed to serialize chunk meta: {}", e))?;
-        files.push(SliceTextFile {
-            path: meta_path.clone(),
-            contents: meta_json,
-        });
+            let dir = format!("{}_{}", level, chunk_index);
+            let sub = cloud.select(&level_indices);
+            let dataset = encode_sog(
+                &sub,
+                params.sh_degree,
+                params.sh_cluster_count,
+                params.sh_iterations,
+            );
 
-        for plane in &dataset.planes {
-            let bytes = plane.encode_webp()?;
-            binaries.push(SliceBinaryFile {
-                path: format!("{}/{}", dir, plane.name),
-                bytes,
+            let meta_path = format!("{}/meta.json", dir);
+            let meta_json = serde_json::to_string(&dataset.meta)
+                .map_err(|e| format!("Failed to serialize chunk meta: {}", e))?;
+            files.push(SliceTextFile {
+                path: meta_path.clone(),
+                contents: meta_json,
             });
+
+            for plane in &dataset.planes {
+                let bytes = plane.encode_webp()?;
+                binaries.push(SliceBinaryFile {
+                    path: format!("{}/{}", dir, plane.name),
+                    bytes,
+                });
+            }
+
+            filenames.push(meta_path);
+            chunk_lods[chunk_index].insert(
+                level.to_string(),
+                BjsLodEntry {
+                    file: file_index,
+                    offset: 0,
+                    count: level_indices.len(),
+                },
+            );
+            level_count += level_indices.len();
+            file_index += 1;
         }
 
-        filenames.push(meta_path);
-        lods.insert(
-            level.to_string(),
-            BjsLodEntry {
-                file: file_index,
-                offset: 0,
-                count: level_indices.len(),
-            },
-        );
-        per_level_counts.push(level_indices.len());
-        file_index += 1;
-        global_chunk_count += 1;
+        per_level_counts.push(level_count);
     }
 
     if filenames.is_empty() {
         return Err("Slice produced no LOD levels — cloud may be too small.".to_string());
     }
 
-    let (world_min, world_max) = bounds_all(cloud);
-    let root_node = BjsLodNode {
-        bound: BjsBound {
-            min: [world_min[0] as f64, world_min[1] as f64, world_min[2] as f64],
-            max: [world_max[0] as f64, world_max[1] as f64, world_max[2] as f64],
-        },
-        children: None,
-        lods: Some(lods),
-    };
+    let root_node = build_lod_tree(cloud, &chunks, &chunk_lods, 0, chunks.len());
 
-    // `count` = finest-level splat count (PC v1: total across all LOD levels
-    // excluding environment; for our single-leaf tree, level 0 is the finest).
+    // `count` = finest-level splat count (PC v1: total excluding environment).
     let lod_meta = BjsLodMeta {
-        version: 1,
-        lod_levels: file_index,
+        version: LOD_META_VERSION,
+        lod_levels: levels,
         count: total,
         counts: per_level_counts,
         filenames: filenames.clone(),
@@ -250,7 +248,7 @@ pub fn slice(cloud: &FullSplatCloud, params: &SliceParams) -> Result<SliceManife
         files,
         binaries,
         splat_count: total,
-        chunk_count: global_chunk_count,
+        chunk_count: file_index,
     })
 }
 
@@ -288,15 +286,23 @@ pub fn encode_single(
     );
     let splat_count = cloud.len();
     let lod_meta = BjsLodMeta {
-        version: 1,
+        version: LOD_META_VERSION,
         lod_levels: 1,
         count: splat_count,
         counts: vec![splat_count],
         filenames: vec!["meta.json".to_string()],
         tree: BjsLodNode {
             bound: BjsBound {
-                min: [world_min[0] as f64, world_min[1] as f64, world_min[2] as f64],
-                max: [world_max[0] as f64, world_max[1] as f64, world_max[2] as f64],
+                min: [
+                    world_min[0] as f64,
+                    world_min[1] as f64,
+                    world_min[2] as f64,
+                ],
+                max: [
+                    world_max[0] as f64,
+                    world_max[1] as f64,
+                    world_max[2] as f64,
+                ],
             },
             children: None,
             lods: Some(lods),
@@ -369,9 +375,23 @@ fn split3(v: u32) -> u64 {
 
 /// Partition Morton-ordered `indices` into chunks bounded by both a target
 /// splat count and a soft world-space extent.
-fn chunk_indices(cloud: &FullSplatCloud, indices: &[usize], params: &SliceParams) -> Vec<Vec<usize>> {
+///
+/// Extent cuts only apply after a chunk has enough splats. Otherwise Morton
+/// curve jumps in large scenes create tens of thousands of tiny leaves (each
+/// with its own WebP set) — sharp but unhostable, and nothing like PlayCanvas
+/// streamed SOG (~tens of files, not tens of thousands).
+fn chunk_indices(
+    cloud: &FullSplatCloud,
+    indices: &[usize],
+    params: &SliceParams,
+) -> Vec<Vec<usize>> {
     let target = params.chunk_count.max(1);
     let extent = params.chunk_extent as f32;
+    // Require a meaningful fill before extent can cut. Too low → tens of
+    // thousands of tiny leaves (unhostable). Too high → single mushy AABB.
+    // ~target/8 keeps warehouse-scale scenes in tens of leaves (hundreds of
+    // files), in the same ballpark as PlayCanvas streamed examples.
+    let min_for_extent_split = (target / 8).max(8_192);
     let mut chunks: Vec<Vec<usize>> = Vec::new();
     let mut current: Vec<usize> = Vec::new();
     let mut cmin = [f32::INFINITY; 3];
@@ -385,8 +405,12 @@ fn chunk_indices(cloud: &FullSplatCloud, indices: &[usize], params: &SliceParams
             nmin[a] = nmin[a].min(p[a]);
             nmax[a] = nmax[a].max(p[a]);
         }
-        let span = (nmax[0] - nmin[0]).max(nmax[1] - nmin[1]).max(nmax[2] - nmin[2]);
-        let exceeds_extent = extent > 0.0 && !current.is_empty() && span > extent;
+        let span = (nmax[0] - nmin[0])
+            .max(nmax[1] - nmin[1])
+            .max(nmax[2] - nmin[2]);
+        let exceeds_extent = extent > 0.0
+            && current.len() >= min_for_extent_split
+            && span > extent;
 
         if !current.is_empty() && (current.len() >= target || exceeds_extent) {
             chunks.push(std::mem::take(&mut current));
@@ -404,6 +428,45 @@ fn chunk_indices(cloud: &FullSplatCloud, indices: &[usize], params: &SliceParams
         chunks.push(current);
     }
     chunks
+}
+
+fn build_lod_tree(
+    cloud: &FullSplatCloud,
+    chunks: &[Vec<usize>],
+    chunk_lods: &[HashMap<String, BjsLodEntry>],
+    start: usize,
+    end: usize,
+) -> BjsLodNode {
+    if end <= start + 1 {
+        let (min, max) = bounds(cloud, &chunks[start]);
+        return BjsLodNode {
+            bound: BjsBound {
+                min: [min[0] as f64, min[1] as f64, min[2] as f64],
+                max: [max[0] as f64, max[1] as f64, max[2] as f64],
+            },
+            children: None,
+            lods: Some(chunk_lods[start].clone()),
+        };
+    }
+
+    let mid = start + (end - start) / 2;
+    let left = build_lod_tree(cloud, chunks, chunk_lods, start, mid);
+    let right = build_lod_tree(cloud, chunks, chunk_lods, mid, end);
+    let min = [
+        left.bound.min[0].min(right.bound.min[0]),
+        left.bound.min[1].min(right.bound.min[1]),
+        left.bound.min[2].min(right.bound.min[2]),
+    ];
+    let max = [
+        left.bound.max[0].max(right.bound.max[0]),
+        left.bound.max[1].max(right.bound.max[1]),
+        left.bound.max[2].max(right.bound.max[2]),
+    ];
+    BjsLodNode {
+        bound: BjsBound { min, max },
+        children: Some(vec![left, right]),
+        lods: None,
+    }
 }
 
 fn bounds(cloud: &FullSplatCloud, indices: &[usize]) -> ([f32; 3], [f32; 3]) {
@@ -441,5 +504,127 @@ fn sanitize_bounds(min: &mut [f32; 3], max: &mut [f32; 3]) {
         if !max[a].is_finite() || max[a] < min[a] {
             max[a] = min[a];
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+    use std::collections::HashSet;
+
+    fn tiny_cloud(count: usize) -> FullSplatCloud {
+        let mut cloud = FullSplatCloud {
+            sh_degree: 0,
+            positions: Vec::with_capacity(count),
+            scales: Vec::with_capacity(count),
+            rotations: Vec::with_capacity(count),
+            opacity_logit: Vec::with_capacity(count),
+            sh0: Vec::with_capacity(count),
+            sh_rest: Vec::new(),
+        };
+        for i in 0..count {
+            cloud
+                .positions
+                .push([i as f32, (i % 2) as f32, (i % 3) as f32]);
+            cloud.scales.push([0.0, 0.0, 0.0]);
+            cloud.rotations.push([1.0, 0.0, 0.0, 0.0]);
+            cloud.opacity_logit.push(0.0);
+            cloud.sh0.push([0.0, 0.0, 0.0]);
+        }
+        cloud
+    }
+
+    fn collect_leaf_file_ids(node: &Value, file_count: usize, out: &mut Vec<usize>) {
+        if let Some(children) = node.get("children").and_then(Value::as_array) {
+            assert!(
+                node.get("lods").is_none(),
+                "internal nodes must not carry lods"
+            );
+            assert!(!children.is_empty(), "internal node must have children");
+            for child in children {
+                collect_leaf_file_ids(child, file_count, out);
+            }
+            return;
+        }
+
+        let lods = node
+            .get("lods")
+            .and_then(Value::as_object)
+            .expect("renderable Babylon leaf must carry lods");
+        assert!(lods.contains_key("0"), "leaf must contain finest LOD 0");
+        assert!(
+            lods.contains_key("1"),
+            "leaf must contain coarsest/base LOD 1"
+        );
+        for entry in lods.values() {
+            let file = entry
+                .get("file")
+                .and_then(Value::as_u64)
+                .expect("LOD entry must carry file index") as usize;
+            let count = entry
+                .get("count")
+                .and_then(Value::as_u64)
+                .expect("LOD entry must carry count");
+            assert!(file < file_count, "file index must reference filenames");
+            assert!(count > 0, "LOD entries must render at least one splat");
+            out.push(file);
+        }
+    }
+
+    #[test]
+    fn streamed_sog_manifest_is_babylon_safe_chunked_tree() {
+        let cloud = tiny_cloud(5);
+        let params = SliceParams {
+            sh_degree: 0,
+            sh_cluster_count: 1,
+            sh_iterations: 1,
+            chunk_count: 2,
+            chunk_extent: 0.0,
+            lod_levels: 2,
+        };
+
+        let manifest = slice(&cloud, &params).expect("slice succeeds");
+        let meta: Value = serde_json::from_str(&manifest.lod_meta_json).expect("valid json");
+        let filenames = meta
+            .get("filenames")
+            .and_then(Value::as_array)
+            .expect("filenames array");
+
+        assert_eq!(meta["version"], 1);
+        assert_eq!(meta["lodLevels"], 2);
+        assert_eq!(meta["count"], 5);
+        assert_eq!(meta["counts"], serde_json::json!([5, 3]));
+        assert_eq!(filenames.len(), manifest.chunk_count);
+        assert_eq!(manifest.chunk_count, 6);
+
+        let emitted_files: HashSet<&str> = manifest
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        for filename in filenames {
+            let path = filename.as_str().expect("filename string");
+            assert!(path.ends_with("/meta.json"));
+            assert!(emitted_files.contains(path), "{path} was not emitted");
+
+            let chunk_meta = manifest
+                .files
+                .iter()
+                .find(|file| file.path == path)
+                .expect("chunk meta exists");
+            let chunk_json: Value =
+                serde_json::from_str(&chunk_meta.contents).expect("chunk meta json");
+            assert_eq!(chunk_json["version"], 2);
+            assert!(chunk_json.get("means").is_some());
+            assert!(chunk_json.get("scales").is_some());
+            assert!(chunk_json.get("quats").is_some());
+            assert!(chunk_json.get("sh0").is_some());
+        }
+
+        let mut file_ids = Vec::new();
+        collect_leaf_file_ids(&meta["tree"], filenames.len(), &mut file_ids);
+        let unique_file_ids: HashSet<usize> = file_ids.into_iter().collect();
+        assert_eq!(unique_file_ids.len(), filenames.len());
     }
 }

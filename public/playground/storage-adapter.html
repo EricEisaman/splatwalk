@@ -630,7 +630,7 @@
         }
       }
 
-      // Load chunked SOG (lod-meta.json + chunks in lodN/chunkM/ directories)
+      // Load chunked SOG (lod-meta.json + chunks in {lod}_{chunk}/ directories)
       async function loadChunkedSog(bundleMap, manifest) {
         // Check for 'levels' (SOG format) or 'lods' (legacy format)
         const levels = manifest.levels || manifest.lods;

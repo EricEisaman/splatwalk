@@ -298,39 +298,44 @@ Bundle layout (paths are bundle-relative, ready to host as-is):
 
 ```none
 lod-meta.json
-lod0/chunk0/meta.json
-lod0/chunk0/means_l.webp        # 16-bit means, low byte
-lod0/chunk0/means_u.webp        # 16-bit means, high byte
-lod0/chunk0/scales.webp         # codebook-indexed log-scales
-lod0/chunk0/quats.webp          # largest-three packed rotation
-lod0/chunk0/sh0.webp            # codebook DC color (RGB) + opacity (A)
-lod0/chunk0/shN_centroids.webp  # SH palette centroids (when SH degree > 0)
-lod0/chunk0/shN_labels.webp     # per-splat palette index
-lod0/chunk1/...
+0_0/meta.json
+0_0/means_l.webp        # 16-bit means, low byte
+0_0/means_u.webp        # 16-bit means, high byte
+0_0/scales.webp         # codebook-indexed log-scales
+0_0/quats.webp          # largest-three packed rotation
+0_0/sh0.webp            # codebook DC color (RGB) + opacity (A)
+0_0/shN_centroids.webp  # SH palette centroids (when SH degree > 0)
+0_0/shN_labels.webp     # per-splat palette index
+0_1/...
+1_0/...
 ```
 
-`lod-meta.json` (interim schema, `version: 1`; will be reconciled with the
-final Babylon streaming contract):
+`lod-meta.json` is canonical PlayCanvas Streamed SOG v1 and also satisfies
+Babylon.js native `GaussianSplattingStream` metadata checks. Babylon requires the
+structural subset `lodLevels`, `filenames`, and `tree`; PlayCanvas v1 additionally
+requires `version: 1`, `count`, and `counts`:
 
 ```ts
 {
   version: 1;
-  splatCount: number;
-  shDegree: number;
-  chunkCountTarget: number;
-  chunkExtent: number;
-  levels: {
-    level: number;               // 0 = coarsest, last = full detail
-    splatCount: number;
-    chunks: {
-      id: number;
-      splatCount: number;
-      boundMin: [number, number, number];
-      boundMax: [number, number, number];
-      dir: string;               // e.g. "lod0/chunk0"
-      meta: string;              // "meta.json"
-    }[];
-  }[];
+  count: number;                 // finest/full-resolution Gaussian count
+  counts: number[];              // per-LOD counts; index 0 = finest
+  lodLevels: number;             // number of LOD levels
+  filenames: string[];           // e.g. "0_0/meta.json", "1_0/meta.json"
+  tree: {
+    bound: {
+      min: [number, number, number];
+      max: [number, number, number];
+    };
+    children?: unknown[];        // internal nodes
+    lods?: {
+      [level: string]: {
+        file: number;            // index into filenames
+        offset: number;          // first splat in that chunk
+        count: number;           // number of splats
+      };
+    };                           // renderable leaves
+  };
 }
 ```
 
@@ -365,18 +370,37 @@ All fields are optional and fall back to the defaults below:
 
 ```ts
 interface SliceSettings {
-  sh_degree?: number;        // exported SH degree cap, 0..3   (default 3)
+  sh_degree?: number;        // exported SH degree cap, 0..3   (default 0)
   sh_cluster_count?: number; // shN k-means palette size       (default 4096)
   sh_iterations?: number;    // shN k-means refinement passes  (default 10)
   chunk_count?: number;      // target splats per LOD chunk    (default 256000)
   chunk_extent?: number;     // soft chunk extent in meters    (default 16)
-  lod_levels?: number;       // LOD levels, >=1                (default 1)
+  lod_levels?: number;       // LOD levels, >=1                (default 2)
 }
 ```
+
+Streamed SOG export is canonical PlayCanvas Streamed SOG v1:
+
+- `lod-meta.json` contains `version: 1`, `count`, `counts`, `lodLevels`,
+  `filenames`, and `tree`.
+- `filenames` point to unbundled SOG v2 chunk metadata such as
+  `0_0/meta.json`, `0_1/meta.json`, and `1_0/meta.json`.
+- LOD `0` is finest/highest detail; higher numeric LODs are coarser.
+- Each renderable tree leaf has `lods` entries whose `file` values index into
+  `filenames`.
+- Babylon treats the highest numeric LOD on each leaf as the permanent base
+  layer, so every leaf must include that coarsest level.
 
 `sh_degree: 0` drops higher-order SH (no `shN` planes). Larger
 `sh_cluster_count` / `sh_iterations` improve SH fidelity at the cost of encode
 time; the shN k-means assignment is the slowest stage on very large scenes.
+
+Browser WASM note: the current `slice_splat(bytes, settings)` API receives the
+entire source as a `Uint8Array`, which wasm-bindgen copies into WASM memory.
+That API is appropriate for local demos and moderate uploads, but literal
+multi-GB files (for example 8GB geospatial scans) require a native/server or
+streaming ingestion path that does not copy the whole source into browser WASM
+memory at once.
 
 ### TypeScript bridge and `SliceArchive`
 
@@ -384,7 +408,7 @@ The bridge (`src/wasm/bridge.ts`) returns a universal, path-keyed `SliceResult`
 (`{ files: Map<string, Uint8Array>; lodMetaPath; splatCount; chunkCount }`):
 
 ```ts
-const result = await splatwalk.sliceSplat(bytes, { sh_degree: 3, lod_levels: 2 });
+const result = await splatwalk.sliceSplat(bytes, { sh_degree: 0, lod_levels: 2 });
 const archive = new SliceArchive(result);
 
 // 1) Download a store-only .zip (internal layout == hostable directory):
@@ -406,7 +430,9 @@ const dir = archive.createBlobDirectory();  // path -> blob: URL
 ### UI
 
 Both demos expose every slice parameter and default to streamed (LOD) export
-for scenes over 1,000,000 splats:
+for scenes over 1,000,000 splats. Streamed LOD defaults to `lod_levels: 2` and
+`sh_degree: 0` so a default export produces multi-LOD coarse→fine streaming
+without higher-order SH:
 
 - **Homepage** (plain DOM): a "Streamed SOG Export" panel in the setup section
   (`index.html`, wired in `src/pages/splatwalk.ts`).

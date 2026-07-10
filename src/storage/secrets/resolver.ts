@@ -34,7 +34,8 @@ interface CacheEntry {
  */
 function detectSecretPlatforms(): SecretPlatformDetector {
   // Check if we're in a Node.js environment
-  const isNode = typeof process !== 'undefined' && process.versions?.node;
+  const isNode =
+    typeof process !== 'undefined' && Boolean(process.versions?.node);
 
   const hasGitHub =
     isNode && process.env?.GITHUB_ACTIONS === 'true';
@@ -197,7 +198,7 @@ export class DefaultSecretsResolver implements SecretsResolver {
    */
   private async resolveGitHub(
     ref: Extract<SecretReference, { type: 'github' }>,
-    options: Required<SecretResolutionOptions>
+    _options: Required<SecretResolutionOptions>
   ): Promise<ResolvedSecret | undefined> {
     // In GitHub Actions, secrets are available as environment variables
     // They are automatically injected by the Actions runtime
@@ -214,7 +215,6 @@ export class DefaultSecretsResolver implements SecretsResolver {
 
     // If not in Actions, try GitHub API (requires token)
     if (ref.token || this.config.githubToken) {
-      const token = ref.token || this.config.githubToken;
       // Note: This would require authenticated API calls to GitHub
       // which is beyond the scope of client-side resolution.
       // Typically handled server-side in CI/CD contexts.

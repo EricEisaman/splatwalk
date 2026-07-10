@@ -22,7 +22,6 @@ interface GPUSplatContext {
 export class StreamingSOGLoader {
   private manifestCache: unknown | null = null;
   private loadedChunks = new Map<string, Uint8Array>();
-  private currentLodLevel = 0;
   private loadingPromises = new Map<string, Promise<Uint8Array>>();
 
   public constructor(
