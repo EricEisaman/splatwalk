@@ -298,6 +298,12 @@ pub struct MeshSettings {
     /// spawn points and agents co-located with the rendered splat and makes the +Y-up
     /// floor/clearance heuristics valid.
     pub flip_y: Option<bool>,
+    /// Uniform world scale applied to oriented splat positions and per-splat gaussian
+    /// scales inside `build_context` (default 1). Matches the renderer's environment
+    /// scale so collision / floor / navmesh bake in the same meters as the visible splat.
+    /// Region bounds and collision seeds are expected in this scaled world space already
+    /// (do not pre-scale them again here).
+    pub environment_scale: Option<f64>,
 }
 
 #[derive(Clone, Serialize)]

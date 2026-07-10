@@ -113,6 +113,11 @@ export interface UseSplatFastNav {
   readonly setCollisionBoundaryVisible: (visible: boolean) => void;
   /** Show or hide the green walkable navmesh overlay (click-to-move target). */
   readonly setNavMeshVisible: (visible: boolean) => void;
+  /**
+   * Apply absolute uniform environment scale to the splat, then re-run FAST NAV
+   * so collision / navmesh bake in the same world meters.
+   */
+  readonly applyEnvironmentScale: (scale: number) => Promise<void>;
   /** Reset back to the idle state, clearing logs and errors. */
   readonly reset: () => void;
 }
@@ -176,6 +181,7 @@ export function useSplatFastNav(
     currentCollisionArtifact = null;
     currentName = 'splat';
     currentNavMeshData = null;
+    babylon.viewer.value?.setEnvironmentScale(1);
   };
 
   const processFile = async (file: File): Promise<void> => {
@@ -192,6 +198,7 @@ export function useSplatFastNav(
       appendLog(`[INFO] Loading file: ${file.name} (${file.size} bytes)`);
 
       const viewer = babylon.initViewer();
+      viewer.setEnvironmentScale(1);
 
       if (!wasmReady) {
         appendLog('[WAIT] Initializing SplatWalk WASM...');
@@ -372,6 +379,66 @@ export function useSplatFastNav(
     babylon.viewer.value?.setNavMeshVisible(visible);
   };
 
+  const applyEnvironmentScale = async (scale: number): Promise<void> => {
+    if (isBusy.value) {
+      return;
+    }
+    if (!Number.isFinite(scale) || scale <= 0) {
+      throw new Error('Scale Environment must be a positive number.');
+    }
+    if (!currentBytes) {
+      throw new Error('Load a splat before applying environment scale.');
+    }
+    const viewer = babylon.viewer.value;
+    if (!viewer) {
+      throw new Error('Viewer is not ready.');
+    }
+
+    errorMessage.value = null;
+    viewer.setEnvironmentScale(scale);
+    appendLog(`[INFO] Environment scale set to ${scale}; re-running FAST NAV...`);
+    currentCollisionArtifact = null;
+    currentNavMeshData = null;
+
+    try {
+      status.value = 'processing';
+      statusMessage.value = 'Re-running FAST NAV at new scale...';
+      phase.value = 'idle';
+      progress.value = null;
+
+      const fastNav = await runFastNav({
+        viewer,
+        bytes: currentBytes,
+        onLog: appendLog,
+        onPhase: (next) => { phase.value = next; },
+        recovery: options.recovery,
+        strayTrim: options.strayTrim,
+        prune: options.prune,
+      });
+      currentNavMeshData = fastNav.navMeshData;
+      phase.value = 'done';
+      progress.value = null;
+
+      statusMessage.value = 'Framing the player (top-down)...';
+      const framing = viewer.focusOnPlayer();
+      if (framing) {
+        appendLog(
+          `[SUCCESS] Top-down view set above player at ` +
+            `${framing.player.map((v) => v.toFixed(2)).join(', ')}.`
+        );
+      }
+
+      status.value = 'done';
+      statusMessage.value = 'FAST NAV complete. Click the navmesh to move the player.';
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      errorMessage.value = detail;
+      appendLog(`[ERROR] ${detail}`);
+      status.value = 'error';
+      statusMessage.value = 'FAST NAV failed after scale.';
+    }
+  };
+
   return {
     status,
     statusMessage,
@@ -391,6 +458,7 @@ export function useSplatFastNav(
     exportCollisionMesh,
     setCollisionBoundaryVisible,
     setNavMeshVisible,
+    applyEnvironmentScale,
     reset,
   };
 }

@@ -78,7 +78,7 @@ const isFullscreen = ref(false);
 const rightHanded = new URLSearchParams(window.location.search).get('rh') === '1';
 
 const babylon = useBabylonViewer(canvasRef, { rightHanded });
-const { status, statusMessage, errorMessage, logs, isBusy, phase, progress, splatCount, maxShDegree, maxChunkExtent, loadAndProcess, loadExample, exportSog, exportNavmesh, generateCollisionBoundary, exportCollisionMesh, setCollisionBoundaryVisible, setNavMeshVisible, reset } =
+const { status, statusMessage, errorMessage, logs, isBusy, phase, progress, splatCount, maxShDegree, maxChunkExtent, loadAndProcess, loadExample, exportSog, exportNavmesh, generateCollisionBoundary, exportCollisionMesh, setCollisionBoundaryVisible, setNavMeshVisible, applyEnvironmentScale, reset } =
   useSplatFastNav(babylon, { recovery: props.recovery, strayTrim: props.strayTrim, prune: props.prune });
 
 // --- Streamed SOG export -------------------------------------------------
@@ -105,6 +105,9 @@ const navMeshVisible = ref(true);
 const collisionSummary = ref<string | null>(null);
 const navExporting = ref(false);
 const navSummary = ref<string | null>(null);
+const environmentScale = ref(1);
+const scaleApplying = ref(false);
+const scaleSummary = ref<string | null>(null);
 
 // Auto-pick the recommended mode whenever a new scene's count resolves; the
 // user can still flip it before exporting.
@@ -112,6 +115,8 @@ watch(splatCount, () => {
   collisionSummary.value = null;
   navSummary.value = null;
   sogSummary.value = null;
+  scaleSummary.value = null;
+  environmentScale.value = 1;
   navMeshVisible.value = true;
   sogMode.value = isLargeScene.value ? 'streamed' : 'single';
 });
@@ -202,6 +207,25 @@ async function runNavmeshExport(): Promise<void> {
 function onNavMeshVisible(visible: boolean): void {
   navMeshVisible.value = visible;
   setNavMeshVisible(visible);
+}
+
+async function runApplyEnvironmentScale(): Promise<void> {
+  if (scaleApplying.value || isBusy.value) return;
+  const scale = Number(environmentScale.value);
+  if (!Number.isFinite(scale) || scale <= 0) {
+    scaleSummary.value = 'Scale Environment must be a positive number.';
+    return;
+  }
+  scaleApplying.value = true;
+  scaleSummary.value = null;
+  try {
+    await applyEnvironmentScale(scale);
+    scaleSummary.value = `Environment scale applied: ${scale}.`;
+  } catch (error) {
+    scaleSummary.value = `Scale failed: ${error instanceof Error ? error.message : String(error)}`;
+  } finally {
+    scaleApplying.value = false;
+  }
 }
 
 // Human-readable progress suffix (e.g. "Pruning floaters 42%") when the worker
@@ -435,6 +459,31 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
                 >
                   Export navmesh (.nav)
                 </v-btn>
+              </div>
+
+              <div class="d-flex align-center flex-wrap ga-3 mb-4">
+                <v-text-field
+                  v-model.number="environmentScale"
+                  type="number"
+                  min="0.01"
+                  step="0.1"
+                  label="Scale Environment"
+                  density="compact"
+                  variant="outlined"
+                  hide-details
+                  style="max-width: 11rem"
+                  :disabled="isBusy || scaleApplying"
+                />
+                <v-btn
+                  color="secondary"
+                  size="small"
+                  :loading="scaleApplying"
+                  :disabled="isBusy"
+                  @click="runApplyEnvironmentScale"
+                >
+                  Apply
+                </v-btn>
+                <div v-if="scaleSummary" class="text-caption text-medium-emphasis">{{ scaleSummary }}</div>
               </div>
 
               <v-sheet

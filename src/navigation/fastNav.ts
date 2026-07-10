@@ -314,6 +314,7 @@ export function defaultFastMeshSettings(viewer: Viewer): MeshSettings {
     component_mode: 'largest',
     rotation: [rot.x, rot.y, rot.z],
     flip_y: viewer.isSplatYFlipped(),
+    environment_scale: viewer.getEnvironmentScale(),
   };
 }
 

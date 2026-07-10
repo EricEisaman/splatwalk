@@ -301,6 +301,11 @@ export interface MeshSettings {
      */
     output_space?: OutputSpaceSettings;
     flip_y?: boolean;
+    /**
+     * Uniform world scale for oriented splat positions / gaussian scales (default 1).
+     * Must match the renderer's environment scale so bake space aligns with the splat.
+     */
+    environment_scale?: number;
 }
 
 interface PendingCall {

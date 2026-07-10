@@ -1116,6 +1116,7 @@ async function main() {
                     component_mode: ((document.getElementById('paramComponentMode') as HTMLSelectElement | null)?.value as MeshSettings['component_mode']) ?? 'largest',
                     rotation: [rot.x, rot.y, rot.z],
                     flip_y: viewer.isSplatYFlipped(),
+                    environment_scale: viewer.getEnvironmentScale(),
                 };
 
                 if (includeRegion) {
@@ -1200,6 +1201,52 @@ async function main() {
             attachRotListener('rotX', 'x');
             attachRotListener('rotY', 'y');
             attachRotListener('rotZ', 'z');
+
+            // Scale Environment: absolute uniform scale + optional nav realign
+            const applyEnvironmentScaleBtn = document.getElementById('applyEnvironmentScaleBtn');
+            if (applyEnvironmentScaleBtn) {
+                applyEnvironmentScaleBtn.addEventListener('click', () => {
+                    const input = document.getElementById('paramEnvironmentScale') as HTMLInputElement | null;
+                    const scale = Number.parseFloat(input?.value ?? '');
+                    if (!Number.isFinite(scale) || scale <= 0) {
+                        console.warn('[WARN] Scale Environment must be a positive number.');
+                        return;
+                    }
+                    const previous = viewer.getEnvironmentScale();
+                    const ratio = scale / (previous > 0 ? previous : 1);
+
+                    // Keep seed UI in world space alongside the scaled splat.
+                    if (ratio !== 1) {
+                        for (const id of ['paramCollisionSeedX', 'paramCollisionSeedY', 'paramCollisionSeedZ'] as const) {
+                            const seedInput = document.getElementById(id) as HTMLInputElement | null;
+                            if (!seedInput) continue;
+                            const value = Number.parseFloat(seedInput.value);
+                            if (Number.isFinite(value)) {
+                                seedInput.value = (value * ratio).toFixed(3);
+                            }
+                        }
+                        viewer.scaleRegionSelection(ratio);
+                    }
+
+                    viewer.setEnvironmentScale(scale);
+
+                    // Imported collider buffers were captured in world space at import
+                    // time; force a fresh read from the scaled mesh on rebuild.
+                    importedColliderGeometry = null;
+                    generatedCollisionArtifact = null;
+
+                    if (navHasBeenGenerated) {
+                        if (realignNavTimer) clearTimeout(realignNavTimer);
+                        realignNavTimer = setTimeout(() => {
+                            realignNavTimer = null;
+                            console.log('[INFO] Environment scaled -- re-aligning navmesh to the new scale...');
+                            runNavmeshFromCollider(lastNavUsedFastPath).catch((error) => {
+                                logError(`Navmesh re-alignment after scale failed: ${error}`);
+                            });
+                        }, 350);
+                    }
+                });
+            }
 
             // 2.5 Region Selection Listeners
             const defineRegionBtn = document.getElementById('defineRegionBtn');

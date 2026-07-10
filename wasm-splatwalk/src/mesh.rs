@@ -316,9 +316,20 @@ fn default_field_basis() -> FieldBasis {
     }
 }
 
+fn environment_scale(settings: &MeshSettings) -> f64 {
+    match settings.environment_scale {
+        Some(s) if s.is_finite() && s > 0.0 => s,
+        _ => 1.0,
+    }
+}
+
 fn build_context(points: &[PointNormal], settings: &MeshSettings) -> ReconstructionContext {
     let min_alpha = settings.min_alpha.unwrap_or(0.05);
     let max_scale = settings.max_scale.unwrap_or(5.0);
+    let env_scale = environment_scale(settings);
+    // Filter against authoring-space gaussian scales; positions/scales are then
+    // multiplied by env_scale so world-space bake matches the renderer.
+    let max_scale_world = max_scale * env_scale;
     let rot_matrix = settings.rotation.as_ref().and_then(|rot| {
         if rot.len() == 3 {
             let q =
@@ -353,9 +364,17 @@ fn build_context(points: &[PointNormal], settings: &MeshSettings) -> Reconstruct
         }
 
         let oriented = PointNormal {
-            point: Point3::new(pt.x as f64, pt.y as f64, pt.z as f64),
+            point: Point3::new(
+                pt.x as f64 * env_scale,
+                pt.y as f64 * env_scale,
+                pt.z as f64 * env_scale,
+            ),
             normal: Vector3::new(norm.x as f64, norm.y as f64, norm.z as f64),
-            scale: p.scale,
+            scale: Vector3::new(
+                p.scale.x * env_scale,
+                p.scale.y * env_scale,
+                p.scale.z * env_scale,
+            ),
             opacity: p.opacity,
         };
 
@@ -393,9 +412,9 @@ fn build_context(points: &[PointNormal], settings: &MeshSettings) -> Reconstruct
         }
 
         if p.opacity <= min_alpha
-            || p.scale.x >= max_scale
-            || p.scale.y >= max_scale
-            || p.scale.z >= max_scale
+            || p.scale.x >= max_scale_world
+            || p.scale.y >= max_scale_world
+            || p.scale.z >= max_scale_world
         {
             continue;
         }

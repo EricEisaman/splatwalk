@@ -76,6 +76,7 @@ export function SplatFastNavShowcase(): JSX.Element {
     setCollisionBoundaryVisible,
     setNavMeshVisible,
     exportSog,
+    applyEnvironmentScale,
     reset,
   } = nav;
 
@@ -103,11 +104,16 @@ export function SplatFastNavShowcase(): JSX.Element {
   const [navMeshVisible, setNavMeshVisibleState] = useState(true);
   const [navExporting, setNavExporting] = useState(false);
   const [navSummary, setNavSummary] = useState<string | null>(null);
+  const [environmentScale, setEnvironmentScale] = useState(1);
+  const [scaleApplying, setScaleApplying] = useState(false);
+  const [scaleSummary, setScaleSummary] = useState<string | null>(null);
 
   useEffect(() => {
     setCollisionSummary(null);
     setNavSummary(null);
     setSogSummary(null);
+    setScaleSummary(null);
+    setEnvironmentScale(1);
     setNavMeshVisibleState(true);
     setSogMode(isLargeScene ? 'streamed' : 'single');
   }, [splatCount, isLargeScene]);
@@ -251,6 +257,25 @@ export function SplatFastNavShowcase(): JSX.Element {
       setNavExporting(false);
     }
   }, [exportNavmesh, navExporting]);
+
+  const runApplyEnvironmentScale = useCallback(async (): Promise<void> => {
+    if (scaleApplying || isBusy) return;
+    const scale = Number(environmentScale);
+    if (!Number.isFinite(scale) || scale <= 0) {
+      setScaleSummary('Scale Environment must be a positive number.');
+      return;
+    }
+    setScaleApplying(true);
+    setScaleSummary(null);
+    try {
+      await applyEnvironmentScale(scale);
+      setScaleSummary(`Environment scale applied: ${scale}.`);
+    } catch (error) {
+      setScaleSummary(`Scale failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setScaleApplying(false);
+    }
+  }, [applyEnvironmentScale, environmentScale, isBusy, scaleApplying]);
 
   const numberField = (
     key: keyof typeof sliceForm,
@@ -459,6 +484,33 @@ export function SplatFastNavShowcase(): JSX.Element {
                   <Button startIcon={<DownloadIcon />} disabled={navExporting} onClick={() => void runNavmeshExport()}>
                     Export navmesh (.nav)
                   </Button>
+                </Box>
+
+                <Box sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 1.5, mb: 2 }}>
+                  <TextField
+                    type="number"
+                    size="small"
+                    label="Scale Environment"
+                    value={environmentScale}
+                    disabled={isBusy || scaleApplying}
+                    inputProps={{ min: 0.01, step: 0.1 }}
+                    onChange={(e) => setEnvironmentScale(Number(e.target.value))}
+                    sx={{ maxWidth: 180 }}
+                  />
+                  <Button
+                    size="small"
+                    variant="contained"
+                    color="secondary"
+                    disabled={isBusy || scaleApplying}
+                    onClick={() => void runApplyEnvironmentScale()}
+                  >
+                    {scaleApplying ? 'Applying…' : 'Apply'}
+                  </Button>
+                  {scaleSummary && (
+                    <Typography variant="caption" color="text.secondary">
+                      {scaleSummary}
+                    </Typography>
+                  )}
                 </Box>
 
                 <Paper

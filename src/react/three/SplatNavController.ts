@@ -79,6 +79,8 @@ export class SplatNavController {
   private pointerDown: { x: number; y: number } | null = null;
   /** Visual toggle only — overlay stays raycastable for click-to-move when hidden. */
   private navMeshOverlayShown = true;
+  /** Absolute uniform environment scale (default 1). Does not scale player/NPC markers. */
+  private _environmentScale = 1;
   private onPointerDown = (e: PointerEvent): void => {
     this.pointerDown = { x: e.clientX, y: e.clientY };
   };
@@ -170,6 +172,28 @@ export class SplatNavController {
     }
   }
 
+  /** Absolute uniform environment scale applied to the splat group. */
+  public getEnvironmentScale(): number {
+    return this._environmentScale;
+  }
+
+  /**
+   * Set absolute uniform environment scale on the splat group (preserving Y-flip).
+   * Floor / collision / navmesh overlays are rebuilt from WASM with matching
+   * `environment_scale` and are not transform-scaled here.
+   */
+  public setEnvironmentScale(scale: number): void {
+    if (!Number.isFinite(scale) || scale <= 0) {
+      console.warn(`[WARN] Ignoring invalid environment scale: ${scale}`);
+      return;
+    }
+    this._environmentScale = scale;
+    if (this.splatGroup) {
+      this.splatGroup.scale.set(scale, -scale, scale);
+    }
+    console.log(`[INFO] Environment scale set to ${scale}.`);
+  }
+
   /** Render a splat from raw bytes (PLY). Replaces any previously loaded splat. */
   public async loadSplat(bytes: Uint8Array): Promise<void> {
     if (!this.handles || !this.world) throw new Error('Controller not attached to a scene.');
@@ -179,7 +203,8 @@ export class SplatNavController {
     // Y-flip the raw splat (matches Babylon's loader). Under the Z-mirrored
     // `world`, the net transform is a proper rotation, so the splat is upright
     // AND un-mirrored (chirality matches Babylon).
-    group.scale.set(1, -1, 1);
+    const s = this._environmentScale;
+    group.scale.set(s, -s, s);
     this.world.add(group);
     this.splatGroup = group;
 
@@ -386,6 +411,7 @@ export class SplatNavController {
   /** Tear down splat, overlays and crowd back to an empty scene. */
   public async reset(): Promise<void> {
     this.destroyCrowd();
+    this._environmentScale = 1;
     if (this.world) {
       if (this.floorMesh) {
         this.world.remove(this.floorMesh);

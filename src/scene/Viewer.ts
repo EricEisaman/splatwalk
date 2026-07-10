@@ -309,6 +309,8 @@ export class Viewer {
     private _debugPlyMeshes: AbstractMesh[] = [];
     private _streamMeshesHiddenForDebug: AbstractMesh[] = [];
     private rotation: { x: number, y: number, z: number } = { x: 0, y: 0, z: 0 };
+    /** Absolute uniform environment scale (default 1). Does not scale player/NPC markers. */
+    private _environmentScale = 1;
     private readonly _perfHud = new SplatPerfHud();
 
     /**
@@ -344,6 +346,7 @@ export class Viewer {
                 // Usually the first mesh is the root or the splat
                 this.splatMesh = result.meshes[0];
                 this.splatMeshes = result.meshes;
+                this.applyEnvironmentScaleToMeshes();
 
                 // Auto-focus the camera
                 const worldExtends = this.scene.getWorldExtends();
@@ -426,6 +429,49 @@ export class Viewer {
 
     public getSplatRotation(): { x: number, y: number, z: number } {
         return { ...this.rotation };
+    }
+
+    /** Absolute uniform environment scale applied to the splat and collider overlays. */
+    public getEnvironmentScale(): number {
+        return this._environmentScale;
+    }
+
+    /**
+     * Set absolute uniform environment scale. Scales the splat mesh (preserving Y-flip
+     * sign) and any collider overlay meshes. Player/NPC markers are left unchanged.
+     */
+    public setEnvironmentScale(scale: number): void {
+        if (!Number.isFinite(scale) || scale <= 0) {
+            console.warn(`[WARN] Ignoring invalid environment scale: ${scale}`);
+            return;
+        }
+        this._environmentScale = scale;
+        this.applyEnvironmentScaleToMeshes();
+        console.log(`[INFO] Environment scale set to ${scale}.`);
+    }
+
+    private applyEnvironmentScaleToMeshes(): void {
+        const s = this._environmentScale;
+        const targets = new Set<AbstractMesh>();
+        if (this.splatMesh) {
+            targets.add(this.splatMesh);
+        }
+        for (const mesh of this.splatMeshes) {
+            targets.add(mesh);
+        }
+        for (const mesh of targets) {
+            const ySign = Math.sign(mesh.scaling.y) || 1;
+            mesh.scaling.set(s, ySign * s, s);
+            mesh.computeWorldMatrix(true);
+        }
+        // Imported GLBs are authoring-space; generated WASM colliders already bake
+        // environment_scale into vertices and stay at identity scaling.
+        if (this._colliderNeedsEnvironmentScale) {
+            for (const mesh of this.colliderMeshes) {
+                mesh.scaling.set(s, s, s);
+                mesh.computeWorldMatrix(true);
+            }
+        }
     }
 
     public async loadMesh(data: Uint8Array | ArrayBuffer | string, extension: string = '.glb'): Promise<void> {
@@ -549,6 +595,8 @@ export class Viewer {
     private groundFieldOverlayMeshes: Mesh[] = [];
     private colliderMeshes: AbstractMesh[] = [];
     private colliderMaterial: StandardMaterial | null = null;
+    /** True when collider GLB is in authoring space and needs environment scale on the mesh. */
+    private _colliderNeedsEnvironmentScale = false;
     private seedMarker: Mesh | null = null;
     private markerLabels: Mesh[] = [];
     private preferredPlayerSpawn: Vector3 | null = null;
@@ -690,6 +738,19 @@ export class Viewer {
         };
     }
 
+    /**
+     * Scale the region selection box about the origin by `ratio` so it stays
+     * aligned when the environment scale changes.
+     */
+    public scaleRegionSelection(ratio: number): void {
+        if (!this.selectionMesh || !Number.isFinite(ratio) || ratio === 1) {
+            return;
+        }
+        this.selectionMesh.position.scaleInPlace(ratio);
+        this.selectionMesh.scaling.scaleInPlace(ratio);
+        this.selectionMesh.computeWorldMatrix(true);
+    }
+
     public async loadColliderMesh(file: File, opacity = 0.35): Promise<{ positions: Float32Array, indices: Uint32Array }> {
         this.clearColliderMesh();
         const result = await SceneLoader.ImportMeshAsync("", "", file, this.scene);
@@ -697,6 +758,7 @@ export class Viewer {
         if (this.colliderMeshes.length === 0) {
             throw new Error("Imported collider GLB has no usable mesh geometry.");
         }
+        this._colliderNeedsEnvironmentScale = true;
 
         this.colliderMaterial = new StandardMaterial("collider_mesh_mat", this.scene);
         this.colliderMaterial.diffuseColor = new Color3(0.0, 0.85, 1.0);
@@ -707,6 +769,7 @@ export class Viewer {
             mesh.material = this.colliderMaterial;
             this.prepareOverlayMesh(mesh, this.colliderMaterial, { pickable: false, liftY: 0.03 });
         }
+        this.applyEnvironmentScaleToMeshes();
 
         const geometry = this.getColliderMeshBuffers();
         const bounds = this.getColliderBounds();
@@ -720,6 +783,8 @@ export class Viewer {
 
     public displayColliderMesh(positions: Float32Array | number[], indices: Uint32Array | number[], opacity = 0.35): void {
         this.clearColliderMesh();
+        // WASM bake already includes environment_scale in vertex positions.
+        this._colliderNeedsEnvironmentScale = false;
         const mesh = new Mesh("collider_mesh_generated", this.scene);
         const vertexData = new VertexData();
         vertexData.positions = Array.from(positions);
@@ -739,6 +804,7 @@ export class Viewer {
             mesh.dispose();
         }
         this.colliderMeshes = [];
+        this._colliderNeedsEnvironmentScale = false;
         if (this.colliderMaterial) {
             this.colliderMaterial.dispose();
             this.colliderMaterial = null;

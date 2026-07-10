@@ -263,6 +263,7 @@ export function useSplatFastNavR3F() {
     currentBytes.current = null;
     currentName.current = 'splat';
     currentNavMeshData.current = null;
+    controller.setEnvironmentScale(1);
     void controller.reset();
   }, [controller]);
 
@@ -284,7 +285,13 @@ export function useSplatFastNavR3F() {
       await controller.loadSplat(bytes);
       appendLog('[INFO] Splat visualized.');
 
-      const base: MeshSettings = { ...FAST_NAV_PRESET, mode: 2, flip_y: true, rotation: [0, 0, 0] };
+      const base: MeshSettings = {
+        ...FAST_NAV_PRESET,
+        mode: 2,
+        flip_y: true,
+        rotation: [0, 0, 0],
+        environment_scale: controller.getEnvironmentScale(),
+      };
       let splatBounds: { min: number[]; max: number[] } | null = null;
       try {
         const bounds = await splatwalk.getSplatBounds(bytes, { ...base, prune_floaters: false });
@@ -399,6 +406,7 @@ export function useSplatFastNavR3F() {
         setStatus('loading');
         setStatusMessage(`Loading ${file.name}...`);
         appendLog(`[INFO] Loading file: ${file.name} (${file.size} bytes)`);
+        controller.setEnvironmentScale(1);
         const bytes = await readSplatBytes(file);
         await processBytes(bytes, file.name);
       } catch (error) {
@@ -409,7 +417,7 @@ export function useSplatFastNavR3F() {
         setStatusMessage('FAST NAV failed.');
       }
     },
-    [appendLog, isBusy, processBytes]
+    [appendLog, controller, isBusy, processBytes]
   );
 
   const loadExample = useCallback(
@@ -435,6 +443,7 @@ export function useSplatFastNavR3F() {
           await splatwalk.init();
           wasmReady.current = true;
         }
+        controller.setEnvironmentScale(1);
         const bytes = await readSplatBytes(new File([raw], fileName));
         await processBytes(bytes, fileName);
       } catch (error) {
@@ -445,7 +454,7 @@ export function useSplatFastNavR3F() {
         setStatusMessage('Failed to load the example scene.');
       }
     },
-    [appendLog, isBusy, processBytes]
+    [appendLog, controller, isBusy, processBytes]
   );
 
   const exportSog = useCallback(
@@ -475,7 +484,13 @@ export function useSplatFastNavR3F() {
   const generateCollisionBoundary = useCallback(async (): Promise<CollisionBoundaryArtifact> => {
     const bytes = currentBytes.current;
     if (!bytes) throw new Error('No splat loaded to generate collision from.');
-    const base: MeshSettings = { ...FAST_NAV_PRESET, mode: 2, flip_y: true, rotation: [0, 0, 0] };
+    const base: MeshSettings = {
+      ...FAST_NAV_PRESET,
+      mode: 2,
+      flip_y: true,
+      rotation: [0, 0, 0],
+      environment_scale: controller.getEnvironmentScale(),
+    };
     const carveHeight = FAST_NAV_PRESET.collision_carve_height ?? 1.7;
     const suggested = await splatwalk.suggestRegion(bytes, base);
     const seed = [
@@ -522,6 +537,36 @@ export function useSplatFastNavR3F() {
     [controller]
   );
 
+  const applyEnvironmentScale = useCallback(
+    async (scale: number): Promise<void> => {
+      if (isBusy) return;
+      if (!Number.isFinite(scale) || scale <= 0) {
+        throw new Error('Scale Environment must be a positive number.');
+      }
+      const bytes = currentBytes.current;
+      if (!bytes) {
+        throw new Error('Load a splat before applying environment scale.');
+      }
+      setErrorMessage(null);
+      controller.setEnvironmentScale(scale);
+      appendLog(`[INFO] Environment scale set to ${scale}; re-running FAST NAV...`);
+      setStatus('processing');
+      setStatusMessage('Re-running FAST NAV at new scale...');
+      setPhase('idle');
+      setProgress(null);
+      try {
+        await processBytes(bytes, `${currentName.current}.ply`);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        setErrorMessage(detail);
+        appendLog(`[ERROR] ${detail}`);
+        setStatus('error');
+        setStatusMessage('FAST NAV failed after scale.');
+      }
+    },
+    [appendLog, controller, isBusy, processBytes]
+  );
+
   return {
     controller,
     status,
@@ -543,6 +588,7 @@ export function useSplatFastNavR3F() {
     exportCollisionMesh,
     setCollisionBoundaryVisible,
     setNavMeshVisible,
+    applyEnvironmentScale,
     reset,
   };
 }
