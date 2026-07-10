@@ -43,21 +43,32 @@ const {
   logs,
   navMeshVisible,
   navPhase,
+  navPlyRotationLabel,
   navSettings,
   resetNavSettings,
   resetStreamSettings,
   resize,
   restoreStreamVisual,
+  rotateNavPly,
+  rotateStreamVisual,
   runFastNavFromStream,
+  selectionRegionVisible,
   setNavMeshVisible,
+  setSelectionRegionVisible,
   setStreamQualityPreset,
   showDebugNavPly,
   statusMessage,
   streamQualityPreset,
   streamResidency,
   streamSettings,
+  streamVisualRotationLabel,
   summary,
 } = useStorageAdapterDemo(canvasRef);
+
+/** Expand Navigation + nested Navmesh settings on load (prune + orientation visible). */
+const navSectionPanels = ref<number[]>([0]);
+const navSettingsPanels = ref<number[]>([0]);
+const canAdjustOrientation = computed(() => hasStream.value || hasNavSession.value);
 
 const onStreamQualityChange = (value: unknown): void => {
   if (typeof value !== 'string') {
@@ -67,6 +78,12 @@ const onStreamQualityChange = (value: unknown): void => {
     return;
   }
   setStreamQualityPreset(value as StreamQualityPreset);
+};
+
+const onSelectionRegionVisible = (visible: boolean): void => {
+  void setSelectionRegionVisible(visible).catch(() => {
+    // Error surfaced via errorMessage / snackbar in the composable.
+  });
 };
 
 const onFullscreenChange = (): void => {
@@ -644,11 +661,12 @@ const onRestoreStream = (): void => {
           <div class="text-caption text-medium-emphasis">
             Fly: <strong class="text-primary">WASD</strong>
             · Up/Down: <strong class="text-primary">E/Q</strong>
+            · <strong class="text-primary">SHIFT</strong> = 10× speed
             · Look: mouse (click canvas first)
           </div>
         </div>
 
-        <v-expansion-panels class="mt-4" variant="accordion">
+        <v-expansion-panels v-model="navSectionPanels" class="mt-4" variant="accordion" multiple>
           <v-expansion-panel title="Navigation from stream">
             <template #text>
               <p class="text-body-2 text-medium-emphasis mb-3">
@@ -659,7 +677,7 @@ const onRestoreStream = (): void => {
                 Navmesh, player, and NPC draw on top of the live stream.
               </p>
 
-              <v-expansion-panels class="mb-4" variant="accordion">
+              <v-expansion-panels v-model="navSettingsPanels" class="mb-4" variant="accordion" multiple>
                 <v-expansion-panel>
                   <template #title>
                     <div class="d-flex align-center ga-2">
@@ -675,6 +693,95 @@ const onRestoreStream = (): void => {
                       park, the nav source was spatially truncated — re-run after this
                       fix, or raise max slope for steep bowls. Height band only clips
                       vertical outliers, not same-level flats.
+                    </p>
+
+                    <div class="text-subtitle-2 mb-2">Orientation</div>
+                    <p class="text-caption text-medium-emphasis mb-2">
+                      SuperSplat-style assets may need stream and nav-PLY offsets independently.
+                      PlayCanvas defaults: stream <code>0</code>, nav PLY <code>−90° X</code>.
+                    </p>
+                    <div class="d-flex flex-wrap align-center ga-2 mb-1">
+                      <span class="text-caption text-medium-emphasis me-2">Stream</span>
+                      <v-btn
+                        size="small"
+                        variant="tonal"
+                        :disabled="busy || !canAdjustOrientation"
+                        @click="rotateStreamVisual('x')"
+                      >
+                        X+90°
+                      </v-btn>
+                      <v-btn
+                        size="small"
+                        variant="tonal"
+                        :disabled="busy || !canAdjustOrientation"
+                        @click="rotateStreamVisual('y')"
+                      >
+                        Y+90°
+                      </v-btn>
+                      <v-btn
+                        size="small"
+                        variant="tonal"
+                        :disabled="busy || !canAdjustOrientation"
+                        @click="rotateStreamVisual('z')"
+                      >
+                        Z+90°
+                      </v-btn>
+                    </div>
+                    <p class="text-caption text-medium-emphasis mb-3">{{ streamVisualRotationLabel }}</p>
+                    <div class="d-flex flex-wrap align-center ga-2 mb-1">
+                      <span class="text-caption text-medium-emphasis me-2">Nav PLY</span>
+                      <v-btn
+                        size="small"
+                        variant="tonal"
+                        :disabled="busy || !canAdjustOrientation"
+                        @click="rotateNavPly('x')"
+                      >
+                        X+90°
+                      </v-btn>
+                      <v-btn
+                        size="small"
+                        variant="tonal"
+                        :disabled="busy || !canAdjustOrientation"
+                        @click="rotateNavPly('y')"
+                      >
+                        Y+90°
+                      </v-btn>
+                      <v-btn
+                        size="small"
+                        variant="tonal"
+                        :disabled="busy || !canAdjustOrientation"
+                        @click="rotateNavPly('z')"
+                      >
+                        Z+90°
+                      </v-btn>
+                    </div>
+                    <p class="text-caption text-medium-emphasis mb-4">{{ navPlyRotationLabel }}</p>
+
+                    <div class="text-subtitle-2 mb-2">Region and prune</div>
+                    <div class="d-flex flex-wrap align-center ga-6 mb-2">
+                      <v-switch
+                        v-model="navSettings.pruneFloaters"
+                        color="primary"
+                        density="compact"
+                        hide-details
+                        label="Prune floaters"
+                        :disabled="busy"
+                      />
+                      <v-switch
+                        :model-value="selectionRegionVisible"
+                        color="warning"
+                        density="compact"
+                        hide-details
+                        label="Selection region"
+                        :disabled="busy || !hasStream"
+                        @update:model-value="onSelectionRegionVisible(Boolean($event))"
+                      />
+                    </div>
+                    <p class="text-caption text-medium-emphasis mb-4">
+                      Prune overrides WASM floater removal for Fast Nav and collision.
+                      When Selection region is shown, the yellow box is the pinned
+                      consideration region (drag/scale with gizmos); when hidden, Fast Nav
+                      auto-selects a boxed region.
                     </p>
 
                     <div class="text-subtitle-2 mb-2">Floor coverage</div>

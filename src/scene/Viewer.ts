@@ -19,6 +19,11 @@ import '@babylonjs/loaders'; // Import loaders (OBJ, GLTF, STL)
 import { GLTF2Export } from '@babylonjs/serializers/glTF';
 import { Crowd, NavMesh as RecastNavMesh, init as initRecast, importNavMesh, CrowdAgent } from 'recast-navigation';
 import type { GroundFieldCellState, WalkableGroundFieldResult } from '../wasm/bridge';
+import {
+    ensureRegionSelectionVolume,
+    MIN_REGION_HEIGHT_METERS,
+    regionSelectionSize,
+} from '../navigation/regionSelection';
 import { SplatPerfHud, installSplatWalkPerfProbe } from './splatPerfHud';
 
 /** Existing Babylon engine/scene to adopt (e.g. stream → nav handoff). */
@@ -54,8 +59,9 @@ export interface ViewerOptions {
 export class Viewer {
   private engine: Engine;
   private scene: Scene;
-  private camera!: ArcRotateCamera;
-  private readonly rightHanded: boolean;
+    private camera!: ArcRotateCamera;
+    private readonly rightHanded: boolean;
+    private _orbitShiftDispose: (() => void) | null = null;
 
     constructor(canvas: HTMLCanvasElement, options: ViewerOptions = {}) {
         this.rightHanded = options.rightHanded ?? false;
@@ -131,8 +137,10 @@ export class Viewer {
     }
 
     /**
-     * Bind existing streamed SOG meshes as the Viewer splat target and sync
-     * rotation / Y-flip from the live mesh (already oriented by the stream loader).
+     * Bind existing streamed SOG meshes as the Viewer splat target.
+     * Stream visual rotation stays at identity offset (Babylon stream already
+     * orients PlayCanvas assets). Nav-PLY / WASM defaults to `-π/2` about X
+     * (SOG Z-up → Y-up bake) so debug PLY and Fast Nav share one adjustable euler.
      */
     public bindStreamVisualMeshes(): void {
         const candidates = this.scene.meshes.filter((mesh) => this.isStreamVisualMesh(mesh));
@@ -145,11 +153,38 @@ export class Viewer {
         this.splatMeshes = meshes;
         this.splatMesh = meshes[0]!;
         this.splatMesh.computeWorldMatrix(true);
-        this.rotation = {
-            x: this.splatMesh.rotation.x,
-            y: this.splatMesh.rotation.y,
-            z: this.splatMesh.rotation.z,
-        };
+        this._streamVisualRotation = { x: 0, y: 0, z: 0 };
+        // SOG nav-PLY default: Z-up authoring → Y-up (matches prior debug PLY bake).
+        this.rotation = { x: -Math.PI / 2, y: 0, z: 0 };
+        this.applyStreamVisualRotationToMeshes();
+    }
+
+    private applyStreamVisualRotationToMeshes(): void {
+        const targets =
+            this.splatMeshes.length > 0
+                ? this.splatMeshes
+                : this.scene.meshes.filter((mesh) => this.isStreamVisualMesh(mesh));
+        for (const mesh of targets) {
+            if (mesh.isDisposed()) {
+                continue;
+            }
+            mesh.rotation.x = this._streamVisualRotation.x;
+            mesh.rotation.y = this._streamVisualRotation.y;
+            mesh.rotation.z = this._streamVisualRotation.z;
+            mesh.computeWorldMatrix(true);
+        }
+    }
+
+    private applyNavPlyRotationToDebugMeshes(): void {
+        for (const mesh of this._debugPlyMeshes) {
+            if (mesh.isDisposed()) {
+                continue;
+            }
+            mesh.rotation.x = this.rotation.x;
+            mesh.rotation.y = this.rotation.y;
+            mesh.rotation.z = this.rotation.z;
+            mesh.computeWorldMatrix(true);
+        }
     }
 
     private frameCameraToSplat(): void {
@@ -189,14 +224,14 @@ export class Viewer {
     }
 
     /**
-     * Hide the live stream visual and show the materialized nav PLY (optional SOG LOD
-     * orientation). For transform debugging only — restore with {@link restoreStreamVisual}.
+     * Hide the live stream visual and show the materialized nav PLY oriented with
+     * the current nav-PLY euler ({@link getSplatRotation}). For transform debugging
+     * only — restore with {@link restoreStreamVisual}.
      */
     public async showDebugIntermediaryPly(
         plyBytes: Uint8Array,
-        options: { applySogLodOrientation?: boolean } = {}
+        _options: { applySogLodOrientation?: boolean } = {}
     ): Promise<void> {
-        const applyOrientation = options.applySogLodOrientation !== false;
         this._streamMeshesHiddenForDebug = this.splatMeshes.filter((m) => !m.isDisposed());
         for (const mesh of this._streamMeshesHiddenForDebug) {
             mesh.setEnabled(false);
@@ -220,17 +255,12 @@ export class Viewer {
         }
 
         const root = result.meshes[0]!;
-        if (applyOrientation) {
-            root.rotation.x = -Math.PI / 2;
-            root.computeWorldMatrix(true);
-        }
+        root.rotation.x = this.rotation.x;
+        root.rotation.y = this.rotation.y;
+        root.rotation.z = this.rotation.z;
+        root.computeWorldMatrix(true);
         this.splatMesh = root;
         this.splatMeshes = result.meshes;
-        this.rotation = {
-            x: root.rotation.x,
-            y: root.rotation.y,
-            z: root.rotation.z,
-        };
         this.frameCameraToSplat();
         this.scene.render();
     }
@@ -253,12 +283,7 @@ export class Viewer {
         if (restored.length > 0) {
             this.splatMeshes = restored;
             this.splatMesh = restored[0]!;
-            this.splatMesh.computeWorldMatrix(true);
-            this.rotation = {
-                x: this.splatMesh.rotation.x,
-                y: this.splatMesh.rotation.y,
-                z: this.splatMesh.rotation.z,
-            };
+            this.applyStreamVisualRotationToMeshes();
         }
         this.frameCameraToSplat();
         this.scene.render();
@@ -294,7 +319,47 @@ export class Viewer {
             this.scene
         );
         camera.attachControl(this.engine.getRenderingCanvas(), true);
-        camera.wheelPrecision = 50;
+
+        // Lower wheelPrecision / panningSensibility = faster orbit drive / pan.
+        const baseWheelPrecision = 50;
+        const basePanningSensibility = 1000;
+        const shiftSpeedMultiplier = 10;
+        camera.wheelPrecision = baseWheelPrecision;
+        camera.panningSensibility = basePanningSensibility;
+
+        let shiftHeld = false;
+        const syncOrbitSpeed = (): void => {
+            const factor = shiftHeld ? shiftSpeedMultiplier : 1;
+            camera.wheelPrecision = baseWheelPrecision / factor;
+            camera.panningSensibility = basePanningSensibility / factor;
+        };
+        const onKeyDown = (event: KeyboardEvent): void => {
+            if (event.code !== 'ShiftLeft' && event.code !== 'ShiftRight') {
+                return;
+            }
+            if (shiftHeld) {
+                return;
+            }
+            shiftHeld = true;
+            syncOrbitSpeed();
+        };
+        const onKeyUp = (event: KeyboardEvent): void => {
+            if (event.code !== 'ShiftLeft' && event.code !== 'ShiftRight') {
+                return;
+            }
+            shiftHeld = false;
+            syncOrbitSpeed();
+        };
+
+        this._orbitShiftDispose?.();
+        window.addEventListener('keydown', onKeyDown);
+        window.addEventListener('keyup', onKeyUp);
+        this._orbitShiftDispose = (): void => {
+            window.removeEventListener('keydown', onKeyDown);
+            window.removeEventListener('keyup', onKeyUp);
+            this._orbitShiftDispose = null;
+        };
+
         return camera;
     }
 
@@ -308,7 +373,10 @@ export class Viewer {
     private splatMeshes: AbstractMesh[] = [];
     private _debugPlyMeshes: AbstractMesh[] = [];
     private _streamMeshesHiddenForDebug: AbstractMesh[] = [];
+    /** Nav-PLY / WASM orientation (what {@link getSplatRotation} returns). */
     private rotation: { x: number, y: number, z: number } = { x: 0, y: 0, z: 0 };
+    /** Stream-visual-only orientation; does not affect WASM MeshSettings.rotation. */
+    private _streamVisualRotation: { x: number, y: number, z: number } = { x: 0, y: 0, z: 0 };
     /** Absolute uniform environment scale (default 1). Does not scale player/NPC markers. */
     private _environmentScale = 1;
     private readonly _perfHud = new SplatPerfHud();
@@ -418,10 +486,8 @@ export class Viewer {
             return;
         }
 
-        // Increment rotation state (conceptual 90 degrees)
+        // Workbench path: rotate nav-PLY state and the active splat mesh together.
         this.rotation[axis] += Math.PI / 2;
-
-        // Apply to mesh
         this.splatMesh.rotation[axis] += Math.PI / 2;
 
         console.log(`Rotated ${axis} by 90deg. Current:`, this.rotation);
@@ -429,6 +495,46 @@ export class Viewer {
 
     public getSplatRotation(): { x: number, y: number, z: number } {
         return { ...this.rotation };
+    }
+
+    /** Stream-visual-only euler (does not affect WASM {@link getSplatRotation}). */
+    public getStreamVisualRotation(): { x: number, y: number, z: number } {
+        return { ...this._streamVisualRotation };
+    }
+
+    /**
+     * Rotate the streamed SOG visual by +90° about `axis` without changing nav-PLY /
+     * WASM orientation.
+     */
+    public rotateStreamVisual(axis: 'x' | 'y' | 'z'): void {
+        this._streamVisualRotation[axis] += Math.PI / 2;
+        this.applyStreamVisualRotationToMeshes();
+        console.log(
+            `[INFO] Stream visual rotated ${axis} +90°. Current:`,
+            this._streamVisualRotation
+        );
+    }
+
+    /** Set absolute stream-visual euler (radians). */
+    public setStreamVisualRotation(euler: { x: number; y: number; z: number }): void {
+        this._streamVisualRotation = { x: euler.x, y: euler.y, z: euler.z };
+        this.applyStreamVisualRotationToMeshes();
+    }
+
+    /**
+     * Rotate nav-PLY / WASM orientation by +90° about `axis`. Updates debug PLY
+     * meshes when they are visible; does not move the stream visual.
+     */
+    public rotateNavPly(axis: 'x' | 'y' | 'z'): void {
+        this.rotation[axis] += Math.PI / 2;
+        this.applyNavPlyRotationToDebugMeshes();
+        console.log(`[INFO] Nav PLY rotated ${axis} +90°. Current:`, this.rotation);
+    }
+
+    /** Set absolute nav-PLY / WASM euler (radians). */
+    public setNavPlyRotation(euler: { x: number; y: number; z: number }): void {
+        this.rotation = { x: euler.x, y: euler.y, z: euler.z };
+        this.applyNavPlyRotationToDebugMeshes();
     }
 
     /** Absolute uniform environment scale applied to the splat and collider overlays. */
@@ -668,30 +774,39 @@ export class Viewer {
             this.selectionMesh.isPickable = true;
         }
 
-        const bounds = region ? {
-            min: new Vector3(region.min[0], region.min[1], region.min[2]),
-            max: new Vector3(region.max[0], region.max[1], region.max[2]),
-        } : this.getLoadedSplatBounds();
+        const rawBounds = region ? {
+            min: [region.min[0], region.min[1], region.min[2]],
+            max: [region.max[0], region.max[1], region.max[2]],
+        } : (() => {
+            const splat = this.getLoadedSplatBounds();
+            if (!splat) {
+                return null;
+            }
+            return {
+                min: [splat.min.x, splat.min.y, splat.min.z],
+                max: [splat.max.x, splat.max.y, splat.max.z],
+            };
+        })();
 
-        if (bounds) {
-            const minFootprintMeters = 0.1;
-            const sizeX = Math.max(bounds.max.x - bounds.min.x, minFootprintMeters);
-            const sizeZ = Math.max(bounds.max.z - bounds.min.z, minFootprintMeters);
-            const sizeY = Math.max(bounds.max.y - bounds.min.y, minFootprintMeters);
+        if (rawBounds) {
+            const volume = ensureRegionSelectionVolume(rawBounds);
+            const size = regionSelectionSize(volume);
 
-            this.selectionMesh.scaling.set(sizeX, sizeY, sizeZ);
+            this.selectionMesh.scaling.set(size.x, size.y, size.z);
             this.selectionMesh.position.set(
-                (bounds.min.x + bounds.max.x) / 2,
-                bounds.min.y + sizeY / 2,
-                (bounds.min.z + bounds.max.z) / 2
+                (volume.min[0] + volume.max[0]) / 2,
+                (volume.min[1] + volume.max[1]) / 2,
+                (volume.min[2] + volume.max[2]) / 2
             );
 
             console.log(
-                `[Viewer] Region selector auto-fit to splat bounds ` +
-                `min=${bounds.min.toString()} max=${bounds.max.toString()} size=${this.selectionMesh.scaling.toString()}`
+                `[Viewer] Region selector volume ` +
+                `min=${volume.min.map((v) => v.toFixed(2)).join(',')} ` +
+                `max=${volume.max.map((v) => v.toFixed(2)).join(',')} ` +
+                `size=${size.x.toFixed(2)}×${size.y.toFixed(2)}×${size.z.toFixed(2)}`
             );
         } else {
-            this.selectionMesh.scaling.set(5, 0.5, 5);
+            this.selectionMesh.scaling.set(5, MIN_REGION_HEIGHT_METERS, 5);
             this.selectionMesh.position.copyFrom(this.camera.target);
             console.warn("[Viewer] Could not determine splat bounds. Region selector placed at camera target.");
         }
@@ -702,10 +817,11 @@ export class Viewer {
         }
         this.gizmoManager.positionGizmoEnabled = true;
         this.gizmoManager.scaleGizmoEnabled = true;
+        this.gizmoManager.rotationGizmoEnabled = false;
         this.gizmoManager.attachableMeshes = [this.selectionMesh];
         this.gizmoManager.attachToMesh(this.selectionMesh);
 
-        console.log("[Viewer] Region selection enabled");
+        console.log("[Viewer] Region selection enabled (drag to move, scale handles for size/height)");
     }
 
     public disableRegionSelection(): void {

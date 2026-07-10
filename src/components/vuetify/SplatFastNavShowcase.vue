@@ -78,7 +78,7 @@ const isFullscreen = ref(false);
 const rightHanded = new URLSearchParams(window.location.search).get('rh') === '1';
 
 const babylon = useBabylonViewer(canvasRef, { rightHanded });
-const { status, statusMessage, errorMessage, logs, isBusy, phase, progress, splatCount, maxShDegree, maxChunkExtent, loadAndProcess, loadExample, exportSog, exportNavmesh, generateCollisionBoundary, exportCollisionMesh, setCollisionBoundaryVisible, setNavMeshVisible, applyEnvironmentScale, reset } =
+const { status, statusMessage, errorMessage, logs, isBusy, phase, progress, splatCount, maxShDegree, maxChunkExtent, loadAndProcess, loadExample, exportSog, exportNavmesh, generateCollisionBoundary, exportCollisionMesh, setCollisionBoundaryVisible, setNavMeshVisible, navSettings, resetNavSettings, hasNavMesh, pruneFloaters, hasLoadedSplat, selectionRegionVisible, setSelectionRegionVisible, rerunFastNav, applyEnvironmentScale, setPendingEnvironmentScale, reset } =
   useSplatFastNav(babylon, { recovery: props.recovery, strayTrim: props.strayTrim, prune: props.prune });
 
 // --- Streamed SOG export -------------------------------------------------
@@ -108,6 +108,8 @@ const navSummary = ref<string | null>(null);
 const environmentScale = ref(1);
 const scaleApplying = ref(false);
 const scaleSummary = ref<string | null>(null);
+/** Expand Navmesh settings on load (Scale Environment visible before Fast Nav). */
+const navSettingsPanels = ref<number[]>([0]);
 
 // Auto-pick the recommended mode whenever a new scene's count resolves; the
 // user can still flip it before exporting.
@@ -116,7 +118,6 @@ watch(splatCount, () => {
   navSummary.value = null;
   sogSummary.value = null;
   scaleSummary.value = null;
-  environmentScale.value = 1;
   navMeshVisible.value = true;
   sogMode.value = isLargeScene.value ? 'streamed' : 'single';
 });
@@ -220,7 +221,10 @@ async function runApplyEnvironmentScale(): Promise<void> {
   scaleSummary.value = null;
   try {
     await applyEnvironmentScale(scale);
-    scaleSummary.value = `Environment scale applied: ${scale}.`;
+    scaleSummary.value =
+      status.value === 'done'
+        ? `Environment scale applied: ${scale}.`
+        : `Environment scale set to ${scale} — applies on next Fast Nav.`;
   } catch (error) {
     scaleSummary.value = `Scale failed: ${error instanceof Error ? error.message : String(error)}`;
   } finally {
@@ -235,7 +239,7 @@ const progressText = computed(() => {
   if (!p) return null;
   const labels: Record<string, string> = {
     parse: 'Parsing splat',
-    prune: 'Pruning floaters',
+    prune: pruneFloaters.value ? 'Pruning floaters' : 'Ingesting splat',
     field: 'Building floor field',
   };
   const base = labels[p.stage] ?? 'Processing';
@@ -251,7 +255,12 @@ const showSnackbar = computed({
   },
 });
 
-const showDropZone = computed(() => status.value === 'idle' || status.value === 'error');
+const showDropZone = computed(() => !hasLoadedSplat.value && (status.value === 'idle' || status.value === 'error'));
+
+/** Selection region after splat load + Fast Nav attempt finished (ok or fail). */
+const canUseSelectionRegion = computed(
+  () => hasLoadedSplat.value && (status.value === 'done' || status.value === 'error') && !isBusy.value
+);
 
 const steps = computed(() => {
   const loadDone = status.value === 'processing' || status.value === 'done';
@@ -260,7 +269,11 @@ const steps = computed(() => {
   const pruneActive = status.value === 'processing' && p === 'prune';
   const pruneDone = p === 'floor' || p === 'navmesh' || p === 'done';
   const navActive = status.value === 'processing' && (p === 'floor' || p === 'navmesh');
-  const pruneLabel = pruneActive && progressText.value ? progressText.value : 'Prune outliers';
+  const pruneLabel = pruneActive && progressText.value
+    ? progressText.value
+    : pruneFloaters.value
+      ? 'Prune outliers'
+      : 'Ingest splat';
   return [
     { label: 'Load splat', active: status.value === 'loading', done: loadDone },
     { label: pruneLabel, active: pruneActive, done: pruneDone || navDone },
@@ -280,6 +293,7 @@ const tagColor: Record<LogTag, string> = {
 
 function pickFile(file: File | null | undefined): void {
   if (file) {
+    setPendingEnvironmentScale(Number(environmentScale.value));
     void loadAndProcess(file);
   }
 }
@@ -297,6 +311,39 @@ function onFileChange(event: Event): void {
 function onDrop(event: DragEvent): void {
   isDragging.value = false;
   pickFile(event.dataTransfer?.files?.[0]);
+}
+
+function onLoadExample(url: string, title: string): void {
+  setPendingEnvironmentScale(Number(environmentScale.value));
+  void loadExample(url, title);
+}
+
+function onReset(): void {
+  environmentScale.value = 1;
+  scaleSummary.value = null;
+  reset();
+}
+
+function onSelectionRegionVisible(visible: boolean): void {
+  void setSelectionRegionVisible(visible).catch(() => {
+    // Error surfaced via errorMessage / snackbar in the composable.
+  });
+}
+
+const rerunApplying = ref(false);
+
+async function runRerunFastNav(): Promise<void> {
+  if (rerunApplying.value || isBusy.value) {
+    return;
+  }
+  rerunApplying.value = true;
+  try {
+    await rerunFastNav();
+  } catch {
+    // Error surfaced via errorMessage / snackbar.
+  } finally {
+    rerunApplying.value = false;
+  }
 }
 
 async function toggleFullscreen(): Promise<void> {
@@ -360,7 +407,7 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
           <canvas ref="canvasRef" class="showcase-canvas" />
 
           <v-btn
-            v-if="status === 'done'"
+            v-if="hasLoadedSplat"
             class="fullscreen-btn"
             :icon="isFullscreen ? 'mdi-fullscreen-exit' : 'mdi-fullscreen'"
             :title="isFullscreen ? 'Exit fullscreen' : 'Fullscreen'"
@@ -403,7 +450,7 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
                       :key="scene.url"
                       :title="scene.title"
                       prepend-icon="mdi-cube-outline"
-                      @click="loadExample(scene.url, scene.title)"
+                      @click="onLoadExample(scene.url, scene.title)"
                     />
                   </v-list>
                 </v-menu>
@@ -440,28 +487,351 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
             variant="text"
             color="secondary"
             prepend-icon="mdi-refresh"
-            @click="reset"
+            @click="onReset"
           >
             Load another
           </v-btn>
         </div>
 
-        <v-expansion-panels v-if="status === 'done'" class="mt-4" variant="accordion">
-          <v-expansion-panel title="Navigation and collision exports">
+        <v-expansion-panels v-model="navSettingsPanels" class="mt-4" variant="accordion" multiple>
+          <v-expansion-panel>
+            <template #title>
+              <div class="d-flex align-center ga-2">
+                <v-icon icon="mdi-tune-vertical" size="small" color="primary" />
+                <span>Navmesh settings</span>
+                <v-chip size="x-small" variant="tonal" color="primary">overrides</v-chip>
+              </div>
+            </template>
             <template #text>
-              <div v-if="navSummary" class="text-caption text-medium-emphasis mb-3">{{ navSummary }}</div>
-              <div class="d-flex flex-wrap ga-3 mb-4">
+              <p class="text-caption text-medium-emphasis mb-3">
+                Set Scale Environment before loading a splat to bake it into the first Fast Nav run,
+                or Apply / Recompute after Fast Nav to rebuild at the new scale.
+                Orbit: hold <strong class="text-primary">SHIFT</strong> for 10× pan / drive (wheel).
+              </p>
+
+              <div class="d-flex flex-wrap align-center ga-3 mb-4">
                 <v-btn
                   color="primary"
-                  :loading="navExporting"
-                  prepend-icon="mdi-download"
-                  @click="runNavmeshExport"
+                  :loading="rerunApplying"
+                  :disabled="isBusy || !canUseSelectionRegion"
+                  prepend-icon="mdi-refresh"
+                  @click="runRerunFastNav"
                 >
-                  Export navmesh (.nav)
+                  Recompute
                 </v-btn>
+                <span class="text-caption text-medium-emphasis">
+                  Re-runs Fast Nav with current prune, selection region, and scale.
+                </span>
               </div>
 
-              <div class="d-flex align-center flex-wrap ga-3 mb-4">
+              <div class="text-subtitle-2 mb-2">Region and prune</div>
+              <div class="d-flex flex-wrap align-center ga-6 mb-2">
+                <v-switch
+                  v-model="navSettings.pruneFloaters"
+                  color="primary"
+                  density="compact"
+                  hide-details
+                  label="Prune floaters"
+                  :disabled="isBusy"
+                />
+                <v-switch
+                  :model-value="selectionRegionVisible"
+                  color="warning"
+                  density="compact"
+                  hide-details
+                  label="Selection region"
+                  :disabled="!canUseSelectionRegion"
+                  @update:model-value="onSelectionRegionVisible(Boolean($event))"
+                />
+              </div>
+              <p class="text-caption text-medium-emphasis mb-4">
+                Prune overrides WASM floater removal for Fast Nav and collision (set before load or before Recompute).
+                When Selection region is shown, the yellow box is the pinned consideration
+                region (drag/scale with gizmos); when hidden, Fast Nav auto-selects a boxed region.
+                Selection region unlocks after the splat loads and Fast Nav finishes (success or fail).
+              </p>
+
+              <div class="text-subtitle-2 mb-2">Floor coverage</div>
+              <v-row density="comfortable">
+                <v-col cols="12" sm="6" md="4">
+                  <v-slider
+                    v-model="navSettings.sameLevelBelow"
+                    :min="0.25"
+                    :max="4"
+                    :step="0.05"
+                    color="primary"
+                    density="compact"
+                    thumb-label
+                    hide-details
+                    :disabled="isBusy"
+                  >
+                    <template #prepend>
+                      <span class="text-caption text-medium-emphasis settings-label">Band below (m)</span>
+                    </template>
+                  </v-slider>
+                </v-col>
+                <v-col cols="12" sm="6" md="4">
+                  <v-slider
+                    v-model="navSettings.sameLevelAbove"
+                    :min="0.3"
+                    :max="4"
+                    :step="0.05"
+                    color="primary"
+                    density="compact"
+                    thumb-label
+                    hide-details
+                    :disabled="isBusy"
+                  >
+                    <template #prepend>
+                      <span class="text-caption text-medium-emphasis settings-label">Band above (m)</span>
+                    </template>
+                  </v-slider>
+                </v-col>
+                <v-col cols="12" sm="6" md="4">
+                  <v-slider
+                    v-model="navSettings.holeFillRadius"
+                    :min="0"
+                    :max="8"
+                    :step="1"
+                    color="primary"
+                    density="compact"
+                    thumb-label
+                    hide-details
+                    :disabled="isBusy"
+                  >
+                    <template #prepend>
+                      <span class="text-caption text-medium-emphasis settings-label">Hole fill (cells)</span>
+                    </template>
+                  </v-slider>
+                </v-col>
+                <v-col cols="12" sm="6" md="4">
+                  <v-slider
+                    v-model="navSettings.sdfCellSize"
+                    :min="0.1"
+                    :max="0.4"
+                    :step="0.01"
+                    color="secondary"
+                    density="compact"
+                    thumb-label
+                    hide-details
+                    :disabled="isBusy"
+                  >
+                    <template #prepend>
+                      <span class="text-caption text-medium-emphasis settings-label">SDF cell (m)</span>
+                    </template>
+                  </v-slider>
+                </v-col>
+                <v-col cols="12" sm="6" md="4">
+                  <v-slider
+                    v-model="navSettings.sdfDensityThreshold"
+                    :min="0.01"
+                    :max="0.12"
+                    :step="0.005"
+                    color="secondary"
+                    density="compact"
+                    thumb-label
+                    hide-details
+                    :disabled="isBusy"
+                  >
+                    <template #prepend>
+                      <span class="text-caption text-medium-emphasis settings-label">Density thresh</span>
+                    </template>
+                  </v-slider>
+                </v-col>
+                <v-col cols="12" sm="6" md="4">
+                  <v-slider
+                    v-model="navSettings.maxLocalHeightVariance"
+                    :min="0.08"
+                    :max="0.6"
+                    :step="0.02"
+                    color="secondary"
+                    density="compact"
+                    thumb-label
+                    hide-details
+                    :disabled="isBusy"
+                  >
+                    <template #prepend>
+                      <span class="text-caption text-medium-emphasis settings-label">Height variance</span>
+                    </template>
+                  </v-slider>
+                </v-col>
+              </v-row>
+
+              <v-divider class="my-4" />
+              <div class="text-subtitle-2 mb-2">Recast agent</div>
+              <v-row density="comfortable">
+                <v-col cols="12" sm="6" md="4">
+                  <v-slider
+                    v-model="navSettings.walkableSlopeAngle"
+                    :min="30"
+                    :max="70"
+                    :step="1"
+                    color="success"
+                    density="compact"
+                    thumb-label
+                    hide-details
+                    :disabled="isBusy"
+                  >
+                    <template #prepend>
+                      <span class="text-caption text-medium-emphasis settings-label">Max slope (°)</span>
+                    </template>
+                  </v-slider>
+                </v-col>
+                <v-col cols="12" sm="6" md="4">
+                  <v-slider
+                    v-model="navSettings.walkableRadius"
+                    :min="0.15"
+                    :max="0.6"
+                    :step="0.05"
+                    color="success"
+                    density="compact"
+                    thumb-label
+                    hide-details
+                    :disabled="isBusy"
+                  >
+                    <template #prepend>
+                      <span class="text-caption text-medium-emphasis settings-label">Agent radius (m)</span>
+                    </template>
+                  </v-slider>
+                </v-col>
+                <v-col cols="12" sm="6" md="4">
+                  <v-slider
+                    v-model="navSettings.walkableClimb"
+                    :min="0.25"
+                    :max="1"
+                    :step="0.05"
+                    color="success"
+                    density="compact"
+                    thumb-label
+                    hide-details
+                    :disabled="isBusy"
+                  >
+                    <template #prepend>
+                      <span class="text-caption text-medium-emphasis settings-label">Max climb (m)</span>
+                    </template>
+                  </v-slider>
+                </v-col>
+                <v-col cols="12" sm="6" md="4">
+                  <v-slider
+                    v-model="navSettings.minRegionArea"
+                    :min="0"
+                    :max="24"
+                    :step="1"
+                    color="success"
+                    density="compact"
+                    thumb-label
+                    hide-details
+                    :disabled="isBusy"
+                  >
+                    <template #prepend>
+                      <span class="text-caption text-medium-emphasis settings-label">Min region</span>
+                    </template>
+                  </v-slider>
+                </v-col>
+                <v-col cols="12" sm="6" md="4">
+                  <v-slider
+                    v-model="navSettings.maxIslandSeedDistance"
+                    :min="6"
+                    :max="200"
+                    :step="2"
+                    color="warning"
+                    density="compact"
+                    thumb-label
+                    hide-details
+                    :disabled="isBusy"
+                  >
+                    <template #prepend>
+                      <span class="text-caption text-medium-emphasis settings-label">Island↔seed max (m)</span>
+                    </template>
+                  </v-slider>
+                </v-col>
+                <v-col cols="12" sm="6" md="4">
+                  <v-slider
+                    v-model="navSettings.cellBandBelow"
+                    :min="0.5"
+                    :max="4"
+                    :step="0.1"
+                    color="primary"
+                    density="compact"
+                    thumb-label
+                    hide-details
+                    :disabled="isBusy"
+                  >
+                    <template #prepend>
+                      <span class="text-caption text-medium-emphasis settings-label">Cell band − (m)</span>
+                    </template>
+                  </v-slider>
+                </v-col>
+                <v-col cols="12" sm="6" md="4">
+                  <v-slider
+                    v-model="navSettings.cellBandAbove"
+                    :min="0.45"
+                    :max="4"
+                    :step="0.1"
+                    color="primary"
+                    density="compact"
+                    thumb-label
+                    hide-details
+                    :disabled="isBusy"
+                  >
+                    <template #prepend>
+                      <span class="text-caption text-medium-emphasis settings-label">Cell band + (m)</span>
+                    </template>
+                  </v-slider>
+                </v-col>
+              </v-row>
+
+              <div class="d-flex flex-wrap ga-2 mt-4 mb-4">
+                <v-btn
+                  variant="tonal"
+                  color="secondary"
+                  prepend-icon="mdi-restore"
+                  :disabled="isBusy"
+                  @click="resetNavSettings"
+                >
+                  Reset defaults
+                </v-btn>
+                <span class="text-caption text-medium-emphasis align-self-center">
+                  Recompute to apply floor / Recast changes
+                </span>
+              </div>
+
+              <v-sheet
+                v-if="hasNavMesh"
+                border
+                rounded="lg"
+                class="d-flex align-center flex-wrap ga-4 pa-3 mb-4 navmesh-toggle-bar"
+                color="surface"
+              >
+                <v-icon
+                  :icon="navMeshVisible ? 'mdi-layers' : 'mdi-layers-off'"
+                  :color="navMeshVisible ? 'success' : 'medium-emphasis'"
+                  size="22"
+                />
+                <div class="flex-grow-1">
+                  <div class="text-body-2 font-weight-medium">Navmesh overlay</div>
+                  <div class="text-caption text-medium-emphasis">
+                    {{
+                      navMeshVisible
+                        ? 'Green walkable mesh visible — click it to move the player'
+                        : 'Hidden — splat view only; click-to-move is off'
+                    }}
+                  </div>
+                </div>
+                <v-switch
+                  :model-value="navMeshVisible"
+                  color="success"
+                  density="comfortable"
+                  hide-details
+                  inset
+                  :disabled="isBusy"
+                  :label="navMeshVisible ? 'Shown' : 'Hidden'"
+                  @update:model-value="onNavMeshVisible(Boolean($event))"
+                />
+              </v-sheet>
+
+              <div class="text-subtitle-2 mb-2">Scale</div>
+              <div class="d-flex align-center flex-wrap ga-3">
                 <v-text-field
                   v-model.number="environmentScale"
                   type="number"
@@ -484,6 +854,24 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
                   Apply
                 </v-btn>
                 <div v-if="scaleSummary" class="text-caption text-medium-emphasis">{{ scaleSummary }}</div>
+              </div>
+            </template>
+          </v-expansion-panel>
+        </v-expansion-panels>
+
+        <v-expansion-panels v-if="status === 'done'" class="mt-4" variant="accordion">
+          <v-expansion-panel title="Navigation and collision exports">
+            <template #text>
+              <div v-if="navSummary" class="text-caption text-medium-emphasis mb-3">{{ navSummary }}</div>
+              <div class="d-flex flex-wrap ga-3 mb-4">
+                <v-btn
+                  color="primary"
+                  :loading="navExporting"
+                  prepend-icon="mdi-download"
+                  @click="runNavmeshExport"
+                >
+                  Export navmesh (.nav)
+                </v-btn>
               </div>
 
               <v-sheet
@@ -715,5 +1103,10 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
     rgba(var(--v-theme-success), 0.08),
     rgba(var(--v-theme-surface), 1) 42%
   );
+}
+
+.settings-label {
+  display: inline-block;
+  min-width: 7.5rem;
 }
 </style>

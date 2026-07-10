@@ -17,13 +17,18 @@ import {
 import {
   runFastNav,
   STREAMED_FAST_NAV_RECAST_ATTEMPTS,
-  STREAMED_MAX_ISLAND_SEED_DISTANCE,
   type FastNavPhase,
 } from '@/navigation/fastNav';
 import {
   DEFAULT_FAST_NAV_RECOVERY,
+  FAST_NAV_PRESET,
   type FastNavRecoveryConfig,
 } from '@/navigation/floor';
+import {
+  DEFAULT_STREAMED_NAV_SETTINGS,
+  demoNavSettingsToFastNavTuning,
+  type StreamedNavSettings,
+} from '@/navigation/navSettings';
 import { Viewer } from '@/scene/Viewer';
 import {
   DEFAULT_NAV_MAX_SPLATS,
@@ -59,55 +64,8 @@ export type { StreamQualityPreset, StreamSettings };
 
 export type StorageDemoNavPhase = FastNavPhase | 'idle' | 'materialize' | 'error';
 
-/**
- * User-tunable Fast Nav overrides for the Storage Adapter streamed flow.
- * Applied on top of the outdoor recovery / Recast ladders.
- */
-export interface StreamedNavSettings {
-  /** Per-cell height band above reference floor (m). */
-  cellBandAbove: number;
-  /** Per-cell height band below reference floor (m). */
-  cellBandBelow: number;
-  /** Hole-fill radius in field cells. */
-  holeFillRadius: number;
-  /** Max local height variance for floor field (m). */
-  maxLocalHeightVariance: number;
-  /** Recast min region area (cells before squaring). */
-  minRegionArea: number;
-  /** Component-median band above seed floor (m) — widen for bowls/ramps. */
-  sameLevelAbove: number;
-  /** Component-median band below seed floor (m). */
-  sameLevelBelow: number;
-  /** SDF cell size (m); larger = coarser outdoor coverage. */
-  sdfCellSize: number;
-  /** SDF density threshold; lower accepts sparser ground. */
-  sdfDensityThreshold: number;
-  /** Recast max climb (m). */
-  walkableClimb: number;
-  /** Recast agent radius (m); smaller = less erosion. */
-  walkableRadius: number;
-  /** Recast max slope (degrees); higher for bowls/ramps. */
-  walkableSlopeAngle: number;
-  /** Max horizontal distance (m) from seed to accepted nav island centroid. */
-  maxIslandSeedDistance: number;
-}
-
-/** Outdoor-friendly defaults (wider height bands + steeper slopes than indoor). */
-export const DEFAULT_STREAMED_NAV_SETTINGS: StreamedNavSettings = {
-  cellBandAbove: 2.5,
-  cellBandBelow: 2.0,
-  holeFillRadius: 4,
-  maxLocalHeightVariance: 0.35,
-  minRegionArea: 2,
-  sameLevelAbove: 2.0,
-  sameLevelBelow: 1.5,
-  sdfCellSize: 0.2,
-  sdfDensityThreshold: 0.03,
-  walkableClimb: 0.65,
-  walkableRadius: 0.35,
-  walkableSlopeAngle: 55,
-  maxIslandSeedDistance: STREAMED_MAX_ISLAND_SEED_DISTANCE,
-};
+export type { StreamedNavSettings };
+export { DEFAULT_STREAMED_NAV_SETTINGS };
 
 export interface UseStorageAdapterDemo {
   readonly busy: Ref<boolean>;
@@ -131,7 +89,9 @@ export interface UseStorageAdapterDemo {
   readonly resize: () => void;
   readonly restoreStreamVisual: () => void;
   readonly runFastNavFromStream: () => Promise<void>;
+  readonly selectionRegionVisible: Ref<boolean>;
   readonly setNavMeshVisible: (visible: boolean) => void;
+  readonly setSelectionRegionVisible: (visible: boolean) => Promise<void>;
   readonly setStreamQualityPreset: (preset: StreamQualityPreset) => void;
   readonly showDebugNavPly: () => Promise<void>;
   readonly statusMessage: Ref<string>;
@@ -139,6 +99,10 @@ export interface UseStorageAdapterDemo {
   readonly streamSettings: Ref<StreamSettings>;
   readonly streamResidency: Ref<StreamResidencyStats | null>;
   readonly resetStreamSettings: () => void;
+  readonly rotateNavPly: (axis: 'x' | 'y' | 'z') => void;
+  readonly rotateStreamVisual: (axis: 'x' | 'y' | 'z') => void;
+  readonly streamVisualRotationLabel: Ref<string>;
+  readonly navPlyRotationLabel: Ref<string>;
   readonly summary: ShallowRef<SogLodManifestSummary | null>;
 }
 
@@ -151,6 +115,93 @@ const KEY_Q = 81;
 
 const DEFAULT_FLY_SPEED = 2.5;
 const DEFAULT_ANGULAR_SENSIBILITY = 2000;
+const SHIFT_SPEED_MULTIPLIER = 10;
+
+/** SOG nav-PLY default: Z-up authoring → Y-up (matches prior debug PLY bake). */
+const DEFAULT_NAV_PLY_ROTATION = { x: -Math.PI / 2, y: 0, z: 0 } as const;
+
+type EulerAxes = { x: number; y: number; z: number };
+type RotationAxis = 'x' | 'y' | 'z';
+type FlyCameraExtras = FreeCamera & {
+  __splatwalkSetBaseFlySpeed?: (speed: number) => void;
+};
+
+const eulerDegreesLabel = (euler: EulerAxes): string =>
+  `X ${((euler.x * 180) / Math.PI).toFixed(0)}° · Y ${((euler.y * 180) / Math.PI).toFixed(0)}° · Z ${((euler.z * 180) / Math.PI).toFixed(0)}°`;
+
+const configureFlyCamera = (camera: FreeCamera, canvas: HTMLCanvasElement): (() => void) => {
+  camera.attachControl(canvas, true);
+  camera.speed = DEFAULT_FLY_SPEED;
+  camera.angularSensibility = DEFAULT_ANGULAR_SENSIBILITY;
+  camera.minZ = 0.1;
+  camera.keysUp = [KEY_W];
+  camera.keysDown = [KEY_S];
+  camera.keysLeft = [KEY_A];
+  camera.keysRight = [KEY_D];
+  camera.keysUpward = [KEY_E];
+  camera.keysDownward = [KEY_Q];
+  canvas.tabIndex = 0;
+
+  let baseFlySpeed = DEFAULT_FLY_SPEED;
+  let shiftHeld = false;
+
+  const syncSpeed = (): void => {
+    camera.speed = baseFlySpeed * (shiftHeld ? SHIFT_SPEED_MULTIPLIER : 1);
+  };
+
+  const onPointerDown = (): void => {
+    canvas.focus();
+  };
+  const onKeyDown = (event: KeyboardEvent): void => {
+    if (event.code !== 'ShiftLeft' && event.code !== 'ShiftRight') {
+      return;
+    }
+    if (shiftHeld) {
+      return;
+    }
+    shiftHeld = true;
+    syncSpeed();
+  };
+  const onKeyUp = (event: KeyboardEvent): void => {
+    if (event.code !== 'ShiftLeft' && event.code !== 'ShiftRight') {
+      return;
+    }
+    shiftHeld = false;
+    syncSpeed();
+  };
+
+  canvas.addEventListener('pointerdown', onPointerDown);
+  window.addEventListener('keydown', onKeyDown);
+  window.addEventListener('keyup', onKeyUp);
+
+  (camera as FlyCameraExtras).__splatwalkSetBaseFlySpeed = (speed: number): void => {
+    baseFlySpeed = speed;
+    syncSpeed();
+  };
+
+  return (): void => {
+    canvas.removeEventListener('pointerdown', onPointerDown);
+    window.removeEventListener('keydown', onKeyDown);
+    window.removeEventListener('keyup', onKeyUp);
+    delete (camera as FlyCameraExtras).__splatwalkSetBaseFlySpeed;
+  };
+};
+
+const frameCameraToScene = (scene: Scene, camera: FreeCamera): void => {
+  const worldExtends = scene.getWorldExtends();
+  const center = worldExtends.min.add(worldExtends.max).scale(0.5);
+  const size = worldExtends.max.subtract(worldExtends.min).length();
+  const distance = Math.max(6, size * 0.65);
+  camera.position = center.add(new Vector3(0, distance * 0.25, -distance));
+  camera.setTarget(center);
+  const baseSpeed = Math.max(0.5, distance * 0.04);
+  const setBase = (camera as FlyCameraExtras).__splatwalkSetBaseFlySpeed;
+  if (setBase) {
+    setBase(baseSpeed);
+  } else {
+    camera.speed = baseSpeed;
+  }
+};
 
 /** Outdoor / large-scene recovery: lower room-floor area floors than indoor Fast Nav. */
 const STREAMED_FAST_NAV_RECOVERY: FastNavRecoveryConfig = {
@@ -181,33 +232,6 @@ const STREAMED_FAST_NAV_RECOVERY: FastNavRecoveryConfig = {
   ],
 };
 
-const configureFlyCamera = (camera: FreeCamera, canvas: HTMLCanvasElement): void => {
-  camera.attachControl(canvas, true);
-  camera.speed = DEFAULT_FLY_SPEED;
-  camera.angularSensibility = DEFAULT_ANGULAR_SENSIBILITY;
-  camera.minZ = 0.1;
-  camera.keysUp = [KEY_W];
-  camera.keysDown = [KEY_S];
-  camera.keysLeft = [KEY_A];
-  camera.keysRight = [KEY_D];
-  camera.keysUpward = [KEY_E];
-  camera.keysDownward = [KEY_Q];
-  canvas.tabIndex = 0;
-  canvas.addEventListener('pointerdown', () => {
-    canvas.focus();
-  });
-};
-
-const frameCameraToScene = (scene: Scene, camera: FreeCamera): void => {
-  const worldExtends = scene.getWorldExtends();
-  const center = worldExtends.min.add(worldExtends.max).scale(0.5);
-  const size = worldExtends.max.subtract(worldExtends.min).length();
-  const distance = Math.max(6, size * 0.65);
-  camera.position = center.add(new Vector3(0, distance * 0.25, -distance));
-  camera.setTarget(center);
-  camera.speed = Math.max(0.5, distance * 0.04);
-};
-
 /**
  * Babylon scene + CDN / local-zip streamed SOG loading, with optional
  * materialize → collision / FastNav handoff onto {@link Viewer}.
@@ -226,6 +250,11 @@ export const useStorageAdapterDemo = (
   const navMeshVisible = ref(true);
   const navPhase = ref<StorageDemoNavPhase>('idle');
   const navSettings = ref<StreamedNavSettings>({ ...DEFAULT_STREAMED_NAV_SETTINGS });
+  const selectionRegionVisible = ref(false);
+  const streamVisualRotation = ref<EulerAxes>({ x: 0, y: 0, z: 0 });
+  const navPlyRotation = ref<EulerAxes>({ ...DEFAULT_NAV_PLY_ROTATION });
+  const streamVisualRotationLabel = computed(() => eulerDegreesLabel(streamVisualRotation.value));
+  const navPlyRotationLabel = computed(() => eulerDegreesLabel(navPlyRotation.value));
   const statusMessage = ref('Ready — load a CDN lod-meta.json URL or a SplatWalk SOD LOD zip.');
   const streamSettings = ref<StreamSettings>({ ...DEFAULT_STREAM_SETTINGS });
   const streamResidency = ref<StreamResidencyStats | null>(null);
@@ -237,9 +266,13 @@ export const useStorageAdapterDemo = (
   });
   const summary = shallowRef<SogLodManifestSummary | null>(null);
 
+  /** Last selection-region AABB so hide→show can restore the user's box. */
+  let cachedSelectionRegion: { min: number[]; max: number[] } | null = null;
+
   let engine: Engine | null = null;
   let scene: BabylonScene | null = null;
   let camera: FreeCamera | null = null;
+  let flyCameraDispose: (() => void) | null = null;
   let streamDispose: (() => void) | null = null;
   let skipLoggerDispose: (() => void) | null = null;
   let viewer: Viewer | null = null;
@@ -299,7 +332,8 @@ export const useStorageAdapterDemo = (
 
     camera = new FreeCameraCtor('flyCamera', new Vector3(0, 5, -10), scene);
     camera.setTarget(Vector3.Zero());
-    configureFlyCamera(camera, canvas);
+    flyCameraDispose?.();
+    flyCameraDispose = configureFlyCamera(camera, canvas);
 
     const light = new HemisphericLight('hemi', new Vector3(0, 1, 0), scene);
     light.intensity = 0.7;
@@ -308,7 +342,7 @@ export const useStorageAdapterDemo = (
       scene?.render();
     });
     window.addEventListener('resize', resize);
-    addLog('Babylon scene ready (WASD fly · E/Q up/down · mouse look)');
+    addLog('Babylon scene ready (WASD fly · E/Q up/down · SHIFT 10× · mouse look)');
   };
 
   const settleStreamResidency = async (
@@ -369,12 +403,16 @@ export const useStorageAdapterDemo = (
     fileCount.value = null;
     streamResidency.value = null;
     navPhase.value = 'idle';
+    streamVisualRotation.value = { x: 0, y: 0, z: 0 };
+    navPlyRotation.value = { ...DEFAULT_NAV_PLY_ROTATION };
   };
 
   const clear = (): void => {
     disposeViewer();
     clearSceneStreams();
     resetStreamState();
+    cachedSelectionRegion = null;
+    selectionRegionVisible.value = false;
     errorMessage.value = null;
     if (!engine && canvasRef.value) {
       initScene();
@@ -388,6 +426,8 @@ export const useStorageAdapterDemo = (
       disposeViewer();
       cachedPly = null;
       cachedPlySplatCount = 0;
+      cachedSelectionRegion = null;
+      selectionRegionVisible.value = false;
       navPhase.value = 'idle';
       if (canvasRef.value) {
         initScene();
@@ -592,6 +632,8 @@ export const useStorageAdapterDemo = (
     window.removeEventListener('resize', resize);
 
     if (camera) {
+      flyCameraDispose?.();
+      flyCameraDispose = null;
       camera.detachControl();
       camera.dispose();
       camera = null;
@@ -611,6 +653,9 @@ export const useStorageAdapterDemo = (
       },
     });
     window.addEventListener('resize', resize);
+    // Restore user orientation offsets after bindStreamVisualMeshes defaults.
+    viewer.setStreamVisualRotation(streamVisualRotation.value);
+    viewer.setNavPlyRotation(navPlyRotation.value);
 
     if (!viewer.hasLoadedSplat()) {
       disposeViewer();
@@ -683,13 +728,124 @@ export const useStorageAdapterDemo = (
     addLog('[DEBUG] Streamed SOG visual restored.');
   };
 
+  const applyStreamVisualToSceneMeshes = (): void => {
+    if (!scene) {
+      return;
+    }
+    const euler = streamVisualRotation.value;
+    for (const mesh of scene.meshes) {
+      const className = mesh.getClassName();
+      if (
+        !(
+          className.includes('Gaussian') ||
+          className.includes('Splatting') ||
+          mesh.name === 'storageAdapterSogStream' ||
+          mesh.name === 'GaussianSplattingStream'
+        )
+      ) {
+        continue;
+      }
+      mesh.rotation.x = euler.x;
+      mesh.rotation.y = euler.y;
+      mesh.rotation.z = euler.z;
+      mesh.computeWorldMatrix(true);
+    }
+  };
+
+  const rotateStreamVisual = (axis: RotationAxis): void => {
+    streamVisualRotation.value = {
+      ...streamVisualRotation.value,
+      [axis]: streamVisualRotation.value[axis] + Math.PI / 2,
+    };
+    if (viewer) {
+      viewer.setStreamVisualRotation(streamVisualRotation.value);
+    } else {
+      applyStreamVisualToSceneMeshes();
+    }
+    addLog(`[INFO] Stream visual ${axis}+90° (${streamVisualRotationLabel.value}). Re-run Fast Nav after adjusting Nav PLY if needed.`);
+  };
+
+  const rotateNavPly = (axis: RotationAxis): void => {
+    navPlyRotation.value = {
+      ...navPlyRotation.value,
+      [axis]: navPlyRotation.value[axis] + Math.PI / 2,
+    };
+    if (viewer) {
+      viewer.setNavPlyRotation(navPlyRotation.value);
+    }
+    addLog(
+      `[INFO] Nav PLY ${axis}+90° (${navPlyRotationLabel.value}). Re-run Fast Nav / collision to bake the new orientation.`
+    );
+  };
+
   const setNavMeshVisible = (visible: boolean): void => {
     navMeshVisible.value = visible;
     viewer?.setNavMeshVisible(visible);
   };
 
+  const setSelectionRegionVisible = async (visible: boolean): Promise<void> => {
+    if (!visible) {
+      if (viewer) {
+        const bounds = viewer.getRegionBounds();
+        if (bounds) {
+          cachedSelectionRegion = {
+            min: [...bounds.min],
+            max: [...bounds.max],
+          };
+        }
+        viewer.disableRegionSelection();
+      }
+      selectionRegionVisible.value = false;
+      addLog('[INFO] Selection region hidden — Fast Nav will auto-select a region.');
+      return;
+    }
+
+    busy.value = true;
+    errorMessage.value = null;
+    try {
+      const { plyBytes, activeViewer } = await ensureViewerWithPly();
+      let region = cachedSelectionRegion;
+      if (!region) {
+        const rotation = activeViewer.getSplatRotation();
+        const suggested = await splatwalk.suggestRegion(plyBytes, {
+          ...FAST_NAV_PRESET,
+          mode: 2,
+          flip_y: activeViewer.isSplatYFlipped(),
+          rotation: [rotation.x, rotation.y, rotation.z],
+          prune_floaters: navSettings.value.pruneFloaters,
+        });
+        region = {
+          min: [...suggested.region_min],
+          max: [...suggested.region_max],
+        };
+        cachedSelectionRegion = region;
+        addLog(
+          `[INFO] Selection region suggested: ` +
+            `${region.min.map((v) => v.toFixed(2)).join(', ')} → ` +
+            `${region.max.map((v) => v.toFixed(2)).join(', ')}`
+        );
+      }
+      activeViewer.enableRegionSelection({ min: region.min, max: region.max });
+      selectionRegionVisible.value = true;
+      addLog('[INFO] Selection region shown — Fast Nav / collision will pin this box.');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      errorMessage.value = message;
+      selectionRegionVisible.value = false;
+      addLog(`Error: ${message}`);
+      throw error;
+    } finally {
+      busy.value = false;
+    }
+  };
+
   const resetNavSettings = (): void => {
     navSettings.value = { ...DEFAULT_STREAMED_NAV_SETTINGS };
+    cachedSelectionRegion = null;
+    if (viewer) {
+      viewer.disableRegionSelection();
+    }
+    selectionRegionVisible.value = false;
     addLog('[INFO] Navmesh settings reset to outdoor defaults.');
   };
 
@@ -700,11 +856,18 @@ export const useStorageAdapterDemo = (
       const { plyBytes, activeViewer } = await ensureViewerWithPly();
       statusMessage.value = 'Generating voxel collision boundary…';
       const rotation = activeViewer.getSplatRotation();
+      const regionBounds = activeViewer.getRegionBounds();
       const settings = buildCollisionBoundarySettings({
+        base: {
+          prune_floaters: navSettings.value.pruneFloaters,
+          ...(regionBounds
+            ? { region_min: [...regionBounds.min], region_max: [...regionBounds.max] }
+            : {}),
+        },
         emitGlb: true,
         flipY: activeViewer.isSplatYFlipped(),
         rotation: [rotation.x, rotation.y, rotation.z],
-        seed: seedFromRegionBounds({ regionBounds: activeViewer.getRegionBounds() }),
+        seed: seedFromRegionBounds({ regionBounds }),
       });
       const artifact = await generateCollisionBoundaryArtifact({ bytes: plyBytes, settings });
       activeViewer.displayColliderMesh(
@@ -742,10 +905,13 @@ export const useStorageAdapterDemo = (
       statusMessage.value = 'Running Fast Nav…';
       navPhase.value = 'prune';
       addLog(
-        `[INFO] Nav settings: slope=${settings.walkableSlopeAngle}° radius=${settings.walkableRadius}m ` +
+        `[INFO] Nav settings: prune=${settings.pruneFloaters ? 'on' : 'off'} ` +
+          `region=${activeViewer.getRegionBounds() ? 'pinned' : 'auto'} ` +
+          `slope=${settings.walkableSlopeAngle}° radius=${settings.walkableRadius}m ` +
           `climb=${settings.walkableClimb}m band=±${settings.sameLevelBelow}/${settings.sameLevelAbove}m ` +
           `sdf=${settings.sdfCellSize}/${settings.sdfDensityThreshold}`
       );
+      const tuning = demoNavSettingsToFastNavTuning(settings);
       const fastNav = await runFastNav({
         viewer: activeViewer,
         bytes: plyBytes,
@@ -755,27 +921,7 @@ export const useStorageAdapterDemo = (
         },
         recovery: STREAMED_FAST_NAV_RECOVERY,
         recastAttempts: STREAMED_FAST_NAV_RECAST_ATTEMPTS,
-        meshSettings: {
-          sdf_cell_size: settings.sdfCellSize,
-          sdf_density_threshold: settings.sdfDensityThreshold,
-          max_local_height_variance: settings.maxLocalHeightVariance,
-          hole_fill_radius: settings.holeFillRadius,
-        },
-        floorMesh: {
-          sameLevelBelow: settings.sameLevelBelow,
-          sameLevelAbove: settings.sameLevelAbove,
-          cellBandBelow: settings.cellBandBelow,
-          cellBandAbove: settings.cellBandAbove,
-        },
-        recastOverrides: {
-          walkableSlopeAngle: settings.walkableSlopeAngle,
-          walkableRadius: settings.walkableRadius,
-          walkableClimb: settings.walkableClimb,
-          minRegionArea: settings.minRegionArea,
-        },
-        islandValidation: {
-          maxSeedDistance: settings.maxIslandSeedDistance,
-        },
+        ...tuning,
       });
       statusMessage.value = 'Framing the player (top-down)…';
       const framing = activeViewer.focusOnPlayer();
@@ -813,6 +959,8 @@ export const useStorageAdapterDemo = (
 
   onBeforeUnmount(() => {
     window.removeEventListener('resize', resize);
+    flyCameraDispose?.();
+    flyCameraDispose = null;
     clearStreamResources();
     disposeViewer();
     engine?.dispose();
@@ -838,18 +986,24 @@ export const useStorageAdapterDemo = (
     logs,
     navMeshVisible,
     navPhase,
+    navPlyRotationLabel,
     navSettings,
     resetNavSettings,
     resize,
     restoreStreamVisual,
+    rotateNavPly,
+    rotateStreamVisual,
     runFastNavFromStream,
+    selectionRegionVisible,
     setNavMeshVisible,
+    setSelectionRegionVisible,
     setStreamQualityPreset,
     showDebugNavPly,
     statusMessage,
     streamQualityPreset,
     streamResidency,
     streamSettings,
+    streamVisualRotationLabel,
     resetStreamSettings,
     summary,
   };

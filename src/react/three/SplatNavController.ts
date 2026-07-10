@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import * as GaussianSplats3D from '@mkkellogg/gaussian-splats-3d';
+import { TransformControls } from 'three/addons/controls/TransformControls.js';
 import {
   init as initRecast,
   importNavMesh,
@@ -8,10 +9,19 @@ import {
   type CrowdAgent,
 } from 'recast-navigation';
 
+import {
+  ensureRegionSelectionVolume,
+  MIN_REGION_HEIGHT_METERS,
+  regionSelectionSize,
+} from '@/navigation/regionSelection';
+
 /** Minimal OrbitControls surface used by the controller (drei's controls). */
 export interface OrbitControlsLike {
   target: THREE.Vector3;
   object: THREE.Camera;
+  enabled?: boolean;
+  panSpeed?: number;
+  zoomSpeed?: number;
   update(): void;
 }
 
@@ -61,6 +71,11 @@ export class SplatNavController {
   private collisionBoundaryMesh: THREE.Mesh | null = null;
   private floorMesh: THREE.Mesh | null = null;
   private navMeshOverlay: THREE.Mesh | null = null;
+  private selectionMesh: THREE.Mesh | null = null;
+  /** Move gizmo — always on with {@link scaleControls} (Babylon GizmoManager parity). */
+  private translateControls: TransformControls | null = null;
+  /** Scale gizmo — always on with {@link translateControls}. */
+  private scaleControls: TransformControls | null = null;
 
   private navMeshQuery: NavMeshQuery | null = null;
   private crowd: Crowd | null = null;
@@ -91,6 +106,87 @@ export class SplatNavController {
     if (moved > 6) return; // a drag/orbit, not a tap
     this.handleTap(e);
   };
+  private onTranslateDraggingChanged = (event: { value: boolean }): void => {
+    if (this.scaleControls) {
+      this.scaleControls.enabled = !event.value;
+    }
+    if (this.handles?.controls && this.handles.controls.enabled !== undefined) {
+      this.handles.controls.enabled = !event.value;
+    }
+  };
+
+  private onScaleDraggingChanged = (event: { value: boolean }): void => {
+    if (this.translateControls) {
+      this.translateControls.enabled = !event.value;
+    }
+    if (this.handles?.controls && this.handles.controls.enabled !== undefined) {
+      this.handles.controls.enabled = !event.value;
+    }
+  };
+
+  private createRegionGizmo(mode: 'translate' | 'scale'): TransformControls {
+    if (!this.handles) {
+      throw new Error('Controller not attached to a scene.');
+    }
+    const controls = new TransformControls(this.handles.camera, this.handles.gl.domElement);
+    controls.setMode(mode);
+    const onDragging =
+      mode === 'translate' ? this.onTranslateDraggingChanged : this.onScaleDraggingChanged;
+    controls.addEventListener(
+      'dragging-changed',
+      onDragging as unknown as (event: THREE.Event) => void
+    );
+    this.handles.scene.add(controls.getHelper());
+    return controls;
+  }
+
+  private disposeRegionGizmo(
+    controls: TransformControls | null,
+    mode: 'translate' | 'scale'
+  ): void {
+    if (!controls) {
+      return;
+    }
+    const onDragging =
+      mode === 'translate' ? this.onTranslateDraggingChanged : this.onScaleDraggingChanged;
+    try {
+      controls.removeEventListener(
+        'dragging-changed',
+        onDragging as unknown as (event: THREE.Event) => void
+      );
+    } catch {
+      // Already detached / disposed.
+    }
+    try {
+      controls.detach();
+    } catch {
+      // Object already cleared.
+    }
+    const helper = controls.getHelper();
+    this.handles?.scene.remove(helper);
+    helper.traverse((child) => {
+      const mesh = child as THREE.Mesh | THREE.Line;
+      if (mesh.geometry) {
+        mesh.geometry.dispose();
+      }
+      const material = mesh.material;
+      if (Array.isArray(material)) {
+        for (const entry of material) {
+          entry.dispose();
+        }
+      } else if (material) {
+        material.dispose();
+      }
+    });
+    // three@0.169 TransformControls.dispose() calls this.traverse, but the class
+    // extends Controls (not Object3D) — that throws and used to leave the React
+    // selection-region toggle stuck on. Disconnect manually instead.
+    try {
+      controls.disconnect();
+    } catch {
+      // Dom listeners already removed.
+    }
+  }
 
   /** Wire the controller to the live three.js context from the R3F canvas. */
   public attach(handles: SceneHandles): void {
@@ -114,6 +210,13 @@ export class SplatNavController {
     this.sceneBounds = { min: [...min], max: [...max] };
   }
 
+  /** Last known oriented splat AABB, or null before bounds are captured. */
+  public getSceneBounds(): { min: number[]; max: number[] } | null {
+    return this.sceneBounds
+      ? { min: [...this.sceneBounds.min], max: [...this.sceneBounds.max] }
+      : null;
+  }
+
   /**
    * Synchronously detach from the scene (R3F canvas unmount). Resource teardown
    * runs immediately so a later effect re-run cannot null a fresh attachment -
@@ -125,6 +228,7 @@ export class SplatNavController {
       handles.gl.domElement.removeEventListener('pointerdown', this.onPointerDown);
       handles.gl.domElement.removeEventListener('pointerup', this.onPointerUp);
     }
+    this.disableRegionSelection();
     this.destroyCrowd();
     const world = this.world;
     if (world) {
@@ -280,6 +384,94 @@ export class SplatNavController {
     this.applyNavMeshOverlayVisibility();
   }
 
+  /**
+   * Show a yellow selection-region box (WASM AABB pin). Move and scale gizmos
+   * are both active (same as Babylon GizmoManager). Thin floor-band suggestions
+   * are expanded to a minimum height so the box is a volume, not a plane.
+   */
+  public enableRegionSelection(region?: { min: number[]; max: number[] }): void {
+    if (!this.handles || !this.world) {
+      throw new Error('Controller not attached to a scene.');
+    }
+
+    if (!this.selectionMesh) {
+      const material = new THREE.MeshBasicMaterial({
+        color: 0xffff00,
+        transparent: true,
+        opacity: 0.22,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+      });
+      this.selectionMesh = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), material);
+      this.selectionMesh.renderOrder = 3;
+      this.world.add(this.selectionMesh);
+    }
+
+    const rawBounds = region
+      ? { min: region.min, max: region.max }
+      : this.sceneBounds;
+
+    if (rawBounds) {
+      const volume = ensureRegionSelectionVolume(rawBounds);
+      const size = regionSelectionSize(volume);
+      this.selectionMesh.scale.set(size.x, size.y, size.z);
+      this.selectionMesh.position.set(
+        (volume.min[0] + volume.max[0]) * 0.5,
+        (volume.min[1] + volume.max[1]) * 0.5,
+        (volume.min[2] + volume.max[2]) * 0.5
+      );
+    } else {
+      this.selectionMesh.scale.set(5, MIN_REGION_HEIGHT_METERS, 5);
+      const target = this.handles.controls?.target ?? new THREE.Vector3();
+      this.selectionMesh.position.copy(target);
+    }
+
+    if (!this.translateControls) {
+      this.translateControls = this.createRegionGizmo('translate');
+    }
+    if (!this.scaleControls) {
+      this.scaleControls = this.createRegionGizmo('scale');
+    }
+    this.translateControls.attach(this.selectionMesh);
+    this.scaleControls.attach(this.selectionMesh);
+    console.log('[INFO] Region selection enabled (move + scale gizmos).');
+  }
+
+  /** Hide and dispose the selection-region box / gizmos. */
+  public disableRegionSelection(): void {
+    const hadRegion = Boolean(this.translateControls || this.scaleControls || this.selectionMesh);
+    this.disposeRegionGizmo(this.translateControls, 'translate');
+    this.translateControls = null;
+    this.disposeRegionGizmo(this.scaleControls, 'scale');
+    this.scaleControls = null;
+    if (this.handles?.controls && this.handles.controls.enabled !== undefined) {
+      this.handles.controls.enabled = true;
+    }
+    if (this.selectionMesh && this.world) {
+      this.world.remove(this.selectionMesh);
+      this.disposeMesh(this.selectionMesh);
+      this.selectionMesh = null;
+    }
+    if (hadRegion) {
+      console.log('[INFO] Region selection disabled');
+    }
+  }
+
+  /** Current selection-region AABB in oriented / world-local space, or null. */
+  public getRegionBounds(): { min: number[]; max: number[] } | null {
+    if (!this.selectionMesh) {
+      return null;
+    }
+    const { position, scale } = this.selectionMesh;
+    const halfX = Math.abs(scale.x) * 0.5;
+    const halfY = Math.abs(scale.y) * 0.5;
+    const halfZ = Math.abs(scale.z) * 0.5;
+    return {
+      min: [position.x - halfX, position.y - halfY, position.z - halfZ],
+      max: [position.x + halfX, position.y + halfY, position.z + halfZ],
+    };
+  }
+
   /** Show the walkable navmesh overlay (green) and use it as the click target. */
   public showNavMesh(positions: Float32Array, indices: Uint32Array): void {
     if (!this.world) return;
@@ -410,6 +602,7 @@ export class SplatNavController {
 
   /** Tear down splat, overlays and crowd back to an empty scene. */
   public async reset(): Promise<void> {
+    this.disableRegionSelection();
     this.destroyCrowd();
     this._environmentScale = 1;
     if (this.world) {

@@ -18,6 +18,11 @@ import {
   type PruneFloatersOptions,
   type FastNavPhase,
 } from '@/navigation/fastNav';
+import {
+  DEFAULT_DEMO_NAV_SETTINGS,
+  demoNavSettingsToFastNavTuning,
+  type DemoNavSettings,
+} from '@/navigation/navSettings';
 import { splatwalk, type MeshSettings } from '@/wasm/bridge';
 import { SUPPORTED_SPLAT_EXTENSIONS } from '@/wasm/normalize';
 import { SliceArchive } from '@/wasm/sliceArchive';
@@ -113,11 +118,33 @@ export interface UseSplatFastNav {
   readonly setCollisionBoundaryVisible: (visible: boolean) => void;
   /** Show or hide the green walkable navmesh overlay (click-to-move target). */
   readonly setNavMeshVisible: (visible: boolean) => void;
+  /** Full NM override panel (floor coverage + Recast), shared with Storage Adapter. */
+  readonly navSettings: Ref<DemoNavSettings>;
+  /** Reset {@link navSettings} to outdoor defaults. */
+  readonly resetNavSettings: () => void;
+  /**
+   * Whether WASM floater pruning runs on the next Fast Nav.
+   * Synced with {@link navSettings}.pruneFloaters.
+   */
+  readonly pruneFloaters: Ref<boolean>;
+  /** True once a navmesh has been generated this session. */
+  readonly hasNavMesh: Ref<boolean>;
+  /** True once splat bytes are loaded (including after a Fast Nav failure). */
+  readonly hasLoadedSplat: ComputedRef<boolean>;
+  /** Whether the yellow selection-region box is visible / pinned. */
+  readonly selectionRegionVisible: Ref<boolean>;
+  /** Show or hide the selection region (pins Fast Nav / collision AABB when shown). */
+  readonly setSelectionRegionVisible: (visible: boolean) => Promise<void>;
+  /** Re-run Fast Nav on the loaded splat using current prune / region / scale. */
+  readonly rerunFastNav: () => Promise<void>;
   /**
    * Apply absolute uniform environment scale to the splat, then re-run FAST NAV
    * so collision / navmesh bake in the same world meters.
+   * When no splat is loaded yet, only stashes the scale for the next Fast Nav.
    */
   readonly applyEnvironmentScale: (scale: number) => Promise<void>;
+  /** Stash scale for the next Fast Nav without rebuilding (no-op if invalid). */
+  readonly setPendingEnvironmentScale: (scale: number) => void;
   /** Reset back to the idle state, clearing logs and errors. */
   readonly reset: () => void;
 }
@@ -149,7 +176,21 @@ export function useSplatFastNav(
   const splatCount = ref<number | null>(null);
   const maxShDegree = ref(DEFAULT_SLICE_SETTINGS.sh_degree);
   const maxChunkExtent = ref(DEFAULT_SLICE_SETTINGS.chunk_extent);
+  const navSettings = ref<DemoNavSettings>({
+    ...DEFAULT_DEMO_NAV_SETTINGS,
+    pruneFloaters: options.prune?.enabled ?? DEFAULT_DEMO_NAV_SETTINGS.pruneFloaters,
+  });
+  const pruneFloaters = computed({
+    get: () => navSettings.value.pruneFloaters,
+    set: (value: boolean) => {
+      navSettings.value = { ...navSettings.value, pruneFloaters: value };
+    },
+  });
+  const selectionRegionVisible = ref(false);
+  const hasLoadedSplat = ref(false);
+  const hasNavMesh = ref(false);
   const isBusy = computed(() => status.value === 'loading' || status.value === 'processing');
+  const hasLoadedSplatComputed = computed(() => hasLoadedSplat.value);
 
   let wasmReady = false;
   // Bytes + base name of the loaded scene, retained for SOG export.
@@ -157,6 +198,21 @@ export function useSplatFastNav(
   let currentName = 'splat';
   let currentCollisionArtifact: CollisionBoundaryArtifact | null = null;
   let currentNavMeshData: Uint8Array | null = null;
+  /** Stashed so Scale Environment set before load applies on first Fast Nav. */
+  let pendingEnvironmentScale = 1;
+  /** Last selection-region AABB so hide→show can restore the user's box. */
+  let cachedSelectionRegion: { min: number[]; max: number[] } | null = null;
+
+  const resolveFastNavTuning = () => {
+    const tuning = demoNavSettingsToFastNavTuning(navSettings.value);
+    return {
+      ...tuning,
+      prune: {
+        ...options.prune,
+        enabled: navSettings.value.pruneFloaters,
+      },
+    };
+  };
 
   const appendLog = (message: string): void => {
     logs.value.push(parseLog(message));
@@ -181,7 +237,25 @@ export function useSplatFastNav(
     currentCollisionArtifact = null;
     currentName = 'splat';
     currentNavMeshData = null;
+    pendingEnvironmentScale = 1;
+    cachedSelectionRegion = null;
+    hasLoadedSplat.value = false;
+    hasNavMesh.value = false;
+    navSettings.value = {
+      ...DEFAULT_DEMO_NAV_SETTINGS,
+      pruneFloaters: options.prune?.enabled ?? DEFAULT_DEMO_NAV_SETTINGS.pruneFloaters,
+    };
+    selectionRegionVisible.value = false;
+    babylon.viewer.value?.disableRegionSelection();
     babylon.viewer.value?.setEnvironmentScale(1);
+  };
+
+  const resetNavSettings = (): void => {
+    navSettings.value = {
+      ...DEFAULT_DEMO_NAV_SETTINGS,
+      pruneFloaters: options.prune?.enabled ?? DEFAULT_DEMO_NAV_SETTINGS.pruneFloaters,
+    };
+    appendLog('[INFO] Navmesh settings reset to outdoor defaults.');
   };
 
   const processFile = async (file: File): Promise<void> => {
@@ -198,7 +272,7 @@ export function useSplatFastNav(
       appendLog(`[INFO] Loading file: ${file.name} (${file.size} bytes)`);
 
       const viewer = babylon.initViewer();
-      viewer.setEnvironmentScale(1);
+      viewer.setEnvironmentScale(pendingEnvironmentScale);
 
       if (!wasmReady) {
         appendLog('[WAIT] Initializing SplatWalk WASM...');
@@ -214,9 +288,11 @@ export function useSplatFastNav(
       appendLog('[INFO] Splat visualized.');
 
       currentBytes = bytes;
+      hasLoadedSplat.value = true;
       currentCollisionArtifact = null;
       currentName = file.name.replace(/\.(ply|spz|splat)$/i, '');
       currentNavMeshData = null;
+      hasNavMesh.value = false;
       // Capture the raw splat count for the export UI (cheap: the parse is cached
       // and reused by the FAST NAV run below).
       try {
@@ -233,6 +309,8 @@ export function useSplatFastNav(
 
       status.value = 'processing';
       statusMessage.value = 'Running FAST NAV...';
+      const tuning = resolveFastNavTuning();
+      appendLog(`[INFO] Floater prune: ${tuning.prune.enabled === false ? 'off' : 'on'}`);
       const fastNav = await runFastNav({
         viewer,
         bytes,
@@ -240,9 +318,10 @@ export function useSplatFastNav(
         onPhase: (next) => { phase.value = next; },
         recovery: options.recovery,
         strayTrim: options.strayTrim,
-        prune: options.prune,
+        ...tuning,
       });
       currentNavMeshData = fastNav.navMeshData;
+      hasNavMesh.value = true;
       phase.value = 'done';
       progress.value = null;
 
@@ -265,6 +344,10 @@ export function useSplatFastNav(
       appendLog(`[ERROR] ${detail}`);
       status.value = 'error';
       statusMessage.value = 'FAST NAV failed.';
+      // Keep any prior navmesh if recompute failed after a successful run.
+      if (!currentNavMeshData) {
+        hasNavMesh.value = false;
+      }
     }
   };
 
@@ -348,6 +431,9 @@ export function useSplatFastNav(
     }
     const rotation = viewer.getSplatRotation();
     const settings = buildCollisionBoundarySettings({
+      base: {
+        prune_floaters: navSettings.value.pruneFloaters,
+      },
       emitGlb: true,
       flipY: viewer.isSplatYFlipped(),
       rotation: [rotation.x, rotation.y, rotation.z],
@@ -379,15 +465,93 @@ export function useSplatFastNav(
     babylon.viewer.value?.setNavMeshVisible(visible);
   };
 
-  const applyEnvironmentScale = async (scale: number): Promise<void> => {
+  const setSelectionRegionVisible = async (visible: boolean): Promise<void> => {
+    const viewer = babylon.viewer.value;
+    if (!visible) {
+      if (viewer) {
+        const bounds = viewer.getRegionBounds();
+        if (bounds) {
+          cachedSelectionRegion = {
+            min: [...bounds.min],
+            max: [...bounds.max],
+          };
+        }
+        viewer.disableRegionSelection();
+      }
+      selectionRegionVisible.value = false;
+      appendLog('[INFO] Selection region hidden — Fast Nav will auto-select a region.');
+      return;
+    }
+
+    if (!currentBytes || !viewer) {
+      throw new Error('Load a splat before showing the selection region.');
+    }
+
+    errorMessage.value = null;
+    try {
+      let region = cachedSelectionRegion;
+      if (!region) {
+        try {
+          const rotation = viewer.getSplatRotation();
+          const suggested = await splatwalk.suggestRegion(currentBytes, {
+            mode: 2,
+            flip_y: viewer.isSplatYFlipped(),
+            rotation: [rotation.x, rotation.y, rotation.z],
+            prune_floaters: navSettings.value.pruneFloaters,
+            environment_scale: viewer.getEnvironmentScale(),
+          });
+          region = {
+            min: [...suggested.region_min],
+            max: [...suggested.region_max],
+          };
+          appendLog(
+            `[INFO] Selection region suggested: ` +
+              `${region.min.map((v) => v.toFixed(2)).join(', ')} → ` +
+              `${region.max.map((v) => v.toFixed(2)).join(', ')}`
+          );
+        } catch (suggestError) {
+          const splatBounds = viewer.getLoadedSplatBounds();
+          if (!splatBounds) {
+            throw suggestError;
+          }
+          region = {
+            min: [splatBounds.min.x, splatBounds.min.y, splatBounds.min.z],
+            max: [splatBounds.max.x, splatBounds.max.y, splatBounds.max.z],
+          };
+          appendLog(
+            `[WARN] suggestRegion failed; using splat AABB for selection region.`
+          );
+        }
+        cachedSelectionRegion = region;
+      }
+      viewer.enableRegionSelection({ min: region.min, max: region.max });
+      selectionRegionVisible.value = true;
+      appendLog(
+        '[INFO] Selection region shown — drag/scale the yellow box, then Re-run Fast Nav to pin it.'
+      );
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      errorMessage.value = detail;
+      selectionRegionVisible.value = false;
+      appendLog(`[ERROR] ${detail}`);
+      throw error;
+    }
+  };
+
+  const setPendingEnvironmentScale = (scale: number): void => {
+    if (!Number.isFinite(scale) || scale <= 0) {
+      return;
+    }
+    pendingEnvironmentScale = scale;
+    babylon.viewer.value?.setEnvironmentScale(scale);
+  };
+
+  const rerunFastNav = async (): Promise<void> => {
     if (isBusy.value) {
       return;
     }
-    if (!Number.isFinite(scale) || scale <= 0) {
-      throw new Error('Scale Environment must be a positive number.');
-    }
     if (!currentBytes) {
-      throw new Error('Load a splat before applying environment scale.');
+      throw new Error('Load a splat before re-running Fast Nav.');
     }
     const viewer = babylon.viewer.value;
     if (!viewer) {
@@ -395,27 +559,44 @@ export function useSplatFastNav(
     }
 
     errorMessage.value = null;
-    viewer.setEnvironmentScale(scale);
-    appendLog(`[INFO] Environment scale set to ${scale}; re-running FAST NAV...`);
+    // Keep the selection box if visible so getRegionBounds() pins the AABB.
+    if (selectionRegionVisible.value) {
+      const bounds = viewer.getRegionBounds();
+      if (bounds) {
+        cachedSelectionRegion = {
+          min: [...bounds.min],
+          max: [...bounds.max],
+        };
+      }
+    }
     currentCollisionArtifact = null;
     currentNavMeshData = null;
+    hasNavMesh.value = false;
+
+    const regionNote = viewer.getRegionBounds() ? ' (pinned region)' : '';
+    appendLog(`[INFO] Re-running FAST NAV${regionNote}…`);
 
     try {
       status.value = 'processing';
-      statusMessage.value = 'Re-running FAST NAV at new scale...';
+      statusMessage.value = 'Re-running FAST NAV...';
       phase.value = 'idle';
       progress.value = null;
 
+      const tuning = resolveFastNavTuning();
+      appendLog(`[INFO] Floater prune: ${tuning.prune.enabled === false ? 'off' : 'on'}`);
       const fastNav = await runFastNav({
         viewer,
         bytes: currentBytes,
         onLog: appendLog,
-        onPhase: (next) => { phase.value = next; },
+        onPhase: (next) => {
+          phase.value = next;
+        },
         recovery: options.recovery,
         strayTrim: options.strayTrim,
-        prune: options.prune,
+        ...tuning,
       });
       currentNavMeshData = fastNav.navMeshData;
+      hasNavMesh.value = true;
       phase.value = 'done';
       progress.value = null;
 
@@ -435,8 +616,33 @@ export function useSplatFastNav(
       errorMessage.value = detail;
       appendLog(`[ERROR] ${detail}`);
       status.value = 'error';
-      statusMessage.value = 'FAST NAV failed after scale.';
+      statusMessage.value = 'FAST NAV failed.';
+      // Keep any prior navmesh if recompute failed after a successful run.
+      if (!currentNavMeshData) {
+        hasNavMesh.value = false;
+      }
+      throw error;
     }
+  };
+
+  const applyEnvironmentScale = async (scale: number): Promise<void> => {
+    if (isBusy.value) {
+      return;
+    }
+    if (!Number.isFinite(scale) || scale <= 0) {
+      throw new Error('Scale Environment must be a positive number.');
+    }
+
+    errorMessage.value = null;
+    setPendingEnvironmentScale(scale);
+
+    if (!currentBytes) {
+      appendLog(`[INFO] Environment scale set to ${scale} (applies on next Fast Nav).`);
+      return;
+    }
+
+    appendLog(`[INFO] Environment scale set to ${scale}; re-running FAST NAV...`);
+    await rerunFastNav();
   };
 
   return {
@@ -458,7 +664,16 @@ export function useSplatFastNav(
     exportCollisionMesh,
     setCollisionBoundaryVisible,
     setNavMeshVisible,
+    navSettings,
+    resetNavSettings,
+    hasNavMesh,
+    pruneFloaters,
+    hasLoadedSplat: hasLoadedSplatComputed,
+    selectionRegionVisible,
+    setSelectionRegionVisible,
+    rerunFastNav,
     applyEnvironmentScale,
+    setPendingEnvironmentScale,
     reset,
   };
 }

@@ -695,6 +695,17 @@ export async function runFastNav(options: FastNavOptions): Promise<FastNavResult
     if (options.prune.k !== undefined) base.prune_floaters_k = options.prune.k;
     if (options.prune.stdRatio !== undefined) base.prune_floaters_std_ratio = options.prune.stdRatio;
   }
+  log(
+    `[INFO] Fast Nav floater prune: ${base.prune_floaters === false ? 'off' : 'on'}` +
+      (base.prune_floaters === false ? '' : ` (k=${base.prune_floaters_k}, std=${base.prune_floaters_std_ratio})`)
+  );
+  // Pin the Viewer selection box when present so WASM filters to that AABB and
+  // Fast Nav recovery does not overwrite it with a dense-floor auto region.
+  const regionBounds = viewer.getRegionBounds();
+  if (regionBounds) {
+    base.region_min = regionBounds.min;
+    base.region_max = regionBounds.max;
+  }
   const recovery = resolveRecovery(options.recovery);
 
   const baseAttempts = options.recastAttempts ?? FAST_NAV_RECAST_ATTEMPTS;

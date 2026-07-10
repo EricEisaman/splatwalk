@@ -653,6 +653,13 @@ Coordinate settings:
 - `flip_y`: negate parsed splat Y (position and normal) to match a renderer that imports the splat Y-flipped. See the Coordinate Contract. Default `false`.
 - `rotation`: `[x, y, z]` Euler radians applied after `flip_y`. Pass the user's current splat orientation so generation stays aligned across rotations.
 
+Prune and region settings (no new WASM fields — existing contract):
+
+- `prune_floaters`: when `true` (default), statistical outlier removal runs once in `parse_splats` before any geometry / region / seed work. Set `false` to keep every splat. The Storage Adapter **Navmesh settings / overrides** panel exposes this as **Prune floaters** for Fast Nav and collision generation.
+- `prune_floaters_k`: neighbours sampled per splat for outlier removal (default `16`). Higher = smoother / more conservative.
+- `prune_floaters_std_ratio`: keep splats within `mean + std_ratio * stddev` (default `2.0`). Lower = more aggressive pruning.
+- `region_min` / `region_max`: optional AABB in `splatwalk_oriented` space. When both are set, WASM discards points outside the box during `build_context`. In the TypeScript Fast Nav path (`runFastNav`), a visible Viewer selection-region gizmo is copied into these fields so the box is the pinned consideration region; that also prevents the dense-floor recovery ladder from auto-adapting a different default region. When absent, callers should use `suggest_region` (and optional dense-floor adaptation) as usual. The Storage Adapter overrides panel **Selection region** toggle shows/hides that gizmo.
+
 Collision/reconstruction settings:
 
 - `collision_voxel_size`: voxel edge length in meters. Smaller values increase fidelity and cost. The UI defaults near SuperSplat's 5-8 cm range.

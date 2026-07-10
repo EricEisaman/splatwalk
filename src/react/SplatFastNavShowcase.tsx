@@ -14,7 +14,9 @@ import IconButton from '@mui/material/IconButton';
 import Menu from '@mui/material/Menu';
 import MenuItem from '@mui/material/MenuItem';
 import Paper from '@mui/material/Paper';
+import Slider from '@mui/material/Slider';
 import Snackbar from '@mui/material/Snackbar';
+import Stack from '@mui/material/Stack';
 import Switch from '@mui/material/Switch';
 import TextField from '@mui/material/TextField';
 import ToggleButton from '@mui/material/ToggleButton';
@@ -38,11 +40,42 @@ import ViewInArIcon from '@mui/icons-material/ViewInAr';
 import { SceneCanvas } from '@/react/SceneCanvas';
 import { DEFAULT_EXAMPLE_SCENES } from '@/react/exampleScenes';
 import { useSplatFastNavR3F, type LogTag, type SogExportMode } from '@/react/useSplatFastNavR3F';
+import type { DemoNavSettings } from '@/navigation/navSettings';
 import {
   clampSliceSettingsForScene,
   DEFAULT_AUTO_SLICE_THRESHOLD,
   DEFAULT_SLICE_SETTINGS,
 } from '@/wasm/sogTypes';
+
+type NavSettingKey = keyof DemoNavSettings;
+
+interface NavSliderSpec {
+  readonly key: Exclude<NavSettingKey, 'pruneFloaters'>;
+  readonly label: string;
+  readonly min: number;
+  readonly max: number;
+  readonly step: number;
+  readonly color?: 'primary' | 'secondary' | 'success' | 'warning';
+}
+
+const FLOOR_SLIDERS: readonly NavSliderSpec[] = [
+  { key: 'sameLevelBelow', label: 'Band below (m)', min: 0.25, max: 4, step: 0.05 },
+  { key: 'sameLevelAbove', label: 'Band above (m)', min: 0.3, max: 4, step: 0.05 },
+  { key: 'holeFillRadius', label: 'Hole fill (cells)', min: 0, max: 8, step: 1 },
+  { key: 'sdfCellSize', label: 'SDF cell (m)', min: 0.1, max: 0.4, step: 0.01, color: 'secondary' },
+  { key: 'sdfDensityThreshold', label: 'Density thresh', min: 0.01, max: 0.12, step: 0.005, color: 'secondary' },
+  { key: 'maxLocalHeightVariance', label: 'Height variance', min: 0.08, max: 0.6, step: 0.02, color: 'secondary' },
+];
+
+const RECAST_SLIDERS: readonly NavSliderSpec[] = [
+  { key: 'walkableSlopeAngle', label: 'Max slope (°)', min: 30, max: 70, step: 1, color: 'success' },
+  { key: 'walkableRadius', label: 'Agent radius (m)', min: 0.15, max: 0.6, step: 0.05, color: 'success' },
+  { key: 'walkableClimb', label: 'Max climb (m)', min: 0.25, max: 1, step: 0.05, color: 'success' },
+  { key: 'minRegionArea', label: 'Min region', min: 0, max: 24, step: 1, color: 'success' },
+  { key: 'maxIslandSeedDistance', label: 'Island↔seed max (m)', min: 6, max: 200, step: 2, color: 'warning' },
+  { key: 'cellBandBelow', label: 'Cell band − (m)', min: 0.5, max: 4, step: 0.1 },
+  { key: 'cellBandAbove', label: 'Cell band + (m)', min: 0.45, max: 4, step: 0.1 },
+];
 
 const tagColor: Record<LogTag, 'info' | 'warning' | 'error' | 'success' | 'secondary'> = {
   info: 'info',
@@ -77,6 +110,17 @@ export function SplatFastNavShowcase(): JSX.Element {
     setNavMeshVisible,
     exportSog,
     applyEnvironmentScale,
+    setPendingEnvironmentScale,
+    navSettings,
+    setNavSettings,
+    resetNavSettings,
+    hasNavMesh,
+    pruneFloaters,
+    setPruneFloaters,
+    hasLoadedSplat,
+    selectionRegionVisible,
+    setSelectionRegionVisible,
+    rerunFastNav,
     reset,
   } = nav;
 
@@ -85,6 +129,13 @@ export function SplatFastNavShowcase(): JSX.Element {
   const [isDragging, setIsDragging] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [exampleAnchor, setExampleAnchor] = useState<null | HTMLElement>(null);
+
+  const updateNavSetting = useCallback(
+    (key: Exclude<NavSettingKey, 'pruneFloaters'>, value: number): void => {
+      setNavSettings((prev) => ({ ...prev, [key]: value }));
+    },
+    [setNavSettings]
+  );
 
   const [sliceForm, setSliceForm] = useState({
     sh_degree: DEFAULT_SLICE_SETTINGS.sh_degree,
@@ -113,7 +164,6 @@ export function SplatFastNavShowcase(): JSX.Element {
     setNavSummary(null);
     setSogSummary(null);
     setScaleSummary(null);
-    setEnvironmentScale(1);
     setNavMeshVisibleState(true);
     setSogMode(isLargeScene ? 'streamed' : 'single');
   }, [splatCount, isLargeScene]);
@@ -130,12 +180,12 @@ export function SplatFastNavShowcase(): JSX.Element {
     if (!progress) return null;
     const labels: Record<string, string> = {
       parse: 'Parsing splat',
-      prune: 'Pruning floaters',
+      prune: pruneFloaters ? 'Pruning floaters' : 'Ingesting splat',
       field: 'Building floor field',
     };
     const baseLabel = labels[progress.stage] ?? 'Processing';
     return progress.fraction !== null ? `${baseLabel} ${Math.round(progress.fraction * 100)}%` : baseLabel;
-  }, [progress]);
+  }, [progress, pruneFloaters]);
 
   const steps = useMemo(() => {
     const loadDone = status === 'processing' || status === 'done';
@@ -143,14 +193,18 @@ export function SplatFastNavShowcase(): JSX.Element {
     const pruneActive = status === 'processing' && phase === 'prune';
     const pruneDone = phase === 'floor' || phase === 'navmesh' || phase === 'done';
     const navActive = status === 'processing' && (phase === 'floor' || phase === 'navmesh');
-    const pruneLabel = pruneActive && progressText ? progressText : 'Prune outliers';
+    const pruneLabel = pruneActive && progressText
+      ? progressText
+      : pruneFloaters
+        ? 'Prune outliers'
+        : 'Ingest splat';
     return [
       { label: 'Load splat', active: status === 'loading', done: loadDone },
       { label: pruneLabel, active: pruneActive, done: pruneDone || navDone },
       { label: 'FAST NAV', active: navActive, done: navDone },
       { label: 'Top-down view', active: false, done: navDone },
     ];
-  }, [status, phase, progressText]);
+  }, [status, phase, progressText, pruneFloaters]);
 
   const sogStatusText = useMemo(() => {
     if (sogSummary) return sogSummary;
@@ -164,14 +218,33 @@ export function SplatFastNavShowcase(): JSX.Element {
   const sogExportButtonLabel =
     sogMode === 'streamed' ? 'Export streamed SOG (.zip)' : 'Export single SOG (.zip)';
 
-  const showDropZone = status === 'idle' || status === 'error';
+  const showDropZone = !hasLoadedSplat && (status === 'idle' || status === 'error');
+  /** Selection region after splat load + Fast Nav attempt finished (ok or fail). */
+  const canUseSelectionRegion =
+    hasLoadedSplat && (status === 'done' || status === 'error') && !isBusy;
 
   const pickFile = useCallback(
     (file: File | null | undefined): void => {
-      if (file) void loadAndProcess(file);
+      if (!file) return;
+      setPendingEnvironmentScale(Number(environmentScale));
+      void loadAndProcess(file);
     },
-    [loadAndProcess]
+    [environmentScale, loadAndProcess, setPendingEnvironmentScale]
   );
+
+  const onLoadExample = useCallback(
+    (url: string, title: string): void => {
+      setPendingEnvironmentScale(Number(environmentScale));
+      void loadExample(url, title);
+    },
+    [environmentScale, loadExample, setPendingEnvironmentScale]
+  );
+
+  const onReset = useCallback((): void => {
+    setEnvironmentScale(1);
+    setScaleSummary(null);
+    reset();
+  }, [reset]);
 
   const onFileChange = (event: React.ChangeEvent<HTMLInputElement>): void => {
     pickFile(event.target.files?.[0]);
@@ -258,6 +331,20 @@ export function SplatFastNavShowcase(): JSX.Element {
     }
   }, [exportNavmesh, navExporting]);
 
+  const [rerunApplying, setRerunApplying] = useState(false);
+
+  const runRerunFastNav = useCallback(async (): Promise<void> => {
+    if (rerunApplying || isBusy) return;
+    setRerunApplying(true);
+    try {
+      await rerunFastNav();
+    } catch {
+      // Error surfaced via snackbar / errorMessage.
+    } finally {
+      setRerunApplying(false);
+    }
+  }, [isBusy, rerunApplying, rerunFastNav]);
+
   const runApplyEnvironmentScale = useCallback(async (): Promise<void> => {
     if (scaleApplying || isBusy) return;
     const scale = Number(environmentScale);
@@ -269,13 +356,17 @@ export function SplatFastNavShowcase(): JSX.Element {
     setScaleSummary(null);
     try {
       await applyEnvironmentScale(scale);
-      setScaleSummary(`Environment scale applied: ${scale}.`);
+      setScaleSummary(
+        status === 'done'
+          ? `Environment scale applied: ${scale}.`
+          : `Environment scale set to ${scale} — applies on next Fast Nav.`
+      );
     } catch (error) {
       setScaleSummary(`Scale failed: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
       setScaleApplying(false);
     }
-  }, [applyEnvironmentScale, environmentScale, isBusy, scaleApplying]);
+  }, [applyEnvironmentScale, environmentScale, isBusy, scaleApplying, status]);
 
   const numberField = (
     key: keyof typeof sliceForm,
@@ -363,7 +454,7 @@ export function SplatFastNavShowcase(): JSX.Element {
               <SceneCanvas controller={controller} />
             </Box>
 
-            {status === 'done' && (
+            {hasLoadedSplat && (
               <IconButton
                 onClick={toggleFullscreen}
                 color="primary"
@@ -414,7 +505,7 @@ export function SplatFastNavShowcase(): JSX.Element {
                           key={scene.url}
                           onClick={() => {
                             setExampleAnchor(null);
-                            void loadExample(scene.url, scene.title);
+                            void onLoadExample(scene.url, scene.title);
                           }}
                         >
                           {scene.title}
@@ -464,11 +555,216 @@ export function SplatFastNavShowcase(): JSX.Element {
               {statusMessage}
             </Typography>
             {(status === 'done' || status === 'error') && (
-              <Button variant="text" color="secondary" startIcon={<RefreshIcon />} onClick={reset}>
+              <Button variant="text" color="secondary" startIcon={<RefreshIcon />} onClick={onReset}>
                 Load another
               </Button>
             )}
           </Box>
+
+          <Accordion defaultExpanded sx={{ mt: 2 }}>
+            <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+              Navmesh settings
+            </AccordionSummary>
+            <AccordionDetails>
+              <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 2 }}>
+                Set Scale Environment before loading a splat to bake it into the first Fast Nav run,
+                or Apply / Recompute after Fast Nav to rebuild at the new scale. Orbit: hold{' '}
+                <strong>SHIFT</strong> for 10× pan / drive (wheel).
+              </Typography>
+
+              <Box sx={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 1.5, mb: 2 }}>
+                <Button
+                  variant="contained"
+                  startIcon={<RefreshIcon />}
+                  disabled={!canUseSelectionRegion || rerunApplying}
+                  onClick={() => void runRerunFastNav()}
+                >
+                  {rerunApplying ? 'Recomputing…' : 'Recompute'}
+                </Button>
+                <Typography variant="caption" color="text.secondary">
+                  Re-runs Fast Nav with current prune, selection region, and scale.
+                </Typography>
+              </Box>
+
+              <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                Region and prune
+              </Typography>
+              <Box sx={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 3, mb: 1 }}>
+                <FormControlLabel
+                  control={
+                    <Switch
+                      color="primary"
+                      checked={pruneFloaters}
+                      disabled={isBusy}
+                      onChange={(_, checked) => setPruneFloaters(checked)}
+                    />
+                  }
+                  label="Prune floaters"
+                />
+                <FormControlLabel
+                  control={
+                    <Switch
+                      color="warning"
+                      checked={selectionRegionVisible}
+                      disabled={!canUseSelectionRegion}
+                      onChange={(_, checked) => {
+                        void setSelectionRegionVisible(checked).catch(() => {
+                          // Error surfaced via snackbar / errorMessage.
+                        });
+                      }}
+                    />
+                  }
+                  label="Selection region"
+                />
+              </Box>
+              <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 2 }}>
+                Prune overrides WASM floater removal for Fast Nav and collision (set before load or
+                before Recompute). When Selection region is shown, the yellow box is the pinned
+                consideration region (move + scale gizmos together); when hidden, Fast Nav auto-selects
+                a boxed region. Selection region unlocks after the splat loads and Fast Nav finishes
+                (success or fail).
+              </Typography>
+
+              <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                Floor coverage
+              </Typography>
+              <Grid container spacing={2} sx={{ mb: 2 }}>
+                {FLOOR_SLIDERS.map((spec) => (
+                  <Grid key={spec.key} item xs={12} sm={6} md={4}>
+                    <Typography variant="caption" color="text.secondary">
+                      {spec.label}: {navSettings[spec.key]}
+                    </Typography>
+                    <Slider
+                      size="small"
+                      color={spec.color ?? 'primary'}
+                      min={spec.min}
+                      max={spec.max}
+                      step={spec.step}
+                      value={navSettings[spec.key]}
+                      disabled={isBusy}
+                      valueLabelDisplay="auto"
+                      onChange={(_, value) => updateNavSetting(spec.key, value as number)}
+                    />
+                  </Grid>
+                ))}
+              </Grid>
+
+              <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                Recast agent
+              </Typography>
+              <Grid container spacing={2} sx={{ mb: 2 }}>
+                {RECAST_SLIDERS.map((spec) => (
+                  <Grid key={spec.key} item xs={12} sm={6} md={4}>
+                    <Typography variant="caption" color="text.secondary">
+                      {spec.label}: {navSettings[spec.key]}
+                    </Typography>
+                    <Slider
+                      size="small"
+                      color={spec.color ?? 'primary'}
+                      min={spec.min}
+                      max={spec.max}
+                      step={spec.step}
+                      value={navSettings[spec.key]}
+                      disabled={isBusy}
+                      valueLabelDisplay="auto"
+                      onChange={(_, value) => updateNavSetting(spec.key, value as number)}
+                    />
+                  </Grid>
+                ))}
+              </Grid>
+
+              <Stack direction="row" spacing={1.5} alignItems="center" flexWrap="wrap" useFlexGap sx={{ mb: 2 }}>
+                <Button
+                  variant="outlined"
+                  color="secondary"
+                  startIcon={<AutorenewIcon />}
+                  disabled={isBusy}
+                  onClick={resetNavSettings}
+                >
+                  Reset defaults
+                </Button>
+                <Typography variant="caption" color="text.secondary">
+                  Recompute to apply floor / Recast changes
+                </Typography>
+              </Stack>
+
+              {hasNavMesh && (
+                <Paper
+                  variant="outlined"
+                  sx={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    flexWrap: 'wrap',
+                    gap: 2,
+                    p: 1.5,
+                    mb: 2,
+                    background: (theme) =>
+                      `linear-gradient(120deg, ${theme.palette.success.main}14, ${theme.palette.background.paper} 42%)`,
+                  }}
+                >
+                  {navMeshVisible ? (
+                    <LayersIcon color="success" />
+                  ) : (
+                    <LayersClearIcon color="disabled" />
+                  )}
+                  <Box sx={{ flexGrow: 1, minWidth: 180 }}>
+                    <Typography variant="body2" fontWeight={600}>
+                      Navmesh overlay
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      {navMeshVisible
+                        ? 'Green walkable mesh visible — click it to move the player'
+                        : 'Hidden — click-to-move still works on the walkable surface'}
+                    </Typography>
+                  </Box>
+                  <FormControlLabel
+                    control={
+                      <Switch
+                        color="success"
+                        checked={navMeshVisible}
+                        disabled={isBusy}
+                        onChange={(_, checked) => {
+                          setNavMeshVisibleState(checked);
+                          setNavMeshVisible(checked);
+                        }}
+                      />
+                    }
+                    label={navMeshVisible ? 'Shown' : 'Hidden'}
+                  />
+                </Paper>
+              )}
+
+              <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                Scale
+              </Typography>
+              <Box sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 1.5 }}>
+                <TextField
+                  type="number"
+                  size="small"
+                  label="Scale Environment"
+                  value={environmentScale}
+                  disabled={isBusy || scaleApplying}
+                  inputProps={{ min: 0.01, step: 0.1 }}
+                  onChange={(e) => setEnvironmentScale(Number(e.target.value))}
+                  sx={{ maxWidth: 180 }}
+                />
+                <Button
+                  size="small"
+                  variant="contained"
+                  color="secondary"
+                  disabled={isBusy || scaleApplying}
+                  onClick={() => void runApplyEnvironmentScale()}
+                >
+                  {scaleApplying ? 'Applying…' : 'Apply'}
+                </Button>
+                {scaleSummary && (
+                  <Typography variant="caption" color="text.secondary">
+                    {scaleSummary}
+                  </Typography>
+                )}
+              </Box>
+            </AccordionDetails>
+          </Accordion>
 
           {status === 'done' && (
             <>
@@ -484,33 +780,6 @@ export function SplatFastNavShowcase(): JSX.Element {
                   <Button startIcon={<DownloadIcon />} disabled={navExporting} onClick={() => void runNavmeshExport()}>
                     Export navmesh (.nav)
                   </Button>
-                </Box>
-
-                <Box sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 1.5, mb: 2 }}>
-                  <TextField
-                    type="number"
-                    size="small"
-                    label="Scale Environment"
-                    value={environmentScale}
-                    disabled={isBusy || scaleApplying}
-                    inputProps={{ min: 0.01, step: 0.1 }}
-                    onChange={(e) => setEnvironmentScale(Number(e.target.value))}
-                    sx={{ maxWidth: 180 }}
-                  />
-                  <Button
-                    size="small"
-                    variant="contained"
-                    color="secondary"
-                    disabled={isBusy || scaleApplying}
-                    onClick={() => void runApplyEnvironmentScale()}
-                  >
-                    {scaleApplying ? 'Applying…' : 'Apply'}
-                  </Button>
-                  {scaleSummary && (
-                    <Typography variant="caption" color="text.secondary">
-                      {scaleSummary}
-                    </Typography>
-                  )}
                 </Box>
 
                 <Paper

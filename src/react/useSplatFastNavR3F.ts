@@ -14,6 +14,11 @@ import {
   resolveRecovery,
   type FastNavLogger,
 } from '@/navigation/floor';
+import {
+  DEFAULT_DEMO_NAV_SETTINGS,
+  demoNavSettingsToFastNavTuning,
+  type DemoNavSettings,
+} from '@/navigation/navSettings';
 import { buildNavmeshKey, getNavmesh, putNavmesh } from '@/navigation/navmeshCache';
 import { splatwalk, type MeshSettings } from '@/wasm/bridge';
 import { normalizeSplatToPly, SUPPORTED_SPLAT_EXTENSIONS } from '@/wasm/normalize';
@@ -162,10 +167,17 @@ async function generateNavMesh(
   positions: Float32Array,
   indices: Uint32Array,
   splatBounds: { min: number[]; max: number[] } | null,
-  log: FastNavLogger
+  log: FastNavLogger,
+  recastOverrides?: Partial<RecastParams>
 ): Promise<NavWorkerResult> {
+  const attempts = recastOverrides
+    ? FAST_NAV_RECAST_ATTEMPTS.map((attempt) => ({
+        ...attempt,
+        params: { ...attempt.params, ...recastOverrides },
+      }))
+    : FAST_NAV_RECAST_ATTEMPTS;
   let lastError: unknown = null;
-  for (const attempt of FAST_NAV_RECAST_ATTEMPTS) {
+  for (const attempt of attempts) {
     log(`[WAIT] Spawning NavMesh worker (${attempt.label})...`);
     try {
       const result = await runNavWorker(positions, indices, attempt.params, splatBounds);
@@ -229,18 +241,37 @@ export function useSplatFastNavR3F() {
   const [splatCount, setSplatCount] = useState<number | null>(null);
   const [maxShDegree, setMaxShDegree] = useState(DEFAULT_SLICE_SETTINGS.sh_degree);
   const [maxChunkExtent, setMaxChunkExtent] = useState(DEFAULT_SLICE_SETTINGS.chunk_extent);
+  const [navSettings, setNavSettings] = useState<DemoNavSettings>({ ...DEFAULT_DEMO_NAV_SETTINGS });
+  const [selectionRegionVisible, setSelectionRegionVisibleState] = useState(false);
+  const [hasLoadedSplat, setHasLoadedSplat] = useState(false);
+  const [hasNavMesh, setHasNavMesh] = useState(false);
 
   const wasmReady = useRef(false);
   const currentCollisionArtifact = useRef<CollisionBoundaryArtifact | null>(null);
   const currentBytes = useRef<Uint8Array | null>(null);
   const currentName = useRef('splat');
   const currentNavMeshData = useRef<Uint8Array | null>(null);
+  /** Stashed so Scale Environment set before load applies on first Fast Nav. */
+  const pendingEnvironmentScale = useRef(1);
+  /** Last selection-region AABB so hide→show can restore the user's box. */
+  const cachedSelectionRegion = useRef<{ min: number[]; max: number[] } | null>(null);
+  const navSettingsRef = useRef(navSettings);
+  navSettingsRef.current = navSettings;
+  const pruneFloaters = navSettings.pruneFloaters;
+  const setPruneFloaters = useCallback((enabled: boolean): void => {
+    setNavSettings((prev) => ({ ...prev, pruneFloaters: enabled }));
+  }, []);
 
   const isBusy = status === 'loading' || status === 'processing';
 
   const appendLog = useCallback((message: string): void => {
     setLogs((prev) => [...prev, parseLog(message)]);
   }, []);
+
+  const resetNavSettings = useCallback((): void => {
+    setNavSettings({ ...DEFAULT_DEMO_NAV_SETTINGS });
+    appendLog('[INFO] Navmesh settings reset to outdoor defaults.');
+  }, [appendLog]);
 
   useEffect(() => {
     splatwalk.onProgress = (stage, fraction): void => setProgress({ stage, fraction });
@@ -263,6 +294,13 @@ export function useSplatFastNavR3F() {
     currentBytes.current = null;
     currentName.current = 'splat';
     currentNavMeshData.current = null;
+    pendingEnvironmentScale.current = 1;
+    cachedSelectionRegion.current = null;
+    setNavSettings({ ...DEFAULT_DEMO_NAV_SETTINGS });
+    setSelectionRegionVisibleState(false);
+    setHasLoadedSplat(false);
+    setHasNavMesh(false);
+    controller.disableRegionSelection();
     controller.setEnvironmentScale(1);
     void controller.reset();
   }, [controller]);
@@ -270,9 +308,11 @@ export function useSplatFastNavR3F() {
   const processBytes = useCallback(
     async (bytes: Uint8Array, name: string): Promise<void> => {
       currentBytes.current = bytes;
+      setHasLoadedSplat(true);
       currentCollisionArtifact.current = null;
       currentName.current = name.replace(/\.(ply|spz|splat)$/i, '');
       currentNavMeshData.current = null;
+      setHasNavMesh(false);
       setMaxShDegree(inferPlyShDegree(bytes));
 
       if (!wasmReady.current) {
@@ -282,16 +322,25 @@ export function useSplatFastNavR3F() {
       }
 
       appendLog('[WAIT] Rendering Gaussian splat...');
+      controller.setEnvironmentScale(pendingEnvironmentScale.current);
       await controller.loadSplat(bytes);
       appendLog('[INFO] Splat visualized.');
 
+      const tuning = demoNavSettingsToFastNavTuning(navSettingsRef.current);
       const base: MeshSettings = {
         ...FAST_NAV_PRESET,
+        ...tuning.meshSettings,
         mode: 2,
         flip_y: true,
         rotation: [0, 0, 0],
         environment_scale: controller.getEnvironmentScale(),
+        prune_floaters: tuning.prune.enabled,
       };
+      const regionBounds = controller.getRegionBounds();
+      if (regionBounds) {
+        base.region_min = [...regionBounds.min];
+        base.region_max = [...regionBounds.max];
+      }
       let splatBounds: { min: number[]; max: number[] } | null = null;
       try {
         const bounds = await splatwalk.getSplatBounds(bytes, { ...base, prune_floaters: false });
@@ -306,6 +355,7 @@ export function useSplatFastNavR3F() {
 
       setStatus('processing');
       setStatusMessage('Running FAST NAV...');
+      appendLog(`[INFO] Floater prune: ${tuning.prune.enabled === false ? 'off' : 'on'}`);
 
       const recovery = resolveRecovery();
 
@@ -318,6 +368,7 @@ export function useSplatFastNavR3F() {
         debugIndices: Uint32Array
       ): Promise<void> => {
         currentNavMeshData.current = navMeshData;
+        setHasNavMesh(true);
         controller.showNavMesh(debugPositions, debugIndices);
         const playerSpawn = navMeshCentroid(debugPositions);
         const npcSpawn = farthestVertex(debugPositions, playerSpawn);
@@ -341,7 +392,11 @@ export function useSplatFastNavR3F() {
         base,
         recovery,
         recastAttempts: FAST_NAV_RECAST_ATTEMPTS,
-        preset: 'fast-nav-r3f-v1',
+        recastOverrides: tuning.recastOverrides,
+        floorMesh: tuning.floorMesh,
+        islandValidation: tuning.islandValidation,
+        navSettings: navSettingsRef.current,
+        preset: 'fast-nav-r3f-v2',
       });
       const cached = await getNavmesh(navCacheKey);
       if (cached) {
@@ -351,15 +406,25 @@ export function useSplatFastNavR3F() {
         return;
       }
 
-      // Seed: center of the suggested region, lifted to standing height.
+      // Seed: center of the pinned or suggested region, lifted to standing height.
       setPhase('prune');
       const carveHeight = FAST_NAV_PRESET.collision_carve_height ?? 1.7;
-      const suggested = await splatwalk.suggestRegion(bytes, base);
-      const seed = [
-        (suggested.region_min[0] + suggested.region_max[0]) * 0.5,
-        suggested.floor_y + carveHeight * 0.5,
-        (suggested.region_min[2] + suggested.region_max[2]) * 0.5,
-      ];
+      let seed: number[];
+      if (regionBounds) {
+        seed = [
+          (regionBounds.min[0] + regionBounds.max[0]) * 0.5,
+          (regionBounds.min[1] + regionBounds.max[1]) * 0.5,
+          (regionBounds.min[2] + regionBounds.max[2]) * 0.5,
+        ];
+        appendLog('[INFO] Using pinned selection region for Fast Nav.');
+      } else {
+        const suggested = await splatwalk.suggestRegion(bytes, base);
+        seed = [
+          (suggested.region_min[0] + suggested.region_max[0]) * 0.5,
+          suggested.floor_y + carveHeight * 0.5,
+          (suggested.region_min[2] + suggested.region_max[2]) * 0.5,
+        ];
+      }
       appendLog(`[INFO] Fast path seed: ${seed.map((v) => v.toFixed(3)).join(', ')}`);
 
       setPhase('floor');
@@ -369,6 +434,7 @@ export function useSplatFastNavR3F() {
         baseSettings: { ...base, collision_seed: seed },
         seed,
         recovery,
+        floorMesh: tuning.floorMesh,
         log: appendLog,
       });
       const floorMesh = extracted.floorMesh;
@@ -376,7 +442,13 @@ export function useSplatFastNavR3F() {
       appendLog(`[SUCCESS] Floor mesh ready (${floorMesh.selectedArea.toFixed(2)} m^2).`);
 
       setPhase('navmesh');
-      const nav = await generateNavMesh(floorMesh.positions, floorMesh.indices, splatBounds, appendLog);
+      const nav = await generateNavMesh(
+        floorMesh.positions,
+        floorMesh.indices,
+        splatBounds,
+        appendLog,
+        tuning.recastOverrides
+      );
       appendLog('[SUCCESS] NavMesh generated successfully.');
       await putNavmesh(navCacheKey, {
         navMeshData: nav.navMeshData,
@@ -406,7 +478,6 @@ export function useSplatFastNavR3F() {
         setStatus('loading');
         setStatusMessage(`Loading ${file.name}...`);
         appendLog(`[INFO] Loading file: ${file.name} (${file.size} bytes)`);
-        controller.setEnvironmentScale(1);
         const bytes = await readSplatBytes(file);
         await processBytes(bytes, file.name);
       } catch (error) {
@@ -443,7 +514,6 @@ export function useSplatFastNavR3F() {
           await splatwalk.init();
           wasmReady.current = true;
         }
-        controller.setEnvironmentScale(1);
         const bytes = await readSplatBytes(new File([raw], fileName));
         await processBytes(bytes, fileName);
       } catch (error) {
@@ -484,20 +554,37 @@ export function useSplatFastNavR3F() {
   const generateCollisionBoundary = useCallback(async (): Promise<CollisionBoundaryArtifact> => {
     const bytes = currentBytes.current;
     if (!bytes) throw new Error('No splat loaded to generate collision from.');
+    const tuning = demoNavSettingsToFastNavTuning(navSettingsRef.current);
     const base: MeshSettings = {
       ...FAST_NAV_PRESET,
+      ...tuning.meshSettings,
       mode: 2,
       flip_y: true,
       rotation: [0, 0, 0],
       environment_scale: controller.getEnvironmentScale(),
+      prune_floaters: tuning.prune.enabled,
     };
+    const regionBounds = controller.getRegionBounds();
+    if (regionBounds) {
+      base.region_min = [...regionBounds.min];
+      base.region_max = [...regionBounds.max];
+    }
     const carveHeight = FAST_NAV_PRESET.collision_carve_height ?? 1.7;
-    const suggested = await splatwalk.suggestRegion(bytes, base);
-    const seed = [
-      (suggested.region_min[0] + suggested.region_max[0]) * 0.5,
-      suggested.floor_y + carveHeight * 0.5,
-      (suggested.region_min[2] + suggested.region_max[2]) * 0.5,
-    ];
+    let seed: number[];
+    if (regionBounds) {
+      seed = [
+        (regionBounds.min[0] + regionBounds.max[0]) * 0.5,
+        (regionBounds.min[1] + regionBounds.max[1]) * 0.5,
+        (regionBounds.min[2] + regionBounds.max[2]) * 0.5,
+      ];
+    } else {
+      const suggested = await splatwalk.suggestRegion(bytes, base);
+      seed = [
+        (suggested.region_min[0] + suggested.region_max[0]) * 0.5,
+        suggested.floor_y + carveHeight * 0.5,
+        (suggested.region_min[2] + suggested.region_max[2]) * 0.5,
+      ];
+    }
     const artifact = await generateCollisionBoundaryArtifact({
       bytes,
       settings: buildCollisionBoundarySettings({
@@ -519,6 +606,126 @@ export function useSplatFastNavR3F() {
     return artifact;
   }, [appendLog, controller]);
 
+  const setSelectionRegionVisible = useCallback(
+    async (visible: boolean): Promise<void> => {
+      if (!visible) {
+        try {
+          const bounds = controller.getRegionBounds();
+          if (bounds) {
+            cachedSelectionRegion.current = {
+              min: [...bounds.min],
+              max: [...bounds.max],
+            };
+          }
+          controller.disableRegionSelection();
+          appendLog('[INFO] Selection region hidden — Fast Nav will auto-select a region.');
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          appendLog(`[WARN] Selection region hide cleanup: ${detail}`);
+        } finally {
+          // Always clear UI state even if gizmo teardown throws.
+          setSelectionRegionVisibleState(false);
+        }
+        return;
+      }
+
+      const bytes = currentBytes.current;
+      if (!bytes) {
+        throw new Error('Load a splat before showing the selection region.');
+      }
+
+      setErrorMessage(null);
+      try {
+        let region = cachedSelectionRegion.current;
+        if (!region) {
+          try {
+            const suggested = await splatwalk.suggestRegion(bytes, {
+              ...FAST_NAV_PRESET,
+              mode: 2,
+              flip_y: true,
+              rotation: [0, 0, 0],
+              prune_floaters: navSettingsRef.current.pruneFloaters,
+              environment_scale: controller.getEnvironmentScale(),
+            });
+            region = {
+              min: [...suggested.region_min],
+              max: [...suggested.region_max],
+            };
+            appendLog(
+              `[INFO] Selection region suggested: ` +
+                `${region.min.map((v) => v.toFixed(2)).join(', ')} → ` +
+                `${region.max.map((v) => v.toFixed(2)).join(', ')}`
+            );
+          } catch (suggestError) {
+            const splatBounds = controller.getSceneBounds();
+            if (!splatBounds) {
+              throw suggestError;
+            }
+            region = {
+              min: [...splatBounds.min],
+              max: [...splatBounds.max],
+            };
+            appendLog('[WARN] suggestRegion failed; using splat AABB for selection region.');
+          }
+          cachedSelectionRegion.current = region;
+        }
+        controller.enableRegionSelection({ min: region.min, max: region.max });
+        setSelectionRegionVisibleState(true);
+        appendLog(
+          '[INFO] Selection region shown — drag/scale the yellow box with the move + scale gizmos, then Recompute.'
+        );
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        setErrorMessage(detail);
+        try {
+          controller.disableRegionSelection();
+        } catch {
+          // Best-effort cleanup after a failed enable.
+        }
+        setSelectionRegionVisibleState(false);
+        appendLog(`[ERROR] ${detail}`);
+        throw error;
+      }
+    },
+    [appendLog, controller]
+  );
+
+  const rerunFastNav = useCallback(async (): Promise<void> => {
+    if (isBusy) {
+      return;
+    }
+    const bytes = currentBytes.current;
+    if (!bytes) {
+      throw new Error('Load a splat before re-running Fast Nav.');
+    }
+    if (selectionRegionVisible) {
+      const bounds = controller.getRegionBounds();
+      if (bounds) {
+        cachedSelectionRegion.current = {
+          min: [...bounds.min],
+          max: [...bounds.max],
+        };
+      }
+    }
+    setErrorMessage(null);
+    const regionNote = controller.getRegionBounds() ? ' (pinned region)' : '';
+    appendLog(`[INFO] Re-running FAST NAV${regionNote}…`);
+    setStatus('processing');
+    setStatusMessage('Re-running FAST NAV...');
+    setPhase('idle');
+    setProgress(null);
+    try {
+      await processBytes(bytes, `${currentName.current}.ply`);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      setErrorMessage(detail);
+      appendLog(`[ERROR] ${detail}`);
+      setStatus('error');
+      setStatusMessage('FAST NAV failed.');
+      throw error;
+    }
+  }, [appendLog, controller, isBusy, processBytes, selectionRegionVisible]);
+
   const exportCollisionMesh = useCallback(async (): Promise<Uint8Array> => {
     const artifact = currentCollisionArtifact.current ?? await generateCollisionBoundary();
     return exportCollisionBoundaryGlb({
@@ -537,34 +744,36 @@ export function useSplatFastNavR3F() {
     [controller]
   );
 
+  const setPendingEnvironmentScale = useCallback(
+    (scale: number): void => {
+      if (!Number.isFinite(scale) || scale <= 0) {
+        return;
+      }
+      pendingEnvironmentScale.current = scale;
+      controller.setEnvironmentScale(scale);
+    },
+    [controller]
+  );
+
   const applyEnvironmentScale = useCallback(
     async (scale: number): Promise<void> => {
       if (isBusy) return;
       if (!Number.isFinite(scale) || scale <= 0) {
         throw new Error('Scale Environment must be a positive number.');
       }
+      setErrorMessage(null);
+      setPendingEnvironmentScale(scale);
+
       const bytes = currentBytes.current;
       if (!bytes) {
-        throw new Error('Load a splat before applying environment scale.');
+        appendLog(`[INFO] Environment scale set to ${scale} (applies on next Fast Nav).`);
+        return;
       }
-      setErrorMessage(null);
-      controller.setEnvironmentScale(scale);
+
       appendLog(`[INFO] Environment scale set to ${scale}; re-running FAST NAV...`);
-      setStatus('processing');
-      setStatusMessage('Re-running FAST NAV at new scale...');
-      setPhase('idle');
-      setProgress(null);
-      try {
-        await processBytes(bytes, `${currentName.current}.ply`);
-      } catch (error) {
-        const detail = error instanceof Error ? error.message : String(error);
-        setErrorMessage(detail);
-        appendLog(`[ERROR] ${detail}`);
-        setStatus('error');
-        setStatusMessage('FAST NAV failed after scale.');
-      }
+      await rerunFastNav();
     },
-    [appendLog, controller, isBusy, processBytes]
+    [appendLog, isBusy, rerunFastNav, setPendingEnvironmentScale]
   );
 
   return {
@@ -588,7 +797,18 @@ export function useSplatFastNavR3F() {
     exportCollisionMesh,
     setCollisionBoundaryVisible,
     setNavMeshVisible,
+    navSettings,
+    setNavSettings,
+    resetNavSettings,
+    hasNavMesh,
+    pruneFloaters,
+    setPruneFloaters,
+    hasLoadedSplat,
+    selectionRegionVisible,
+    setSelectionRegionVisible,
+    rerunFastNav,
     applyEnvironmentScale,
+    setPendingEnvironmentScale,
     reset,
   };
 }
