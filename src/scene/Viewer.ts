@@ -1,5 +1,6 @@
 import {
     Engine,
+    Matrix,
     Scene,
     ArcRotateCamera,
     Vector3,
@@ -138,9 +139,9 @@ export class Viewer {
 
     /**
      * Bind existing streamed SOG meshes as the Viewer splat target.
-     * Stream visual rotation stays at identity offset (Babylon stream already
-     * orients PlayCanvas assets). Nav-PLY / WASM defaults to `-π/2` about X
-     * (SOG Z-up → Y-up bake) so debug PLY and Fast Nav share one adjustable euler.
+     * Preserves {@link GaussianSplattingStream}'s mesh orientation (Z-up→Y-up).
+     * WASM {@link getSplatRotation} matches the live stream by default (378ec846).
+     * SuperSplat-style assets can decouple nav-PLY via {@link setNavPlyRotation}.
      */
     public bindStreamVisualMeshes(): void {
         const candidates = this.scene.meshes.filter((mesh) => this.isStreamVisualMesh(mesh));
@@ -153,10 +154,13 @@ export class Viewer {
         this.splatMeshes = meshes;
         this.splatMesh = meshes[0]!;
         this.splatMesh.computeWorldMatrix(true);
-        this._streamVisualRotation = { x: 0, y: 0, z: 0 };
-        // SOG nav-PLY default: Z-up authoring → Y-up (matches prior debug PLY bake).
-        this.rotation = { x: -Math.PI / 2, y: 0, z: 0 };
-        this.applyStreamVisualRotationToMeshes();
+        this._streamVisualRotation = {
+            x: this.splatMesh.rotation.x,
+            y: this.splatMesh.rotation.y,
+            z: this.splatMesh.rotation.z,
+        };
+        this.rotation = { ...this._streamVisualRotation };
+        this._navRotationDecoupledFromVisual = false;
     }
 
     private applyStreamVisualRotationToMeshes(): void {
@@ -200,9 +204,17 @@ export class Viewer {
      * That weird vertical skatepark view is a transform bug, not a Recast tuning issue.
      */
     public assertGroundLooksYUp(): void {
-        const bounds = this.getLoadedSplatBounds();
+        let bounds = this.getLoadedSplatBounds();
         if (!bounds) {
             throw new Error('No splat bounds available for orientation check.');
+        }
+        // Stream handoff keeps the SOG visual at identity while WASM/nav PLY use
+        // {@link getSplatRotation}. Validate the nav bake, not the raw stream AABB.
+        if (this._navRotationDecoupledFromVisual && this._streamMeshesHiddenForDebug.length === 0) {
+            const localBounds = this.getLoadedSplatLocalBounds();
+            if (localBounds) {
+                bounds = this.boundsAfterNavRotation(localBounds, this.rotation);
+            }
         }
         const sizeX = bounds.max.x - bounds.min.x;
         const sizeY = bounds.max.y - bounds.min.y;
@@ -377,6 +389,12 @@ export class Viewer {
     private rotation: { x: number, y: number, z: number } = { x: 0, y: 0, z: 0 };
     /** Stream-visual-only orientation; does not affect WASM MeshSettings.rotation. */
     private _streamVisualRotation: { x: number, y: number, z: number } = { x: 0, y: 0, z: 0 };
+    /**
+     * When true, the stream SOG visual euler is decoupled from nav-PLY / WASM
+     * ({@link bindStreamVisualMeshes}). Orientation checks must bake {@link rotation}
+     * into local bounds instead of reading the live stream mesh world AABB.
+     */
+    private _navRotationDecoupledFromVisual = false;
     /** Absolute uniform environment scale (default 1). Does not scale player/NPC markers. */
     private _environmentScale = 1;
     private readonly _perfHud = new SplatPerfHud();
@@ -402,6 +420,7 @@ export class Viewer {
 
             // Reset rotation
             this.rotation = { x: 0, y: 0, z: 0 };
+            this._navRotationDecoupledFromVisual = false;
             this.splatMesh = null;
             this.splatMeshes = [];
 
@@ -480,6 +499,26 @@ export class Viewer {
         return (mesh.scaling?.y ?? 1) < 0;
     }
 
+    /**
+     * True when nav WASM consumes materialized SOG→PLY bytes while the live
+     * GaussianSplattingStream mesh supplies visual orientation separately.
+     */
+    public usesDecoupledStreamNavSource(): boolean {
+        return this._navRotationDecoupledFromVisual;
+    }
+
+    /**
+     * `flip_y` for WASM mesh settings. Streamed nav PLY is raw PlayCanvas Z-up
+     * (never through Babylon's PLY loader) but must match the stream's Y-flip
+     * contract (`GaussianSplattingStream` negates mesh.scaling.y).
+     */
+    public getWasmFlipY(): boolean {
+        if (this._navRotationDecoupledFromVisual) {
+            return true;
+        }
+        return this.isSplatYFlipped();
+    }
+
     public rotateSplat(axis: 'x' | 'y' | 'z'): void {
         if (!this.splatMesh) {
             console.warn("No splat mesh to rotate");
@@ -527,14 +566,24 @@ export class Viewer {
      */
     public rotateNavPly(axis: 'x' | 'y' | 'z'): void {
         this.rotation[axis] += Math.PI / 2;
+        this.syncNavRotationDecoupledFlag();
         this.applyNavPlyRotationToDebugMeshes();
         console.log(`[INFO] Nav PLY rotated ${axis} +90°. Current:`, this.rotation);
     }
 
-    /** Set absolute nav-PLY / WASM euler (radians). */
+    /** Set absolute nav-PLY / WASM euler (radians). Decouples from stream visual when it differs. */
     public setNavPlyRotation(euler: { x: number; y: number; z: number }): void {
         this.rotation = { x: euler.x, y: euler.y, z: euler.z };
+        this.syncNavRotationDecoupledFlag();
         this.applyNavPlyRotationToDebugMeshes();
+    }
+
+    private syncNavRotationDecoupledFlag(): void {
+        const eps = 1e-6;
+        this._navRotationDecoupledFromVisual =
+            Math.abs(this.rotation.x - this._streamVisualRotation.x) > eps ||
+            Math.abs(this.rotation.y - this._streamVisualRotation.y) > eps ||
+            Math.abs(this.rotation.z - this._streamVisualRotation.z) > eps;
     }
 
     /** Absolute uniform environment scale applied to the splat and collider overlays. */
@@ -708,9 +757,7 @@ export class Viewer {
     private preferredPlayerSpawn: Vector3 | null = null;
     private preferredNpcSpawn: Vector3 | null = null;
 
-    private getLoadedSplatBounds(): { min: Vector3, max: Vector3 } | null {
-        if (!this.splatMesh && this.splatMeshes.length === 0) return null;
-
+    private collectLoadedSplatMeshes(): Set<AbstractMesh> {
         const meshes = new Set<AbstractMesh>();
 
         if (this.splatMesh) {
@@ -727,6 +774,13 @@ export class Viewer {
             }
         }
 
+        return meshes;
+    }
+
+    private mergeMeshBounds(
+        meshes: Iterable<AbstractMesh>,
+        space: 'local' | 'world'
+    ): { min: Vector3; max: Vector3 } | null {
         let min: Vector3 | null = null;
         let max: Vector3 | null = null;
 
@@ -738,8 +792,8 @@ export class Viewer {
 
                 mesh.computeWorldMatrix(true);
                 const boundingBox = mesh.getBoundingInfo().boundingBox;
-                const meshMin = boundingBox.minimumWorld;
-                const meshMax = boundingBox.maximumWorld;
+                const meshMin = space === 'world' ? boundingBox.minimumWorld : boundingBox.minimum;
+                const meshMax = space === 'world' ? boundingBox.maximumWorld : boundingBox.maximum;
                 const values = [meshMin.x, meshMin.y, meshMin.z, meshMax.x, meshMax.y, meshMax.z];
 
                 if (!values.every(Number.isFinite)) {
@@ -758,6 +812,48 @@ export class Viewer {
         }
 
         return { min, max };
+    }
+
+    /** Axis-aligned bounds after applying nav-PLY euler about the box center. */
+    private boundsAfterNavRotation(
+        bounds: { min: Vector3; max: Vector3 },
+        euler: { x: number; y: number; z: number }
+    ): { min: Vector3; max: Vector3 } {
+        const center = bounds.min.add(bounds.max).scale(0.5);
+        const matrix = Matrix.RotationYawPitchRoll(euler.y, euler.x, euler.z);
+        const xs = [bounds.min.x, bounds.max.x];
+        const ys = [bounds.min.y, bounds.max.y];
+        const zs = [bounds.min.z, bounds.max.z];
+
+        let minOut: Vector3 | null = null;
+        let maxOut: Vector3 | null = null;
+
+        for (const x of xs) {
+            for (const y of ys) {
+                for (const z of zs) {
+                    const corner = new Vector3(x, y, z).subtract(center);
+                    const rotated = Vector3.TransformCoordinates(corner, matrix).add(center);
+                    minOut = minOut ? Vector3.Minimize(minOut, rotated) : rotated.clone();
+                    maxOut = maxOut ? Vector3.Maximize(maxOut, rotated) : rotated.clone();
+                }
+            }
+        }
+
+        return { min: minOut!, max: maxOut! };
+    }
+
+    private getLoadedSplatLocalBounds(): { min: Vector3; max: Vector3 } | null {
+        if (!this.splatMesh && this.splatMeshes.length === 0) {
+            return null;
+        }
+        return this.mergeMeshBounds(this.collectLoadedSplatMeshes(), 'local');
+    }
+
+    private getLoadedSplatBounds(): { min: Vector3, max: Vector3 } | null {
+        if (!this.splatMesh && this.splatMeshes.length === 0) {
+            return null;
+        }
+        return this.mergeMeshBounds(this.collectLoadedSplatMeshes(), 'world');
     }
 
     public enableRegionSelection(region?: { min: number[], max: number[] }): void {

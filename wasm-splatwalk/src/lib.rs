@@ -20,7 +20,7 @@ extern "C" {
 #[wasm_bindgen]
 pub fn init_splatwalk() -> String {
     console_error_panic_hook::set_once();
-    log("G2M WASM Initialized with Parsing Support");
+    log(&format!("💩🚶 SplatWalk v{} (api {})", core_semver(), API_VERSION));
     "Ready".to_string()
 }
 

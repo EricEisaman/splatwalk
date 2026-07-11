@@ -313,7 +313,7 @@ export function defaultFastMeshSettings(viewer: Viewer): MeshSettings {
     agent_radius_erode: 0,
     component_mode: 'largest',
     rotation: [rot.x, rot.y, rot.z],
-    flip_y: viewer.isSplatYFlipped(),
+    flip_y: viewer.getWasmFlipY(),
     environment_scale: viewer.getEnvironmentScale(),
   };
 }

@@ -697,8 +697,10 @@ const onRestoreStream = (): void => {
 
                     <div class="text-subtitle-2 mb-2">Orientation</div>
                     <p class="text-caption text-medium-emphasis mb-2">
-                      SuperSplat-style assets may need stream and nav-PLY offsets independently.
-                      PlayCanvas defaults: stream <code>0</code>, nav PLY <code>−90° X</code>.
+                      PlayCanvas CDN streams (skatepark, church) inherit the
+                      GaussianSplattingStream mesh rotation — nav PLY matches by
+                      default. Some SuperSplat exports need a separate nav-PLY offset
+                      (often −90° X on nav only).
                     </p>
                     <div class="d-flex flex-wrap align-center ga-2 mb-1">
                       <span class="text-caption text-medium-emphasis me-2">Stream</span>

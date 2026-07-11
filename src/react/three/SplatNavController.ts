@@ -382,6 +382,9 @@ export class SplatNavController {
   public setNavMeshVisible(visible: boolean): void {
     this.navMeshOverlayShown = visible;
     this.applyNavMeshOverlayVisibility();
+    if (!visible) {
+      this.clearFloorMesh();
+    }
   }
 
   /**
@@ -475,6 +478,7 @@ export class SplatNavController {
   /** Show the walkable navmesh overlay (green) and use it as the click target. */
   public showNavMesh(positions: Float32Array, indices: Uint32Array): void {
     if (!this.world) return;
+    this.clearFloorMesh();
     if (this.navMeshOverlay) {
       this.world.remove(this.navMeshOverlay);
       this.disposeMesh(this.navMeshOverlay);
@@ -643,6 +647,15 @@ export class SplatNavController {
     const local = this.navMeshOverlay.worldToLocal(hit.point.clone());
     const snapped = this.snapToNavMesh([local.x, local.y, local.z]) ?? [local.x, local.y, local.z];
     this.playerAgent.requestMoveTarget({ x: snapped[0], y: snapped[1], z: snapped[2] });
+  }
+
+  private clearFloorMesh(): void {
+    if (!this.floorMesh || !this.world) {
+      return;
+    }
+    this.world.remove(this.floorMesh);
+    this.disposeMesh(this.floorMesh);
+    this.floorMesh = null;
   }
 
   private applyNavMeshOverlayVisibility(): void {

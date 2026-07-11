@@ -117,9 +117,6 @@ const DEFAULT_FLY_SPEED = 2.5;
 const DEFAULT_ANGULAR_SENSIBILITY = 2000;
 const SHIFT_SPEED_MULTIPLIER = 10;
 
-/** SOG nav-PLY default: Z-up authoring → Y-up (matches prior debug PLY bake). */
-const DEFAULT_NAV_PLY_ROTATION = { x: -Math.PI / 2, y: 0, z: 0 } as const;
-
 type EulerAxes = { x: number; y: number; z: number };
 type RotationAxis = 'x' | 'y' | 'z';
 type FlyCameraExtras = FreeCamera & {
@@ -252,7 +249,7 @@ export const useStorageAdapterDemo = (
   const navSettings = ref<StreamedNavSettings>({ ...DEFAULT_STREAMED_NAV_SETTINGS });
   const selectionRegionVisible = ref(false);
   const streamVisualRotation = ref<EulerAxes>({ x: 0, y: 0, z: 0 });
-  const navPlyRotation = ref<EulerAxes>({ ...DEFAULT_NAV_PLY_ROTATION });
+  const navPlyRotation = ref<EulerAxes>({ x: 0, y: 0, z: 0 });
   const streamVisualRotationLabel = computed(() => eulerDegreesLabel(streamVisualRotation.value));
   const navPlyRotationLabel = computed(() => eulerDegreesLabel(navPlyRotation.value));
   const statusMessage = ref('Ready — load a CDN lod-meta.json URL or a SplatWalk SOD LOD zip.');
@@ -390,6 +387,35 @@ export const useStorageAdapterDemo = (
     }
   };
 
+  /** Capture GaussianSplattingStream's default mesh euler (Z-up→Y-up) for fly-cam UI. */
+  const captureStreamVisualRotationFromScene = (): void => {
+    if (!scene) {
+      return;
+    }
+    for (const mesh of scene.meshes) {
+      const className = mesh.getClassName();
+      if (
+        className.includes('Gaussian') ||
+        className.includes('Splatting') ||
+        mesh.name === 'storageAdapterSogStream' ||
+        mesh.name === 'GaussianSplattingStream'
+      ) {
+        mesh.computeWorldMatrix(true);
+        streamVisualRotation.value = {
+          x: mesh.rotation.x,
+          y: mesh.rotation.y,
+          z: mesh.rotation.z,
+        };
+        navPlyRotation.value = { ...streamVisualRotation.value };
+        addLog(
+          `[INFO] Stream visual rotation: ${streamVisualRotationLabel.value} ` +
+            `(nav PLY matches stream; use Nav PLY rotate for SuperSplat-style offsets)`
+        );
+        return;
+      }
+    }
+  };
+
   const resetStreamState = (): void => {
     streamManifest = null;
     streamAccess = null;
@@ -404,7 +430,7 @@ export const useStorageAdapterDemo = (
     streamResidency.value = null;
     navPhase.value = 'idle';
     streamVisualRotation.value = { x: 0, y: 0, z: 0 };
-    navPlyRotation.value = { ...DEFAULT_NAV_PLY_ROTATION };
+    navPlyRotation.value = { x: 0, y: 0, z: 0 };
   };
 
   const clear = (): void => {
@@ -490,6 +516,7 @@ export const useStorageAdapterDemo = (
         environmentPath: result.summary.environment,
         stream: result.stream,
       });
+      captureStreamVisualRotationFromScene();
       const residency = streamResidency.value;
       const resident = result.streamOptions.maxResidentSplats ?? 0;
       statusMessage.value =
@@ -558,6 +585,7 @@ export const useStorageAdapterDemo = (
         environmentPath: result.summary.environment,
         stream: result.stream,
       });
+      captureStreamVisualRotationFromScene();
       const residency = streamResidency.value;
       const resident = result.streamOptions.maxResidentSplats ?? 0;
       statusMessage.value =
@@ -653,9 +681,17 @@ export const useStorageAdapterDemo = (
       },
     });
     window.addEventListener('resize', resize);
-    // Restore user orientation offsets after bindStreamVisualMeshes defaults.
-    viewer.setStreamVisualRotation(streamVisualRotation.value);
-    viewer.setNavPlyRotation(navPlyRotation.value);
+    streamVisualRotation.value = viewer.getStreamVisualRotation();
+    const navFromStream = viewer.getSplatRotation();
+    const navDiffersFromStream =
+      Math.abs(navPlyRotation.value.x - streamVisualRotation.value.x) > 1e-6 ||
+      Math.abs(navPlyRotation.value.y - streamVisualRotation.value.y) > 1e-6 ||
+      Math.abs(navPlyRotation.value.z - streamVisualRotation.value.z) > 1e-6;
+    if (navDiffersFromStream) {
+      viewer.setNavPlyRotation(navPlyRotation.value);
+    } else {
+      navPlyRotation.value = { ...navFromStream };
+    }
 
     if (!viewer.hasLoadedSplat()) {
       disposeViewer();
@@ -810,7 +846,7 @@ export const useStorageAdapterDemo = (
         const suggested = await splatwalk.suggestRegion(plyBytes, {
           ...FAST_NAV_PRESET,
           mode: 2,
-          flip_y: activeViewer.isSplatYFlipped(),
+          flip_y: activeViewer.getWasmFlipY(),
           rotation: [rotation.x, rotation.y, rotation.z],
           prune_floaters: navSettings.value.pruneFloaters,
         });
@@ -865,7 +901,7 @@ export const useStorageAdapterDemo = (
             : {}),
         },
         emitGlb: true,
-        flipY: activeViewer.isSplatYFlipped(),
+        flipY: activeViewer.getWasmFlipY(),
         rotation: [rotation.x, rotation.y, rotation.z],
         seed: seedFromRegionBounds({ regionBounds }),
       });

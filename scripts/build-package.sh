@@ -99,7 +99,7 @@ const pkg = {
   ],
   sideEffects: false,
   // Provenance is enabled in CI via NPM_CONFIG_PROVENANCE=true (see release.yml),
-  // not here: baking it into publishConfig breaks a local/non-OIDC `npm publish`.
+  // not here: baking it into publishConfig breaks a local/non-OIDC npm publish.
   publishConfig: { access: 'public' },
 };
 fs.writeFileSync('$OUT/package.json', JSON.stringify(pkg, null, 2) + '\n');

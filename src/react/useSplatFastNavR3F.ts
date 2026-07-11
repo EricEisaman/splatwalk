@@ -438,7 +438,6 @@ export function useSplatFastNavR3F() {
         log: appendLog,
       });
       const floorMesh = extracted.floorMesh;
-      controller.showFloor(floorMesh.positions, floorMesh.indices);
       appendLog(`[SUCCESS] Floor mesh ready (${floorMesh.selectedArea.toFixed(2)} m^2).`);
 
       setPhase('navmesh');

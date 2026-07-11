@@ -37,6 +37,7 @@ services:
         - index.html
         - vuetify.html
         - react.html
+        - storage-adapter-app.html
       ignoredPaths:
         - README.md
         - .git/**

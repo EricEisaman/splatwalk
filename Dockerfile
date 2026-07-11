@@ -107,6 +107,7 @@ COPY src ./src
 COPY index.html ./
 COPY vuetify.html ./
 COPY react.html ./
+COPY storage-adapter-app.html ./
 COPY vite.config.ts ./
 COPY tsconfig.json ./
 COPY tsconfig.react.json ./
