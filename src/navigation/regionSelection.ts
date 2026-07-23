@@ -10,6 +10,12 @@ export const MIN_REGION_FOOTPRINT_METERS = 0.5;
 /** Minimum vertical extent (meters) — person-scale volume, not a plane. */
 export const MIN_REGION_HEIGHT_METERS = 2.0;
 
+/** Extra height above floor for voxel-collision regions (stairs / upper landing). */
+export const REGION_STAIR_HEADROOM_METERS = 4.0;
+
+/** Drop below suggested floor so treads / basement lip stay inside the box. */
+export const REGION_STAIR_FOOTROOM_METERS = 1.0;
+
 export interface RegionAabb {
   readonly min: readonly [number, number, number] | readonly number[];
   readonly max: readonly [number, number, number] | readonly number[];
@@ -59,3 +65,19 @@ export const regionSelectionSize = (
   y: region.max[1] - region.min[1],
   z: region.max[2] - region.min[2],
 });
+
+/**
+ * Expand a selection region vertically so voxel carve can reach stair runs and
+ * landings (suggestRegion often returns a thin floor slab).
+ */
+export const expandRegionForVoxelStairs = (
+  region: RegionAabb,
+  carveHeight = 1.6
+): MutableRegionAabb => {
+  const base = ensureRegionSelectionVolume(region);
+  const floorY = base.min[1]!;
+  base.min[1] = floorY - REGION_STAIR_FOOTROOM_METERS;
+  const minCeiling = floorY + carveHeight + REGION_STAIR_HEADROOM_METERS;
+  base.max[1] = Math.max(base.max[1]!, minCeiling);
+  return base;
+};

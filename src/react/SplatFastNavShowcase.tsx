@@ -33,6 +33,7 @@ import FullscreenIcon from '@mui/icons-material/Fullscreen';
 import FullscreenExitIcon from '@mui/icons-material/FullscreenExit';
 import LayersIcon from '@mui/icons-material/Layers';
 import LayersClearIcon from '@mui/icons-material/LayersClear';
+import PersonPinCircleIcon from '@mui/icons-material/PersonPinCircle';
 import RadioButtonUncheckedIcon from '@mui/icons-material/RadioButtonUnchecked';
 import RefreshIcon from '@mui/icons-material/Refresh';
 import ViewInArIcon from '@mui/icons-material/ViewInAr';
@@ -41,6 +42,7 @@ import { SceneCanvas } from '@/react/SceneCanvas';
 import { DEFAULT_EXAMPLE_SCENES } from '@/react/exampleScenes';
 import { useSplatFastNavR3F, type LogTag, type SogExportMode } from '@/react/useSplatFastNavR3F';
 import type { DemoNavSettings } from '@/navigation/navSettings';
+import { downloadIntegrationKit } from '@/utils/downloadIntegrationKit';
 import {
   clampSliceSettingsForScene,
   DEFAULT_AUTO_SLICE_THRESHOLD,
@@ -104,10 +106,19 @@ export function SplatFastNavShowcase(): JSX.Element {
     loadAndProcess,
     loadExample,
     exportNavmesh,
+    downloadNavArtifacts,
+    uploadNavArtifacts,
+    hasNavArtifactBundle,
+    navArtifactUploadHint,
+    cameraSelectOffsets,
+    setCameraSelectOffsets,
+    resetCameraSelectOffsets,
+    applySelectRegionFromCamera,
     generateCollisionBoundary,
     exportCollisionMesh,
     setCollisionBoundaryVisible,
     setNavMeshVisible,
+    goToPlayer,
     exportSog,
     applyEnvironmentScale,
     setPendingEnvironmentScale,
@@ -125,6 +136,7 @@ export function SplatFastNavShowcase(): JSX.Element {
   } = nav;
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const navArtifactsInputRef = useRef<HTMLInputElement | null>(null);
   const cardRef = useRef<HTMLDivElement | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -390,16 +402,45 @@ export function SplatFastNavShowcase(): JSX.Element {
   };
 
   return (
-    <Container maxWidth="lg" sx={{ py: 4 }}>
+    <Container maxWidth={false} sx={{ px: { xs: 2, sm: 3 }, py: 4 }}>
       <Grid container justifyContent="center">
         <Grid item xs={12} md={10} lg={9}>
           <Typography variant="h5" sx={{ fontWeight: 900, textTransform: 'uppercase', mb: 1 }}>
             Gaussian Splat <Box component="span" sx={{ color: 'primary.main' }}>FAST NAV</Box>
           </Typography>
-          <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }}>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
             Drop a <strong>.ply</strong> or <strong>.spz</strong> 3D Gaussian Splat. It renders in React Three
             Fiber, auto-runs the FAST NAV pipeline (floor field &rarr; navmesh &rarr; crowd &rarr; NPC), then frames the
             player top-down. Click the green navmesh to move the player.
+          </Typography>
+
+          <Stack direction="row" flexWrap="wrap" useFlexGap spacing={2} alignItems="center" sx={{ mb: 1 }}>
+            <Button
+              variant="outlined"
+              color="primary"
+              startIcon={<DownloadIcon />}
+              disabled={isBusy}
+              onClick={() => downloadIntegrationKit('r3f')}
+            >
+              Download FastNav kit
+            </Button>
+            <ToggleButtonGroup
+              exclusive
+              size="small"
+              value="webgl"
+              aria-label="Renderer preference"
+            >
+              <ToggleButton value="webgpu" disabled aria-label="WebGPU unavailable for R3F splat path">
+                WebGPU
+              </ToggleButton>
+              <ToggleButton value="webgl" aria-label="WebGL">
+                WebGL
+              </ToggleButton>
+            </ToggleButtonGroup>
+            <Chip size="small" color="secondary" variant="outlined" label="active: webgl" />
+          </Stack>
+          <Typography variant="caption" color="text.secondary" display="block" sx={{ mb: 3 }}>
+            R3F splat path uses Three.js WebGL (<code>gaussian-splats-3d</code>). WebGPU is not available here.
           </Typography>
 
           <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, mb: 3 }}>
@@ -617,13 +658,59 @@ export function SplatFastNavShowcase(): JSX.Element {
                   label="Selection region"
                 />
               </Box>
-              <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 2 }}>
+              <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1 }}>
                 Prune overrides WASM floater removal for Fast Nav and collision (set before load or
                 before Recompute). When Selection region is shown, the yellow box is the pinned
                 consideration region (move + scale gizmos together); when hidden, Fast Nav auto-selects
                 a boxed region. Selection region unlocks after the splat loads and Fast Nav finishes
                 (success or fail).
               </Typography>
+              <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1 }}>
+                Camera select AABB (m)
+              </Typography>
+              <Grid container spacing={1} sx={{ mb: 1 }}>
+                {(
+                  [
+                    ['left', 'Left'],
+                    ['right', 'Right'],
+                    ['forward', 'Forward'],
+                    ['behind', 'Behind'],
+                    ['below', 'Below'],
+                    ['above', 'Above'],
+                  ] as const
+                ).map(([key, label]) => (
+                  <Grid key={key} item xs={6} sm={4} md={2}>
+                    <TextField
+                      size="small"
+                      type="number"
+                      label={label}
+                      value={cameraSelectOffsets[key]}
+                      disabled={isBusy}
+                      inputProps={{ min: 0, step: 0.5 }}
+                      onChange={(e) => {
+                        const n = Number(e.target.value);
+                        if (Number.isFinite(n) && n >= 0) {
+                          setCameraSelectOffsets({ [key]: n });
+                        }
+                      }}
+                    />
+                  </Grid>
+                ))}
+              </Grid>
+              <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, mb: 2 }}>
+                <Button
+                  size="small"
+                  variant="outlined"
+                  color="warning"
+                  disabled={isBusy || !hasLoadedSplat}
+                  onClick={() => applySelectRegionFromCamera()}
+                >
+                  Apply select region from camera
+                </Button>
+                <Button size="small" disabled={isBusy} onClick={() => resetCameraSelectOffsets()}>
+                  Reset offsets
+                </Button>
+              </Box>
 
               <Typography variant="subtitle2" sx={{ mb: 1 }}>
                 Floor coverage
@@ -731,6 +818,16 @@ export function SplatFastNavShowcase(): JSX.Element {
                     }
                     label={navMeshVisible ? 'Shown' : 'Hidden'}
                   />
+                  <Button
+                    size="small"
+                    variant="outlined"
+                    color="secondary"
+                    startIcon={<PersonPinCircleIcon />}
+                    disabled={isBusy}
+                    onClick={goToPlayer}
+                  >
+                    Go to Player
+                  </Button>
                 </Paper>
               )}
 
@@ -780,7 +877,57 @@ export function SplatFastNavShowcase(): JSX.Element {
                   <Button startIcon={<DownloadIcon />} disabled={navExporting} onClick={() => void runNavmeshExport()}>
                     Export navmesh (.nav)
                   </Button>
+                  <Button
+                    startIcon={<DownloadIcon />}
+                    disabled={!hasNavArtifactBundle || isBusy}
+                    onClick={() => downloadNavArtifacts()}
+                  >
+                    Download nav artifacts
+                  </Button>
+                  <Box
+                    sx={{
+                      position: 'relative',
+                      display: 'inline-flex',
+                      pointerEvents: !hasLoadedSplat || isBusy ? 'none' : 'auto',
+                    }}
+                    title={navArtifactUploadHint}
+                  >
+                    <Button
+                      startIcon={<CloudUploadIcon />}
+                      disabled={!hasLoadedSplat || isBusy}
+                      tabIndex={-1}
+                    >
+                      Upload nav artifacts
+                    </Button>
+                    {hasLoadedSplat && !isBusy ? (
+                      <input
+                        ref={navArtifactsInputRef}
+                        type="file"
+                        multiple
+                        accept=".zip,application/zip,.glb,.bin,.json,application/json"
+                        title={navArtifactUploadHint}
+                        style={{
+                          position: 'absolute',
+                          inset: 0,
+                          opacity: 0,
+                          cursor: 'pointer',
+                          zIndex: 1,
+                          fontSize: 0,
+                        }}
+                        onChange={(e) => {
+                          const files = e.target.files;
+                          e.target.value = '';
+                          if (files && files.length > 0) {
+                            void uploadNavArtifacts(files).catch(() => undefined);
+                          }
+                        }}
+                      />
+                    ) : null}
+                  </Box>
                 </Box>
+                <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 2 }}>
+                  {navArtifactUploadHint}
+                </Typography>
 
                 <Paper
                   variant="outlined"

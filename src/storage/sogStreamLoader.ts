@@ -1,7 +1,7 @@
 /**
- * Load PlayCanvas / Babylon streamed SOG (lod-meta.json) from a CDN URL or a
- * local SplatWalk store-only zip, using Babylon 9.16 GaussianSplattingStream
- * with a fixed resident memory budget (city-scale safe up to 200M+ catalogs).
+ * Load streamed SOG (lod-meta.json) from a CDN URL or a local SplatWalk
+ * store-only zip via {@link GaussianSplattingStream} with a fixed resident
+ * memory budget (city-scale safe up to 200M+ catalogs).
  */
 
 import type { AbstractMesh, Scene } from '@babylonjs/core';
@@ -113,9 +113,9 @@ const resolveStreamOptions = (params: {
   // Never allow callers to strip the resident budget (city-scale invariant).
   const maxResidentSplats = Math.max(
     1,
-    merged.maxResidentSplats ?? fromSettings.maxResidentSplats ?? 4_000_000
+    merged.maxResidentSplats ?? fromSettings.maxResidentSplats ?? 2_000_000
   );
-  const memoryBudgetMb = Math.max(1, merged.memoryBudgetMb ?? fromSettings.memoryBudgetMb ?? 384);
+  const memoryBudgetMb = Math.max(1, merged.memoryBudgetMb ?? fromSettings.memoryBudgetMb ?? 192);
   return {
     ...merged,
     // Bundle fflate so environment/*.sog unzip does not depend on unpkg CDN (sky).
@@ -146,6 +146,33 @@ export const assertLodMetaCdnUrl = (raw: string): string => {
     throw new Error('URL must point directly to lod-meta.json.');
   }
   return parsed.href;
+};
+
+/**
+ * Resolve a CDN stream URL to a lod-meta.json href.
+ * Accepts a full `…/lod-meta.json` URL or a directory/root URL (appends lod-meta.json).
+ */
+export const resolveLodMetaCdnUrl = (raw: string): string => {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    throw new Error('Paste a full https:// …/lod-meta.json URL.');
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    throw new Error('Invalid URL. Paste a full https:// …/lod-meta.json link.');
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    throw new Error('URL must use http or https.');
+  }
+  if (!parsed.pathname.toLowerCase().endsWith(LOD_META_BASENAME)) {
+    const base = parsed.pathname.endsWith('/')
+      ? parsed.pathname.slice(0, -1)
+      : parsed.pathname;
+    parsed.pathname = `${base}/${LOD_META_BASENAME}`;
+  }
+  return assertLodMetaCdnUrl(parsed.href);
 };
 
 export const isSogLodMetadata = (data: unknown): data is ISOGLODMetadata =>
@@ -322,7 +349,7 @@ export const loadCdnLodMeta = async (params: {
   assertNotInterimLodMeta(raw);
   if (!isSogLodMetadata(raw)) {
     throw new Error(
-      'lod-meta.json does not match PlayCanvas/Babylon streamed SOG metadata (lodLevels, filenames, tree).'
+      'lod-meta.json does not match streamed SOG metadata (lodLevels, filenames, tree).'
     );
   }
 
@@ -389,7 +416,7 @@ export const loadLocalSogZip = async (params: {
   assertNotInterimLodMeta(raw);
   if (!isSogLodMetadata(raw)) {
     throw new Error(
-      'lod-meta.json does not match PlayCanvas/Babylon streamed SOG metadata (lodLevels, filenames, tree).'
+      'lod-meta.json does not match streamed SOG metadata (lodLevels, filenames, tree).'
     );
   }
 

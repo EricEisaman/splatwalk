@@ -66,7 +66,7 @@ export interface FastNavTuningFromSettings {
     cellBandBelow: number;
     cellBandAbove: number;
   };
-  readonly islandValidation: { maxSeedDistance: number };
+  readonly islandValidation: { maxSeedDistance: number; mergeNearbyIslands: boolean };
   readonly meshSettings: {
     sdf_cell_size: number;
     sdf_density_threshold: number;
@@ -107,5 +107,7 @@ export const demoNavSettingsToFastNavTuning = (
   },
   islandValidation: {
     maxSeedDistance: settings.maxIslandSeedDistance,
+    mergeNearbyIslands:
+      settings.maxIslandSeedDistance >= DEFAULT_DEMO_NAV_SETTINGS.maxIslandSeedDistance,
   },
 });

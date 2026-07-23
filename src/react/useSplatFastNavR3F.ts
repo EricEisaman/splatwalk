@@ -8,12 +8,26 @@ import {
   generateCollisionBoundary as generateCollisionBoundaryArtifact,
   type CollisionBoundaryArtifact,
 } from '@/collision/voxelBoundary';
+import { applyNavArtifactsToR3F } from '@/navigation/applyNavArtifacts';
+import {
+  DEFAULT_CAMERA_SELECT_REGION_OFFSETS,
+  regionBoundsFromCameraSelect,
+  type CameraSelectRegionInput,
+  type CameraSelectRegionOffsets,
+} from '@/navigation/cameraSelectRegion';
 import {
   FAST_NAV_PRESET,
   extractFloorFieldWithRecovery,
   resolveRecovery,
   type FastNavLogger,
 } from '@/navigation/floor';
+import {
+  buildMinimalNavArtifactBundle,
+  downloadNavArtifactZip,
+  parseNavArtifactFiles,
+  type NavArtifactBundle,
+} from '@/navigation/navArtifactBundle';
+import { NAV_ARTIFACT_UPLOAD_HINT } from '@/navigation/navArtifactContract';
 import {
   DEFAULT_DEMO_NAV_SETTINGS,
   demoNavSettingsToFastNavTuning,
@@ -30,6 +44,12 @@ import {
   type SliceSettings,
 } from '@/wasm/sogTypes';
 import { SplatNavController } from '@/react/three/SplatNavController';
+
+/** Options for {@link useSplatFastNavR3F} (mirrors Babylon `useSplatFastNav`). */
+export interface UseSplatFastNavR3FOptions {
+  readonly cameraSelect?: CameraSelectRegionInput;
+  readonly keepCameraSelectView?: boolean;
+}
 
 export type SogExportMode = 'streamed' | 'single';
 export type FastNavStatus = 'idle' | 'loading' | 'processing' | 'done' | 'error';
@@ -228,9 +248,27 @@ function farthestVertex(
  * it, auto-run FAST NAV (floor field -> floor mesh -> Recast navmesh -> crowd +
  * NPC), then frame the player. Mirrors the Vuetify `useSplatFastNav`, but drives
  * the three.js {@link SplatNavController} instead of the Babylon viewer.
+ *
+ * When `cameraSelect` is set, pins {@link SplatNavController.enableRegionSelection}
+ * from the derived AABB and restores that view after nav (skips top-down focus).
  */
-export function useSplatFastNavR3F() {
+export function useSplatFastNavR3F(options: UseSplatFastNavR3FOptions = {}) {
   const controller = useMemo(() => new SplatNavController(), []);
+  const cameraSelectRef = useRef(options.cameraSelect);
+  const keepCameraSelectViewRef = useRef(options.keepCameraSelectView !== false);
+  keepCameraSelectViewRef.current = options.keepCameraSelectView !== false;
+  useEffect(() => {
+    if (options.cameraSelect) {
+      cameraSelectRef.current = options.cameraSelect;
+    }
+  }, [options.cameraSelect]);
+  const currentNavArtifactBundle = useRef<NavArtifactBundle | null>(null);
+  const [hasNavArtifactBundle, setHasNavArtifactBundle] = useState(false);
+  const [cameraSelectOffsets, setCameraSelectOffsetsState] = useState<CameraSelectRegionOffsets>({
+    ...DEFAULT_CAMERA_SELECT_REGION_OFFSETS,
+  });
+  const cameraSelectOffsetsRef = useRef(cameraSelectOffsets);
+  cameraSelectOffsetsRef.current = cameraSelectOffsets;
 
   const [status, setStatus] = useState<FastNavStatus>('idle');
   const [statusMessage, setStatusMessage] = useState('Drop a .ply, .spz, or .splat splat to begin.');
@@ -326,6 +364,18 @@ export function useSplatFastNavR3F() {
       await controller.loadSplat(bytes);
       appendLog('[INFO] Splat visualized.');
 
+      const cameraSelect = cameraSelectRef.current;
+      if (cameraSelect) {
+        const bounds = regionBoundsFromCameraSelect(cameraSelect);
+        controller.enableRegionSelection({ min: bounds.min, max: bounds.max });
+        setSelectionRegionVisibleState(true);
+        appendLog(
+          `[INFO] Camera select region pinned: ` +
+            `${bounds.min.map((v) => v.toFixed(2)).join(', ')} → ` +
+            `${bounds.max.map((v) => v.toFixed(2)).join(', ')}`
+        );
+      }
+
       const tuning = demoNavSettingsToFastNavTuning(navSettingsRef.current);
       const base: MeshSettings = {
         ...FAST_NAV_PRESET,
@@ -376,10 +426,26 @@ export function useSplatFastNavR3F() {
         controller.addNPC(npcSpawn);
         appendLog('[SUCCESS] Crowd ready: player + NPC spawned.');
 
+        const region = controller.getRegionBounds();
+        currentNavArtifactBundle.current = buildMinimalNavArtifactBundle({
+          navMeshData,
+          playerSpawn,
+          regionMax: region?.max ?? null,
+          regionMin: region?.min ?? null,
+        });
+        setHasNavArtifactBundle(true);
+
         setPhase('done');
         setProgress(null);
-        setStatusMessage('Framing the player (top-down)...');
-        controller.focusOnPlayer();
+        const keepView =
+          cameraSelectRef.current !== undefined && keepCameraSelectViewRef.current;
+        if (keepView && cameraSelectRef.current) {
+          controller.applyCameraSelectView(cameraSelectRef.current.view);
+          appendLog('[INFO] Restored camera select view after nav (skipped top-down focus).');
+        } else {
+          setStatusMessage('Framing the player (top-down)...');
+          controller.focusOnPlayer();
+        }
 
         setStatus('done');
         setStatusMessage('FAST NAV complete. Click the navmesh to move the player.');
@@ -775,6 +841,115 @@ export function useSplatFastNavR3F() {
     [appendLog, isBusy, rerunFastNav, setPendingEnvironmentScale]
   );
 
+  const resetCameraSelectOffsets = useCallback((): void => {
+    setCameraSelectOffsetsState({ ...DEFAULT_CAMERA_SELECT_REGION_OFFSETS });
+  }, []);
+
+  const setCameraSelectOffsets = useCallback(
+    (partial: Partial<CameraSelectRegionOffsets>): void => {
+      setCameraSelectOffsetsState((prev) => ({ ...prev, ...partial }));
+    },
+    []
+  );
+
+  const applySelectRegionFromCamera = useCallback((): void => {
+    const position = controller.getCameraPosition();
+    if (!position) {
+      appendLog('[WARN] Apply select region from camera: controller not attached.');
+      return;
+    }
+    const input: CameraSelectRegionInput = {
+      view: {
+        position,
+        // OrbitControls: yaw not exposed as FreeCamera euler — footprint uses yaw 0.
+        eulerDegrees: { x: 0, y: 0, z: 0 },
+      },
+      offsets: { ...cameraSelectOffsetsRef.current },
+    };
+    cameraSelectRef.current = input;
+    const bounds = regionBoundsFromCameraSelect(input);
+    controller.enableRegionSelection({ min: bounds.min, max: bounds.max });
+    setSelectionRegionVisibleState(true);
+    appendLog(
+      `[INFO] Camera select region pinned: ` +
+        `${bounds.min.map((v) => v.toFixed(2)).join(', ')} → ` +
+        `${bounds.max.map((v) => v.toFixed(2)).join(', ')}`
+    );
+  }, [appendLog, controller]);
+
+  const downloadNavArtifacts = useCallback((): void => {
+    const bundle = currentNavArtifactBundle.current;
+    if (!bundle) {
+      appendLog('[WARN] No nav artifact pack — run Fast Nav first.');
+      return;
+    }
+    downloadNavArtifactZip({ bundle, slug: currentName.current });
+    appendLog(`[SUCCESS] Downloaded nav-artifacts-${currentName.current}.zip`);
+  }, [appendLog]);
+
+  const uploadNavArtifacts = useCallback(
+    async (files: File[] | FileList): Promise<void> => {
+      const list = Array.from(files);
+      appendLog(
+        `[INFO] Uploading nav artifacts (${list.length} file${list.length === 1 ? '' : 's'}: ` +
+          `${list.map((f) => f.name).join(', ') || '(none)'})…`
+      );
+      if (isBusy) {
+        appendLog('[WARN] Upload ignored — another job is still running.');
+        return;
+      }
+      if (!hasLoadedSplat) {
+        const detail = 'Load a splat before uploading nav artifacts.';
+        appendLog(`[ERROR] ${detail}`);
+        throw new Error(detail);
+      }
+      setErrorMessage(null);
+      try {
+        setStatus('processing');
+        setStatusMessage('Uploading nav artifacts...');
+        const parsed = await parseNavArtifactFiles(list);
+        appendLog(
+          `[INFO] Parsed pack: locomotion=${parsed.session.locomotionMode}` +
+            (parsed.bundle.recastNavmeshBin ? ', recast.navmesh.bin' : '') +
+            (parsed.volume ? ', volume trio' : '')
+        );
+        currentNavArtifactBundle.current = parsed.bundle;
+        setHasNavArtifactBundle(true);
+        if (parsed.bundle.recastNavmeshBin) {
+          currentNavMeshData.current = parsed.bundle.recastNavmeshBin;
+        }
+        await applyNavArtifactsToR3F({
+          controller,
+          onLog: appendLog,
+          parsed,
+        });
+        setHasNavMesh(true);
+        setStatus('done');
+        setStatusMessage(
+          'Nav artifacts restored. Top-down framed — click the navmesh to move.'
+        );
+        appendLog(`[SUCCESS] Uploaded nav artifacts. ${NAV_ARTIFACT_UPLOAD_HINT}`);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        setErrorMessage(detail);
+        appendLog(`[ERROR] ${detail}`);
+        setStatus('error');
+        setStatusMessage('Upload nav artifacts failed.');
+        throw error;
+      }
+    },
+    [appendLog, controller, hasLoadedSplat, isBusy]
+  );
+
+  const goToPlayer = useCallback((): void => {
+    if (!controller || !hasNavMesh) {
+      appendLog('[WARN] Go to Player: no player agent.');
+      return;
+    }
+    controller.focusOnPlayer();
+    appendLog('[SUCCESS] Go to Player — framing player top-down.');
+  }, [appendLog, controller, hasNavMesh]);
+
   return {
     controller,
     status,
@@ -792,6 +967,15 @@ export function useSplatFastNavR3F() {
     loadExample,
     exportSog,
     exportNavmesh,
+    goToPlayer,
+    downloadNavArtifacts,
+    uploadNavArtifacts,
+    hasNavArtifactBundle,
+    navArtifactUploadHint: NAV_ARTIFACT_UPLOAD_HINT,
+    cameraSelectOffsets,
+    setCameraSelectOffsets,
+    resetCameraSelectOffsets,
+    applySelectRegionFromCamera,
     generateCollisionBoundary,
     exportCollisionMesh,
     setCollisionBoundaryVisible,

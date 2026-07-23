@@ -69,7 +69,7 @@ interface SwModule {
 
 export class Playground {
   private static readonly SPLATWALK_CORE_ESM =
-    'https://cdn.jsdelivr.net/npm/@splatwalk/core@0.3.7/wasm_splatwalk.js';
+    'https://cdn.jsdelivr.net/npm/@splatwalk/core@0.6.4/wasm_splatwalk.js';
   private static readonly RECAST_JS = 'https://cdn.babylonjs.com/recast.js';
 
   private static readonly SCENES: DemoScene[] = [

@@ -1,5 +1,10 @@
 import { Viewer } from '../scene/Viewer';
 import { DropZone } from '../components/DropZone';
+import {
+    parseRendererPreference,
+    type BabylonRendererPreference,
+} from '../scene/createBabylonEngine';
+import { downloadIntegrationKit } from '../utils/downloadIntegrationKit';
 import { splatwalk, type GroundFieldCellState, type MeshSettings } from '../wasm/bridge';
 import {
     collisionBoundaryDiagnosticsSummary,
@@ -34,6 +39,18 @@ import {
     type NavIslandMetadata,
 } from '../navigation/fastNav';
 import { buildNavmeshKey, getNavmesh, putNavmesh } from '../navigation/navmeshCache';
+import {
+    DEFAULT_CAMERA_SELECT_REGION_OFFSETS,
+    regionBoundsFromCameraSelect,
+    type CameraSelectRegionInput,
+} from '../navigation/cameraSelectRegion';
+import {
+    buildMinimalNavArtifactBundle,
+    downloadNavArtifactZip,
+    parseNavArtifactFiles,
+    type NavArtifactBundle,
+} from '../navigation/navArtifactBundle';
+import { applyNavArtifactsToViewer } from '../navigation/applyNavArtifacts';
 import { registerServiceWorker, setupOfflineHandling } from '../pwa/sw-register';
 
 async function main() {
@@ -240,6 +257,8 @@ async function main() {
     let currentMesh: Mesh | null = null;
     let currentMat: StandardMaterial | null = null;
     let generatedCollisionArtifact: CollisionBoundaryArtifact | null = null;
+    let generatedNavArtifactBundle: NavArtifactBundle | null = null;
+    let pendingWorkbenchCameraSelect: CameraSelectRegionInput | null = null;
     let importedColliderGeometry: { positions: Float32Array, indices: Uint32Array } | null = null;
 
     if (showMeshCheckbox) {
@@ -325,11 +344,78 @@ async function main() {
         // Init WASM
         await splatwalk.init();
 
+        let rendererPreference = parseRendererPreference();
+        const rendererRadios = document.querySelectorAll<HTMLInputElement>(
+            'input[name="rendererPreference"]'
+        );
+        for (const radio of rendererRadios) {
+            radio.checked = radio.value === rendererPreference;
+        }
+        const rendererActiveHint = document.getElementById('rendererActiveHint');
+
+        const syncRendererHint = (actual: string, fallback: boolean): void => {
+            if (!rendererActiveHint) {
+                return;
+            }
+            rendererActiveHint.textContent = fallback
+                ? `Active: ${actual} (WebGPU unavailable — fell back)`
+                : `Active: ${actual} · WebGPU falls back to WebGL if unsupported`;
+        };
+
         // Init Viewer
-        const viewer = new Viewer(canvas);
+        let viewer = await Viewer.create(canvas, { renderer: rendererPreference });
+        {
+            const engine = viewer.getScene().getEngine();
+            const actual = engine.isWebGPU ? 'webgpu' : 'webgl';
+            syncRendererHint(actual, rendererPreference === 'webgpu' && actual === 'webgl');
+        }
         // Expose the viewer for dev-only end-to-end visual tests (camera framing).
         if (import.meta.env.DEV) {
             (window as unknown as { __splatwalkViewer?: Viewer }).__splatwalkViewer = viewer;
+        }
+
+        document.getElementById('downloadFastNavKitBtn')?.addEventListener('click', () => {
+            downloadIntegrationKit('babylon-workbench');
+        });
+
+        const applyRendererPreference = async (
+            preference: BabylonRendererPreference
+        ): Promise<void> => {
+            if (preference === rendererPreference) {
+                return;
+            }
+            rendererPreference = preference;
+            console.log(`[INFO] Renderer preference → ${preference}`);
+            viewer.getScene().getEngine().dispose();
+            viewer = await Viewer.create(canvas, { renderer: preference });
+            if (import.meta.env.DEV) {
+                (window as unknown as { __splatwalkViewer?: Viewer }).__splatwalkViewer = viewer;
+            }
+            const engine = viewer.getScene().getEngine();
+            const actual = engine.isWebGPU ? 'webgpu' : 'webgl';
+            syncRendererHint(actual, preference === 'webgpu' && actual === 'webgl');
+            console.log(
+                `[INFO] Renderer: ${actual}` +
+                    (preference === 'webgpu' && actual === 'webgl'
+                        ? ' (WebGPU unavailable — fell back)'
+                        : '')
+            );
+            console.warn(
+                '[WARN] Renderer change cleared the scene — reload a splat to continue.'
+            );
+        };
+
+        for (const radio of rendererRadios) {
+            radio.addEventListener('change', () => {
+                if (!radio.checked) {
+                    return;
+                }
+                const value = radio.value;
+                if (value !== 'webgl' && value !== 'webgpu') {
+                    return;
+                }
+                void applyRendererPreference(value);
+            });
         }
         const colliderGlbInput = document.getElementById('colliderGlbInput') as HTMLInputElement | null;
         const colliderGlbBtn = document.getElementById('colliderGlbBtn') as HTMLButtonElement | null;
@@ -719,13 +805,37 @@ async function main() {
                 const simulationSection = document.getElementById('simulationSection') as HTMLDivElement | null;
                 if (simulationSection) simulationSection.style.display = 'block';
 
+                const region = viewer.getWasmRegionBounds();
+                const collisionGlb = generatedCollisionArtifact?.result.glb ?? null;
+                generatedNavArtifactBundle = buildMinimalNavArtifactBundle({
+                    collisionGlb,
+                    navMeshData: artifact.navMeshData,
+                    playerSpawn: spawnPoint
+                        ? [spawnPoint.x, spawnPoint.y, spawnPoint.z]
+                        : null,
+                    regionMax: region?.max ?? null,
+                    regionMin: region?.min ?? null,
+                    seed: effectiveFastSeed,
+                });
+                const downloadNavArtifactsBtn = document.getElementById(
+                    'downloadNavArtifactsBtn'
+                ) as HTMLButtonElement | null;
+                if (downloadNavArtifactsBtn) {
+                    downloadNavArtifactsBtn.style.display = 'block';
+                }
+
                 if (autoSpawnNpc) {
                     viewer.addNPC();
-                    const framing = viewer.focusOnPlayer();
-                    if (framing) {
-                        console.log(`[INFO] Top-down view set above player at ${framing.player.map((v) => v.toFixed(2)).join(', ')}.`);
+                    if (pendingWorkbenchCameraSelect) {
+                        viewer.applyCameraSelectView(pendingWorkbenchCameraSelect.view);
+                        console.log('[INFO] Restored camera select view after Fast Nav.');
                     } else {
-                        console.warn("[WARN] No player agent found to frame for the top-down view.");
+                        const framing = viewer.focusOnPlayer();
+                        if (framing) {
+                            console.log(`[INFO] Top-down view set above player at ${framing.player.map((v) => v.toFixed(2)).join(', ')}.`);
+                        } else {
+                            console.warn("[WARN] No player agent found to frame for the top-down view.");
+                        }
                     }
                     console.log("[SUCCESS] Fast path complete: navmesh ready, NPC spawned, click navmesh to move.");
                 } else {
@@ -1587,6 +1697,75 @@ async function main() {
         // Mobile Local File Upload Logic
         const chooseFileBtn = document.getElementById('chooseFileBtn');
         const localFileInput = document.getElementById('localFileInput') as HTMLInputElement;
+        const uploadNavArtifactsBtn = document.getElementById('uploadNavArtifactsBtn');
+        const uploadNavArtifactsNavBtn = document.getElementById('uploadNavArtifactsNavBtn');
+        const navArtifactsInput = document.getElementById('navArtifactsInput') as HTMLInputElement | null;
+        const downloadNavArtifactsBtn = document.getElementById(
+            'downloadNavArtifactsBtn'
+        ) as HTMLButtonElement | null;
+        const applyCamSelectRegionBtn = document.getElementById('applyCamSelectRegionBtn');
+
+        const readCamSelectOffsets = () => {
+            const read = (id: string, fallback: number): number => {
+                const el = document.getElementById(id) as HTMLInputElement | null;
+                const n = el ? Number(el.value) : NaN;
+                return Number.isFinite(n) && n >= 0 ? n : fallback;
+            };
+            return {
+                left: read('camSelectLeft', DEFAULT_CAMERA_SELECT_REGION_OFFSETS.left),
+                right: read('camSelectRight', DEFAULT_CAMERA_SELECT_REGION_OFFSETS.right),
+                forward: read('camSelectForward', DEFAULT_CAMERA_SELECT_REGION_OFFSETS.forward),
+                behind: read('camSelectBehind', DEFAULT_CAMERA_SELECT_REGION_OFFSETS.behind),
+                below: read('camSelectBelow', DEFAULT_CAMERA_SELECT_REGION_OFFSETS.below),
+                above: read('camSelectAbove', DEFAULT_CAMERA_SELECT_REGION_OFFSETS.above),
+            };
+        };
+
+        const openNavArtifactsPicker = (): void => {
+            navArtifactsInput?.click();
+        };
+
+        const runUploadNavArtifacts = async (files: FileList): Promise<void> => {
+            const list = Array.from(files);
+            console.log(
+                `[INFO] Uploading nav artifacts (${list.length} file${list.length === 1 ? '' : 's'}: ` +
+                    `${list.map((f) => f.name).join(', ') || '(none)'})…`
+            );
+            if (!viewer) {
+                console.error('[ERROR] Load a splat before uploading nav artifacts.');
+                return;
+            }
+            try {
+                const parsed = await parseNavArtifactFiles(list);
+                console.log(
+                    `[INFO] Parsed pack: locomotion=${parsed.session.locomotionMode}` +
+                        (parsed.bundle.recastNavmeshBin ? ', recast.navmesh.bin' : '') +
+                        (parsed.volume ? ', volume trio' : '')
+                );
+                viewer.clearNavArtifacts();
+                generatedNavArtifactBundle = parsed.bundle;
+                await applyNavArtifactsToViewer({
+                    onLog: (message) => console.log(message),
+                    parsed,
+                    viewer,
+                });
+                if (downloadNavArtifactsBtn) {
+                    downloadNavArtifactsBtn.style.display = 'block';
+                }
+                const downloadNavBtn = document.getElementById('downloadNavBtn') as HTMLButtonElement | null;
+                if (downloadNavBtn && parsed.bundle.recastNavmeshBin) {
+                    downloadNavBtn.style.display = 'block';
+                }
+                const simulationSection = document.getElementById('simulationSection') as HTMLDivElement | null;
+                if (simulationSection) {
+                    simulationSection.style.display = 'block';
+                }
+                (document.getElementById('resultSection') as HTMLElement | null)!.style.display = 'block';
+                console.log('[SUCCESS] Uploaded nav artifacts.');
+            } catch (error) {
+                logError(`Upload nav artifacts failed: ${error}`);
+            }
+        };
 
         if (chooseFileBtn && localFileInput) {
             chooseFileBtn.addEventListener('click', () => {
@@ -1596,12 +1775,72 @@ async function main() {
             localFileInput.addEventListener('change', () => {
                 if (localFileInput.files && localFileInput.files.length > 0) {
                     const file = localFileInput.files[0];
+                    generatedNavArtifactBundle = null;
+                    pendingWorkbenchCameraSelect = null;
                     handleFileLoad(file);
                     // Clear value to allow re-selecting the same file if needed
                     localFileInput.value = '';
                 }
             });
         }
+
+        uploadNavArtifactsBtn?.addEventListener('click', openNavArtifactsPicker);
+        uploadNavArtifactsNavBtn?.addEventListener('click', openNavArtifactsPicker);
+        navArtifactsInput?.addEventListener('change', () => {
+            if (navArtifactsInput.files && navArtifactsInput.files.length > 0) {
+                void runUploadNavArtifacts(navArtifactsInput.files);
+                navArtifactsInput.value = '';
+            }
+        });
+
+        downloadNavArtifactsBtn?.addEventListener('click', () => {
+            if (!generatedNavArtifactBundle) {
+                console.warn('[WARN] No nav artifact pack — run Fast Nav / Generate Navmesh first.');
+                return;
+            }
+            downloadNavArtifactZip({
+                bundle: generatedNavArtifactBundle,
+                slug: 'workbench',
+            });
+            console.log('[SUCCESS] Downloaded nav-artifacts-workbench.zip');
+        });
+
+        applyCamSelectRegionBtn?.addEventListener('click', () => {
+            if (!viewer) {
+                console.error('[ERROR] Load a splat before applying a camera select region.');
+                return;
+            }
+            const cam = viewer.getScene().activeCamera;
+            if (!cam || !('position' in cam) || !('rotation' in cam)) {
+                console.warn('[WARN] Apply from camera needs a FreeCamera-style active camera.');
+                return;
+            }
+            const free = cam as { position: { x: number; y: number; z: number }; rotation: { x: number; y: number; z: number } };
+            const radToDeg = 180 / Math.PI;
+            const input: CameraSelectRegionInput = {
+                view: {
+                    position: {
+                        x: free.position.x,
+                        y: free.position.y,
+                        z: free.position.z,
+                    },
+                    eulerDegrees: {
+                        x: free.rotation.x * radToDeg,
+                        y: free.rotation.y * radToDeg,
+                        z: free.rotation.z * radToDeg,
+                    },
+                },
+                offsets: readCamSelectOffsets(),
+            };
+            pendingWorkbenchCameraSelect = input;
+            const bounds = regionBoundsFromCameraSelect(input);
+            viewer.enableRegionSelection({ min: bounds.min, max: bounds.max });
+            console.log(
+                `[INFO] Camera select region pinned: ` +
+                    `${bounds.min.map((v) => v.toFixed(2)).join(', ')} → ` +
+                    `${bounds.max.map((v) => v.toFixed(2)).join(', ')}`
+            );
+        });
 
         // Prevent variable unused lint error (dummy usage)
         if (viewer) {

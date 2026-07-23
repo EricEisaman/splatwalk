@@ -6,6 +6,10 @@ import { buildNavmeshKey, getNavmesh, putNavmesh } from '@/navigation/navmeshCac
 import { splatwalk, type MeshSettings } from '@/wasm/bridge';
 import { normalizeSplatToPly } from '@/wasm/normalize';
 import {
+  regionBoundsFromCameraSelect,
+  type CameraSelectRegionInput,
+} from '@/navigation/cameraSelectRegion';
+import {
   extractFloorFieldWithRecovery,
   resolveRecovery,
   type DenseSeedOptions,
@@ -82,11 +86,35 @@ export interface FastNavOptions {
   readonly floorMesh?: FastFloorMeshOptions;
   /**
    * Island safety checks after Recast. Outdoor / streamed scenes often need a
-   * larger {@link maxSeedDistance} than the indoor 6 m default.
+   * larger {@link maxSeedDistance} than the indoor 6 m default. When
+   * {@link mergeNearbyIslands} is set (or implied by a large maxSeedDistance),
+   * all same-level islands within that radius are kept instead of one nearest.
    */
   readonly islandValidation?: {
+    readonly floorYBand?: number;
     readonly maxSeedDistance?: number;
+    readonly mergeNearbyIslands?: boolean;
   };
+  /**
+   * When true (Storage Adapter streamed / Church outdoor), pin a seed-centered
+   * ~100 m working volume and outdoor field knobs. Default false restores HEAD
+   * indoor Fast Nav (yellow box only; suggestRegion for seed) so Bedroom / PurplePad
+   * need no extra intervention.
+   */
+  readonly seedCenteredOutdoor?: boolean;
+  /**
+   * Camera view + AABB offsets. Replaces any prior selection region for this run,
+   * pins WASM `region_min`/`region_max` via the yellow box, and (unless
+   * {@link keepCameraSelectView} is false) restores the view after nav instead of
+   * top-down framing.
+   */
+  readonly cameraSelect?: CameraSelectRegionInput;
+  /**
+   * When `cameraSelect` is set, restore that view after nav (default true).
+   * Callers should skip {@link Viewer.focusOnPlayer} when the result reports
+   * {@link FastNavResult.keptCameraSelectView}.
+   */
+  readonly keepCameraSelectView?: boolean;
 }
 
 /** Override for the WASM-side floater prune (statistical outlier removal). */
@@ -105,6 +133,11 @@ export interface FastNavResult {
   readonly navMeshData: Uint8Array;
   /** The chosen player spawn point on the navmesh, if any. */
   readonly playerSpawn: Vector3 | null;
+  /**
+   * True when {@link FastNavOptions.cameraSelect} restored the camera view;
+   * callers should not call {@link Viewer.focusOnPlayer}.
+   */
+  readonly keptCameraSelectView: boolean;
 }
 
 interface NavReport {
@@ -211,6 +244,61 @@ export const FAST_NAV_RECAST_ATTEMPTS: ReadonlyArray<{ label: string; params: Re
       maxSimplificationError: 1.0,
       minRegionArea: 2,
       mergeRegionArea: 8,
+    },
+  },
+];
+
+/**
+ * Recast ladder for voxel collision meshes: smaller agent radius and floor-sheet-friendly
+ * params so tiny pinned-region colliders are not eroded away entirely.
+ */
+export const VOXEL_COLLIDER_RECAST_ATTEMPTS: ReadonlyArray<{
+  label: string;
+  params: RecastParams;
+}> = [
+  {
+    label: 'voxel-collider',
+    params: {
+      ...FAST_NAV_BASE_PARAMS,
+      autoCellSize: false,
+      cs: 0.1,
+      ch: 0.08,
+      walkableHeight: 1.4,
+      walkableRadius: 0.08,
+      walkableClimb: 0.75,
+      walkableSlopeAngle: 50,
+      minRegionArea: 2,
+      mergeRegionArea: 8,
+    },
+  },
+  {
+    label: 'voxel-collider-small',
+    params: {
+      ...FAST_NAV_BASE_PARAMS,
+      autoCellSize: false,
+      cs: 0.08,
+      ch: 0.06,
+      walkableHeight: 1.2,
+      walkableRadius: 0.1,
+      walkableClimb: 0.6,
+      walkableSlopeAngle: 55,
+      minRegionArea: 0,
+      mergeRegionArea: 1,
+    },
+  },
+  {
+    label: 'voxel-collider-tiny',
+    params: {
+      ...FAST_NAV_BASE_PARAMS,
+      autoCellSize: false,
+      cs: 0.05,
+      ch: 0.05,
+      walkableHeight: 1.0,
+      walkableRadius: 0.06,
+      walkableClimb: 0.65,
+      walkableSlopeAngle: 60,
+      minRegionArea: 0,
+      mergeRegionArea: 0,
     },
   },
 ];
@@ -346,21 +434,103 @@ function buildFastFieldSettings(base: MeshSettings, seed: number[] | null): Mesh
   };
 }
 
+/** Half-extent (m) of the seed-centered outdoor working volume (±50 → 100 m XZ). */
+export const SEED_CENTERED_HALF_EXTENT_M = 50;
+
+/** Y band below seed floor for the seed-centered region (m). */
+const SEED_CENTERED_Y_BELOW_M = 2;
+
+/** Y band above seed floor for the seed-centered region (m). */
+const SEED_CENTERED_Y_ABOVE_M = 6;
+
+/** Outdoor ground-field cell size (m) under a seed-centered pin — avoids moth-eaten fine grids. */
+export const SEED_CENTERED_SDF_CELL_SIZE_M = 0.4;
+
+/** Outdoor WASM hole-fill radius (cells) under a seed-centered pin. */
+export const SEED_CENTERED_HOLE_FILL_RADIUS = 8;
+
+/** Apply outdoor field knobs that survive later meshSettings / fast-field merges. */
+const applySeedCenteredOutdoorFieldKnobs = (settings: MeshSettings): void => {
+  settings.sdf_cell_size = SEED_CENTERED_SDF_CELL_SIZE_M;
+  settings.hole_fill_radius = SEED_CENTERED_HOLE_FILL_RADIUS;
+};
+
+/**
+ * Pin WASM region before field build.
+ * - Yellow Selection box always wins.
+ * - Outdoor seed-centered ~100 m pin only when `seedCenteredOutdoor` is true
+ *   (streamed Church path). Indoor default matches HEAD: no auto region pin.
+ */
+async function pinFastNavRegionIfNeeded(
+  viewer: Viewer,
+  bytes: Uint8Array,
+  base: MeshSettings,
+  log: FastNavLogger,
+  seedCenteredOutdoor: boolean
+): Promise<number[] | null> {
+  const yellowBox = viewer.getWasmRegionBounds();
+  if (yellowBox) {
+    base.region_min = yellowBox.min;
+    base.region_max = yellowBox.max;
+    log(
+      `[INFO] Fast Nav region=yellow-box ` +
+        `min=[${yellowBox.min.map((v) => v.toFixed(2)).join(', ')}] ` +
+        `max=[${yellowBox.max.map((v) => v.toFixed(2)).join(', ')}]`
+    );
+    return null;
+  }
+
+  if (!seedCenteredOutdoor) {
+    log('[INFO] Fast Nav region=indoor-unpinned (HEAD: suggestRegion seed only)');
+    return null;
+  }
+
+  const carveHeight = base.collision_carve_height ?? 1.6;
+  const suggested = await splatwalk.suggestRegion(bytes, base);
+  const seedX = (suggested.region_min[0] + suggested.region_max[0]) * 0.5;
+  const seedZ = (suggested.region_min[2] + suggested.region_max[2]) * 0.5;
+  const floorY = suggested.floor_y;
+  const half = SEED_CENTERED_HALF_EXTENT_M;
+  base.region_min = [seedX - half, floorY - SEED_CENTERED_Y_BELOW_M, seedZ - half];
+  base.region_max = [seedX + half, floorY + SEED_CENTERED_Y_ABOVE_M, seedZ + half];
+  applySeedCenteredOutdoorFieldKnobs(base);
+  const seed = [seedX, floorY + carveHeight * 0.5, seedZ];
+  log(
+    `[INFO] Fast Nav region=seed-centered (100m) ` +
+      `sdf_cell_size=${SEED_CENTERED_SDF_CELL_SIZE_M} hole_fill_radius=${SEED_CENTERED_HOLE_FILL_RADIUS} ` +
+      `seed=[${seedX.toFixed(2)}, ${floorY.toFixed(2)}, ${seedZ.toFixed(2)}] ` +
+      `min=[${base.region_min.map((v) => v.toFixed(2)).join(', ')}] ` +
+      `max=[${base.region_max.map((v) => v.toFixed(2)).join(', ')}]`
+  );
+  return seed;
+}
+
 async function ensureFastCollisionSeed(
   viewer: Viewer,
   bytes: Uint8Array,
   base: MeshSettings,
-  log: FastNavLogger
+  log: FastNavLogger,
+  precomputedSeed?: number[] | null
 ): Promise<number[]> {
-  const regionBounds = viewer.getRegionBounds();
   const carveHeight = base.collision_carve_height ?? 1.6;
+  const wasmRegionBounds = viewer.getWasmRegionBounds();
 
   let seed: number[];
-  if (regionBounds) {
+  if (precomputedSeed) {
+    seed = precomputedSeed;
+  } else if (wasmRegionBounds) {
     seed = [
-      (regionBounds.min[0] + regionBounds.max[0]) * 0.5,
-      regionBounds.min[1] + carveHeight * 0.5,
-      (regionBounds.min[2] + regionBounds.max[2]) * 0.5,
+      (wasmRegionBounds.min[0] + wasmRegionBounds.max[0]) * 0.5,
+      wasmRegionBounds.min[1] + carveHeight * 0.5,
+      (wasmRegionBounds.min[2] + wasmRegionBounds.max[2]) * 0.5,
+    ];
+  } else if (base.region_min && base.region_max) {
+    // Seed-centered pin: region Y is floor±band; seed Y uses floor + carve/2.
+    const floorY = base.region_min[1] + SEED_CENTERED_Y_BELOW_M;
+    seed = [
+      (base.region_min[0] + base.region_max[0]) * 0.5,
+      floorY + carveHeight * 0.5,
+      (base.region_min[2] + base.region_max[2]) * 0.5,
     ];
   } else {
     const suggested = await splatwalk.suggestRegion(bytes, base);
@@ -389,16 +559,43 @@ export function triangleArea(positions: Float32Array, i0: number, i1: number, i2
   return 0.5 * Math.sqrt(cx * cx + cy * cy + cz * cz);
 }
 
+export interface FilterNavmeshIslandOptions {
+  /** Max |centroid.y − seed.y| when merging same-level outdoor islands (m). */
+  readonly floorYBand?: number;
+  /** Max horizontal distance (m) from seed when merging outdoor islands. */
+  readonly maxSeedDistance?: number;
+  /**
+   * When true, union all viable same-level islands within maxSeedDistance.
+   * Indoor default keeps a single nearest island.
+   */
+  readonly mergeNearbyIslands?: boolean;
+}
+
+/** Indoor default: reject islands whose centroid is farther than this from the seed. */
+export const DEFAULT_MAX_ISLAND_SEED_DISTANCE = 6.0;
+
+/** Outdoor / streamed default — church courtyards and parks exceed 6 m easily. */
+export const STREAMED_MAX_ISLAND_SEED_DISTANCE = 80.0;
+
+/** Default Y band (m) for merging same-level outdoor Recast islands. */
+export const DEFAULT_MERGE_ISLAND_FLOOR_Y_BAND = 2.5;
+
 export function filterNavmeshIslandNearSeed(
   positions: Float32Array,
   indices: Uint32Array,
   seed: number[] | null,
-  log: FastNavLogger = (message: string): void => console.log(message)
+  log: FastNavLogger = (message: string): void => console.log(message),
+  options?: FilterNavmeshIslandOptions
 ): { positions: Float32Array; indices: Uint32Array; metadata: NavIslandMetadata | null } {
   const triangleCount = Math.floor(indices.length / 3);
   if (!seed || triangleCount <= 1) {
     return { positions, indices, metadata: null };
   }
+
+  const maxSeedDistance = options?.maxSeedDistance ?? DEFAULT_MAX_ISLAND_SEED_DISTANCE;
+  const mergeNearbyIslands =
+    options?.mergeNearbyIslands ?? maxSeedDistance >= STREAMED_MAX_ISLAND_SEED_DISTANCE;
+  const floorYBand = options?.floorYBand ?? DEFAULT_MERGE_ISLAND_FLOOR_Y_BAND;
 
   const vertexToTriangles = new Map<string, number[]>();
   const vertexKey = (vertexIndex: number): string => {
@@ -424,6 +621,7 @@ export function filterNavmeshIslandNearSeed(
     area: number;
     centroid: [number, number, number];
     distanceToSeed: number;
+    horizontalDistanceToSeed: number;
     ymin: number;
     ymax: number;
   }> = [];
@@ -475,11 +673,13 @@ export function filterNavmeshIslandNearSeed(
     const dx = centroid[0] - seed[0];
     const dy = centroid[1] - seed[1];
     const dz = centroid[2] - seed[2];
+    const horizontalDistanceToSeed = Math.sqrt(dx * dx + dz * dz);
     components.push({
       triangles: component,
       area,
       centroid,
       distanceToSeed: Math.sqrt(dx * dx + dy * dy + dz * dz),
+      horizontalDistanceToSeed,
       ymin,
       ymax,
     });
@@ -514,8 +714,42 @@ export function filterNavmeshIslandNearSeed(
 
   const largestArea = Math.max(...components.map((component) => component.area));
   const viable = components.filter((component) => component.area >= largestArea * 0.08);
-  viable.sort((a, b) => a.distanceToSeed - b.distanceToSeed || b.area - a.area);
-  const selected = viable[0] ?? components.sort((a, b) => b.area - a.area)[0];
+
+  let selectedComponents: typeof components;
+  if (mergeNearbyIslands) {
+    selectedComponents = viable.filter(
+      (component) =>
+        component.horizontalDistanceToSeed <= maxSeedDistance &&
+        Math.abs(component.centroid[1] - seed[1]) <= floorYBand
+    );
+    if (selectedComponents.length === 0) {
+      selectedComponents = [
+        [...viable].sort((a, b) => a.horizontalDistanceToSeed - b.horizontalDistanceToSeed || b.area - a.area)[0] ??
+          [...components].sort((a, b) => b.area - a.area)[0],
+      ].filter(Boolean);
+    }
+  } else {
+    const sorted = [...viable].sort((a, b) => a.distanceToSeed - b.distanceToSeed || b.area - a.area);
+    selectedComponents = [sorted[0] ?? [...components].sort((a, b) => b.area - a.area)[0]];
+  }
+
+  const selectedTriangles = selectedComponents.flatMap((component) => component.triangles);
+  const totalArea = selectedComponents.reduce((sum, component) => sum + component.area, 0);
+  const nearest = [...selectedComponents].sort(
+    (a, b) => a.horizontalDistanceToSeed - b.horizontalDistanceToSeed || b.area - a.area
+  )[0];
+  const weightedCentroid: [number, number, number] = (() => {
+    let wx = 0;
+    let wy = 0;
+    let wz = 0;
+    for (const component of selectedComponents) {
+      wx += component.centroid[0] * component.area;
+      wy += component.centroid[1] * component.area;
+      wz += component.centroid[2] * component.area;
+    }
+    const inv = totalArea > 0 ? 1 / totalArea : 0;
+    return [wx * inv, wy * inv, wz * inv];
+  })();
 
   const remap = new Map<number, number>();
   const filteredPositions: number[] = [];
@@ -530,7 +764,7 @@ export function filterNavmeshIslandNearSeed(
     return next;
   };
 
-  const orderedTriangles = [...selected.triangles].sort((a, b) => {
+  const orderedTriangles = [...selectedTriangles].sort((a, b) => {
     const centroidDistance = (tri: number): number => {
       const i0 = indices[tri * 3] * 3;
       const i1 = indices[tri * 3 + 1] * 3;
@@ -555,36 +789,32 @@ export function filterNavmeshIslandNearSeed(
   }
 
   log(
-    `[INFO] Fast nav island filter: kept ${selected.triangles.length}/${triangleCount} triangles ` +
-      `across ${components.length} islands, area=${selected.area.toFixed(2)}, ` +
-      `seedDistance=${selected.distanceToSeed.toFixed(2)}`
+    `[INFO] Fast nav island filter: kept ${selectedTriangles.length}/${triangleCount} triangles ` +
+      `from ${selectedComponents.length}/${components.length} islands` +
+      (mergeNearbyIslands ? ' (merged same-level)' : '') +
+      `, area=${totalArea.toFixed(2)}, ` +
+      `seedDistance=${(nearest?.distanceToSeed ?? 0).toFixed(2)}`
   );
 
   return {
     positions: new Float32Array(filteredPositions),
     indices: new Uint32Array(filteredIndices),
     metadata: {
-      area: selected.area,
-      centroid: selected.centroid,
-      distanceToSeed: selected.distanceToSeed,
-      triangleCount: selected.triangles.length,
+      area: totalArea,
+      centroid: weightedCentroid,
+      distanceToSeed: nearest?.distanceToSeed ?? 0,
+      triangleCount: selectedTriangles.length,
       islandCount: components.length,
     },
   };
 }
-
-/** Indoor default: reject islands whose centroid is farther than this from the seed. */
-export const DEFAULT_MAX_ISLAND_SEED_DISTANCE = 6.0;
-
-/** Outdoor / streamed default — church courtyards and parks exceed 6 m easily. */
-export const STREAMED_MAX_ISLAND_SEED_DISTANCE = 80.0;
 
 export function validateFastNavIsland(
   metadata: NavIslandMetadata | null,
   seed: number[] | null,
   expectedFloorY: number | null,
   log: FastNavLogger = (message: string): void => console.log(message),
-  options?: { maxSeedDistance?: number }
+  options?: FilterNavmeshIslandOptions
 ): void {
   if (!metadata) {
     log('[WARN] Fast nav island validation skipped because no seed island metadata was available.');
@@ -645,11 +875,12 @@ export function chooseNpcSpawnPoint(
   return best;
 }
 
-function generateNavmeshInWorker(
+export function generateNavmeshInWorker(
   geometry: { positions: Float32Array; indices: Uint32Array },
   params: RecastParams,
   sourceLabel: string,
-  splatBounds: { min: number[]; max: number[] } | null
+  splatBounds: { min: number[]; max: number[] } | null,
+  colliderBounds: { min: number[]; max: number[] } | null = null
 ): Promise<NavWorkerResult> {
   const worker = new NavWorker();
   return new Promise<NavWorkerResult>((resolve, reject) => {
@@ -669,7 +900,7 @@ function generateNavmeshInWorker(
     };
     worker.postMessage({
       type: 'generate',
-      payload: { positions: geometry.positions, indices: geometry.indices, params, sourceLabel, splatBounds, colliderBounds: null },
+      payload: { positions: geometry.positions, indices: geometry.indices, params, sourceLabel, splatBounds, colliderBounds },
     });
   });
 }
@@ -683,6 +914,9 @@ export async function runFastNav(options: FastNavOptions): Promise<FastNavResult
   const { viewer, bytes } = options;
   const log: FastNavLogger = options.onLog ?? ((message: string): void => console.log(message));
   const phase: FastNavPhaseListener = options.onPhase ?? ((): void => undefined);
+  const cameraSelect = options.cameraSelect;
+  const keepCameraSelectView =
+    cameraSelect !== undefined && options.keepCameraSelectView !== false;
 
   log('[WAIT] Fast path: splat -> floor field -> navmesh -> NPC...');
 
@@ -699,13 +933,29 @@ export async function runFastNav(options: FastNavOptions): Promise<FastNavResult
     `[INFO] Fast Nav floater prune: ${base.prune_floaters === false ? 'off' : 'on'}` +
       (base.prune_floaters === false ? '' : ` (k=${base.prune_floaters_k}, std=${base.prune_floaters_std_ratio})`)
   );
-  // Pin the Viewer selection box when present so WASM filters to that AABB and
-  // Fast Nav recovery does not overwrite it with a dense-floor auto region.
-  const regionBounds = viewer.getRegionBounds();
-  if (regionBounds) {
-    base.region_min = regionBounds.min;
-    base.region_max = regionBounds.max;
+
+  if (cameraSelect) {
+    const bounds = regionBoundsFromCameraSelect(cameraSelect);
+    viewer.enableRegionSelection({ min: bounds.min, max: bounds.max });
+    base.region_min = [...bounds.min];
+    base.region_max = [...bounds.max];
+    log(
+      `[INFO] Camera select region pinned: ` +
+        `${bounds.min.map((v) => v.toFixed(2)).join(', ')} → ` +
+        `${bounds.max.map((v) => v.toFixed(2)).join(', ')}`
+    );
   }
+
+  // HEAD indoor default: yellow box only. Outdoor seed-centered pin is opt-in
+  // (Storage Adapter streamed Church) via options.seedCenteredOutdoor.
+  const seedCenteredOutdoor = options.seedCenteredOutdoor === true;
+  const precomputedSeed = await pinFastNavRegionIfNeeded(
+    viewer,
+    bytes,
+    base,
+    log,
+    seedCenteredOutdoor
+  );
   const recovery = resolveRecovery(options.recovery);
 
   const baseAttempts = options.recastAttempts ?? FAST_NAV_RECAST_ATTEMPTS;
@@ -732,17 +982,34 @@ export async function runFastNav(options: FastNavOptions): Promise<FastNavResult
   if (cached) {
     log('[INFO] FAST NAV navmesh restored from cache (skipping recompute).');
     phase('navmesh');
-    return finishFastNav(viewer, cached, log);
+    return finalizeFastNavWithCameraSelect(
+      viewer,
+      await finishFastNav(viewer, cached, log),
+      cameraSelect,
+      keepCameraSelectView,
+      log
+    );
   }
 
   // First touch of the splat bytes parses + prunes floaters in the worker.
   phase('prune');
-  const fastSeed = await ensureFastCollisionSeed(viewer, bytes, base, log);
+  const fastSeed = await ensureFastCollisionSeed(viewer, bytes, base, log, precomputedSeed);
   const builtField = buildFastFieldSettings(base, fastSeed);
   const navSettings: MeshSettings = {
     ...builtField,
     ...(options.meshSettings ?? {}),
     collision_seed: options.meshSettings?.collision_seed ?? builtField.collision_seed,
+    region_max: base.region_max ?? builtField.region_max,
+    region_min: base.region_min ?? builtField.region_min,
+  };
+  // buildFastFieldSettings + meshSettings overwrite outdoor knobs — re-apply after merge.
+  if (seedCenteredOutdoor) {
+    applySeedCenteredOutdoorFieldKnobs(navSettings);
+  }
+
+  const floorMeshOptions: FastFloorMeshOptions = {
+    ...(options.floorMesh ?? {}),
+    seedCenteredOutdoor,
   };
 
   phase('floor');
@@ -754,7 +1021,8 @@ export async function runFastNav(options: FastNavOptions): Promise<FastNavResult
     recovery,
     strayTrim: options.strayTrim,
     denseSeed: options.denseSeed,
-    floorMesh: options.floorMesh,
+    floorMesh: floorMeshOptions,
+    seedCenteredOutdoor,
     log,
   });
   const floorMesh = extracted.floorMesh;
@@ -806,8 +1074,19 @@ export async function runFastNav(options: FastNavOptions): Promise<FastNavResult
   const expectedFloorY = navSettings.collision_carve_height
     ? effectiveFastSeed[1] - navSettings.collision_carve_height * 0.5
     : null;
-  const safety = filterNavmeshIslandNearSeed(result.debugPositions, result.debugIndices, effectiveFastSeed, log);
-  validateFastNavIsland(safety.metadata, effectiveFastSeed, expectedFloorY, log, options.islandValidation);
+  const islandOptions: FilterNavmeshIslandOptions = {
+    floorYBand: options.islandValidation?.floorYBand,
+    maxSeedDistance: options.islandValidation?.maxSeedDistance,
+    mergeNearbyIslands: options.islandValidation?.mergeNearbyIslands,
+  };
+  const safety = filterNavmeshIslandNearSeed(
+    result.debugPositions,
+    result.debugIndices,
+    effectiveFastSeed,
+    log,
+    islandOptions
+  );
+  validateFastNavIsland(safety.metadata, effectiveFastSeed, expectedFloorY, log, islandOptions);
 
   // Persist the validated artifact so an unchanged revisit restores it instead of
   // recomputing. Best-effort: a storage failure never blocks the pipeline, and we
@@ -818,8 +1097,34 @@ export async function runFastNav(options: FastNavOptions): Promise<FastNavResult
     debugIndices: result.debugIndices,
   });
 
-  return finishFastNav(viewer, result, log);
+  return finalizeFastNavWithCameraSelect(
+    viewer,
+    await finishFastNav(viewer, result, log),
+    cameraSelect,
+    keepCameraSelectView,
+    log
+  );
 }
+
+const finalizeFastNavWithCameraSelect = (
+  viewer: Viewer,
+  result: FastNavResult,
+  cameraSelect: CameraSelectRegionInput | undefined,
+  keepCameraSelectView: boolean,
+  log: FastNavLogger
+): FastNavResult => {
+  if (!cameraSelect || !keepCameraSelectView) {
+    return { ...result, keptCameraSelectView: false };
+  }
+  viewer.applyCameraSelectView(cameraSelect.view);
+  log(
+    `[INFO] Restored camera select view at ` +
+      `[${cameraSelect.view.position.x.toFixed(2)}, ` +
+      `${cameraSelect.view.position.y.toFixed(2)}, ` +
+      `${cameraSelect.view.position.z.toFixed(2)}]`
+  );
+  return { ...result, keptCameraSelectView: true };
+};
 
 /**
  * Shared post-worker tail used by both a fresh navmesh build and a cache hit:
@@ -827,23 +1132,44 @@ export async function runFastNav(options: FastNavOptions): Promise<FastNavResult
  * NPC. Deterministic in its inputs, so a restored artifact reproduces the same
  * player/NPC setup as the original run.
  */
-async function finishFastNav(
+export async function finishFastNav(
   viewer: Viewer,
   artifact: { navMeshData: Uint8Array; debugPositions: Float32Array; debugIndices: Uint32Array },
-  log: FastNavLogger
+  log: FastNavLogger,
+  pathLabel = 'Fast Nav',
+  seedOriented?: number[] | null
 ): Promise<FastNavResult> {
   log('[WAIT] Rendering NavMesh overlay...');
-  const spawnPoint = await viewer.displayNavMesh(artifact.debugPositions, artifact.debugIndices, 0);
-  if (spawnPoint) {
-    const npcSpawn = chooseNpcSpawnPoint(artifact.debugPositions, artifact.debugIndices, spawnPoint);
-    viewer.setPreferredNavSpawnPoints([spawnPoint.x, spawnPoint.y, spawnPoint.z], npcSpawn);
-    log(`[INFO] Player agent spawn: ${spawnPoint.x.toFixed(3)}, ${spawnPoint.y.toFixed(3)}, ${spawnPoint.z.toFixed(3)}`);
+  const spawnWorld = await viewer.displayNavMesh(
+    artifact.debugPositions,
+    artifact.debugIndices,
+    0,
+    seedOriented ?? null
+  );
+  const orientedSpawn = viewer.getNavMeshSpawnOriented();
+  if (orientedSpawn) {
+    const npcSpawn = chooseNpcSpawnPoint(artifact.debugPositions, artifact.debugIndices, orientedSpawn);
+    viewer.setPreferredNavSpawnPoints(
+      [orientedSpawn.x, orientedSpawn.y, orientedSpawn.z],
+      npcSpawn
+    );
+    const world = viewer.orientedNavPointToWorld(orientedSpawn);
+    log(
+      `[INFO] Player agent spawn: world ${world.x.toFixed(3)}, ${world.y.toFixed(3)}, ${world.z.toFixed(3)} ` +
+        `(oriented ${orientedSpawn.x.toFixed(3)}, ${orientedSpawn.y.toFixed(3)}, ${orientedSpawn.z.toFixed(3)})`
+    );
+  } else if (spawnWorld) {
+    log(`[WARN] Navmesh overlay rendered but no spawn point resolved near seed.`);
   }
 
   log('[WAIT] Initializing NPC crowd simulation...');
-  await viewer.initCrowd(artifact.navMeshData, spawnPoint);
+  await viewer.initCrowd(artifact.navMeshData);
   viewer.addNPC();
-  log('[SUCCESS] Fast path complete: navmesh ready, NPC spawned.');
+  log(`[SUCCESS] ${pathLabel} complete: navmesh ready, NPC spawned. Click splats, walls, or ceilings to move.`);
 
-  return { navMeshData: artifact.navMeshData, playerSpawn: spawnPoint };
+  return {
+    navMeshData: artifact.navMeshData,
+    playerSpawn: spawnWorld,
+    keptCameraSelectView: false,
+  };
 }

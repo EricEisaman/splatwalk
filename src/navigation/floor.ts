@@ -77,6 +77,24 @@ export const DEFAULT_FLOOR_FLATTEN_TOLERANCE = 0.12;
  */
 const MAX_BRIDGE_GAP_CELLS = 12;
 
+/** Indoor default max horizontal gap (m) closed by seam bridging. */
+const DEFAULT_SEAM_GAP_M = 0.6;
+
+/** Outdoor seed-centered max horizontal gap (m) closed by seam bridging. */
+const OUTDOOR_SEAM_GAP_M = 2.0;
+
+/** Y band below dense modal height when re-pinning under a seed-centered outdoor region. */
+const SEED_CENTERED_DENSE_Y_BELOW_M = 2;
+
+/** Y band above dense modal height when re-pinning under a seed-centered outdoor region. */
+const SEED_CENTERED_DENSE_Y_ABOVE_M = 6;
+
+/** Min outdoor cell size (m) when seed-centered — recovery must not go finer. */
+const SEED_CENTERED_MIN_SDF_CELL_SIZE_M = 0.4;
+
+/** Min outdoor hole-fill radius (cells) when seed-centered. */
+const SEED_CENTERED_MIN_HOLE_FILL_RADIUS = 8;
+
 /** Default ceiling on total navmesh voxel columns when auto-sizing the cell size. */
 export const DEFAULT_MAX_NAV_CELLS = 1_000_000;
 
@@ -556,6 +574,11 @@ export interface FastFloorMeshOptions {
    * Widen for outdoor bowls / ramps.
    */
   readonly sameLevelBelow?: number;
+  /**
+   * When true, bridge seams up to {@link OUTDOOR_SEAM_GAP_M} instead of the indoor
+   * 0.6 m default (seed-centered outdoor courtyards).
+   */
+  readonly seedCenteredOutdoor?: boolean;
 }
 
 /**
@@ -826,7 +849,8 @@ export function buildFastFloorMesh(
     }
     return additions.length;
   };
-  const maxSeamGapCells = Math.max(1, Math.round(0.6 / field.cell_size));
+  const seamGapM = options.seedCenteredOutdoor ? OUTDOOR_SEAM_GAP_M : DEFAULT_SEAM_GAP_M;
+  const maxSeamGapCells = Math.max(1, Math.round(seamGapM / field.cell_size));
   const seamHeightTolerance = 0.35;
 
   const strictMask = buildMask(false);
@@ -1129,6 +1153,11 @@ export interface ExtractFloorFieldArgs {
   readonly denseSeed?: DenseSeedOptions;
   /** Optional same-level / cell height-band overrides for outdoor bowls / ramps. */
   readonly floorMesh?: FastFloorMeshOptions;
+  /**
+   * When true, dense-floor recovery re-pins region Y from the dense modal band while
+   * keeping the seed-centered XZ extent (does not replace XZ with the indoor dense AABB).
+   */
+  readonly seedCenteredOutdoor?: boolean;
   /** Progress sink. */
   readonly log: FastNavLogger;
 }
@@ -1152,8 +1181,18 @@ export interface ExtractFloorFieldResult {
  * step fails it throws an aggregated {@link FastNavFloorError}.
  */
 export async function extractFloorFieldWithRecovery(args: ExtractFloorFieldArgs): Promise<ExtractFloorFieldResult> {
-  const { bytes, buildField, baseSettings, seed, recovery, strayTrim, denseSeed, floorMesh: floorMeshOptions, log } =
-    args;
+  const {
+    bytes,
+    buildField,
+    baseSettings,
+    seed,
+    recovery,
+    strayTrim,
+    denseSeed,
+    floorMesh: floorMeshOptions,
+    seedCenteredOutdoor = false,
+    log,
+  } = args;
   const steps = recovery.steps;
   const reseedThreshold = denseSeed?.reseedThreshold ?? 2.0;
   const denseSeedEnabled = denseSeed?.enabled ?? true;
@@ -1164,6 +1203,14 @@ export async function extractFloorFieldWithRecovery(args: ExtractFloorFieldArgs)
     const step = steps[i];
     const hasMore = i < steps.length - 1;
     const settings: MeshSettings = { ...baseSettings, ...step.settings };
+    if (seedCenteredOutdoor) {
+      const cellSize = settings.sdf_cell_size ?? SEED_CENTERED_MIN_SDF_CELL_SIZE_M;
+      settings.sdf_cell_size = Math.max(cellSize, SEED_CENTERED_MIN_SDF_CELL_SIZE_M);
+      settings.hole_fill_radius = Math.max(
+        settings.hole_fill_radius ?? 0,
+        SEED_CENTERED_MIN_HOLE_FILL_RADIUS
+      );
+    }
 
     try {
       let field = await buildField(bytes, settings);
@@ -1182,10 +1229,21 @@ export async function extractFloorFieldWithRecovery(args: ExtractFloorFieldArgs)
         const dense = estimateDenseFloorSeed(field, effectiveSeed, denseSeed);
         const movedXZ = Math.hypot(dense[0] - effectiveSeed[0], dense[2] - effectiveSeed[2]);
         const movedY = Math.abs(dense[1] - effectiveSeed[1]);
-        if (movedXZ > reseedThreshold || movedY > reseedThreshold) {
+        const seedMoved = movedXZ > reseedThreshold || movedY > reseedThreshold;
+        const pinnedRegion = Boolean(settings.region_min && settings.region_max);
+        const denseYMin = dense[1] - SEED_CENTERED_DENSE_Y_BELOW_M;
+        const denseYMax = dense[1] + SEED_CENTERED_DENSE_Y_ABOVE_M;
+        const pinnedYNeedsUpdate =
+          seedCenteredOutdoor &&
+          pinnedRegion &&
+          settings.region_min &&
+          settings.region_max &&
+          (Math.abs(settings.region_min[1] - denseYMin) > 0.25 ||
+            Math.abs(settings.region_max[1] - denseYMax) > 0.25);
+
+        if (seedMoved || pinnedYNeedsUpdate) {
           const rebuild: MeshSettings = { ...settings, collision_seed: dense };
-          // Only adapt the default region when the caller hasn't pinned one.
-          if (!settings.region_min || !settings.region_max) {
+          if (!pinnedRegion) {
             const region = estimateDenseFloorRegion(field, denseSeed);
             if (region) {
               rebuild.region_min = region.min;
@@ -1195,11 +1253,21 @@ export async function extractFloorFieldWithRecovery(args: ExtractFloorFieldArgs)
                   `(y ${region.min[1].toFixed(2)}..${region.max[1].toFixed(2)}) (step "${step.label}").`
               );
             }
+          } else if (seedCenteredOutdoor && settings.region_min && settings.region_max) {
+            // Keep seed-centered XZ; only re-pin Y to the dense modal band.
+            rebuild.region_min = [settings.region_min[0], denseYMin, settings.region_min[2]];
+            rebuild.region_max = [settings.region_max[0], denseYMax, settings.region_max[2]];
+            log(
+              `[INFO] FAST NAV re-pinning seed-centered region Y to dense floor band ` +
+                `(y ${denseYMin.toFixed(2)}..${denseYMax.toFixed(2)}) (step "${step.label}").`
+            );
           }
-          log(
-            `[INFO] FAST NAV re-seeding to dense floor area ` +
-              `(${dense.map((v) => v.toFixed(2)).join(', ')}; moved ${movedXZ.toFixed(1)}m XZ, ${movedY.toFixed(1)}m Y) (step "${step.label}").`
-          );
+          if (seedMoved) {
+            log(
+              `[INFO] FAST NAV re-seeding to dense floor area ` +
+                `(${dense.map((v) => v.toFixed(2)).join(', ')}; moved ${movedXZ.toFixed(1)}m XZ, ${movedY.toFixed(1)}m Y) (step "${step.label}").`
+            );
+          }
           field = await buildField(bytes, rebuild);
           const reFloorY = field.diagnostics.floor_plane_height;
           effectiveSeed = Number.isFinite(reFloorY) ? [dense[0], reFloorY, dense[2]] : dense;

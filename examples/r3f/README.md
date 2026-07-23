@@ -26,6 +26,11 @@ Then open the demo route:
 
 - http://localhost:5173/react
 
+Use **Download FastNav kit** for `splatwalk-fastnav-r3f.zip` (`INTEGRATE.md` +
+source glue; pin `@splatwalk/core@0.6.4`). The WebGPU/WebGL control is shown for
+parity with Babylon demos; WebGPU is disabled because this path uses Three.js
+WebGL (`gaussian-splats-3d`).
+
 Drop a `.ply` / `.spz` / `.splat` splat (or pick an example scene). FAST NAV runs
 automatically: floor field -> floor mesh -> Recast navmesh -> crowd + NPC. Click
 the green navmesh overlay to move the blue player agent; the green NPC shares the

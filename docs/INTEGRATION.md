@@ -65,7 +65,7 @@ import {
 if (splatwalk_api_version() !== 2) throw new Error('Unsupported SplatWalk binary');
 
 const caps = splatwalk_capabilities();        // e.g. ['room_floor_mesh', 'recast_config', ...]
-const version = splatwalk_version();          // tracks the crate version, e.g. '0.3.6'
+const version = splatwalk_version();          // tracks the crate version, e.g. '0.6.4'
 
 if (!caps.includes('room_floor_mesh')) {
   // Fall back to the multi-step field path instead of the one-call entry point.
@@ -338,6 +338,27 @@ above the player (`beta ≈ 0`), targets the player, and sets
 splat ceiling, clamped between one player-height and 4 m above the player's head
 so the player stays framed in rooms of any height.
 
+**Camera select (view + offsets).** Hosts can pin the select-region AABB from a
+FreeCamera-style view and restore that view after Fast Nav (skip `focusOnPlayer`
+when `keptCameraSelectView` is true). Wire format stays WASM `region_min` /
+`region_max`; `api_version` remains **2**. CDN pin `@splatwalk/core@0.6.4`.
+Demos also support **Download / Upload nav artifacts** (zip or multi-select of `nav_session.json` + volume trio or `recast.navmesh.bin`). The Storage Adapter **Region and prune** panel can rebuild this AABB from the live
+fly camera (**Apply select region from camera**) with editable L/R/forward/behind/below/above offsets.
+
+```ts
+await runFastNav({
+  viewer,
+  bytes,
+  cameraSelect: {
+    view: {
+      position: { x: -329.834, y: 4.212, z: 148.185 },
+      eulerDegrees: { x: 28.5, y: 79.2, z: 0.0 },
+    },
+    // offsets?: Partial<{ left, right, forward, behind, below, above }>
+  },
+});
+```
+
 **Right-handed regression scene (`?rh=1`).** The Vuetify showcase can build the
 viewer with `scene.useRightHandedSystem = true` via a hidden `?rh=1` URL flag
 (`ViewerOptions.rightHanded` in `src/scene/Viewer.ts`). This is a
@@ -361,7 +382,7 @@ unchanged from the rest of this guide:
 
 ```ts
 // Babylon Playground (TypeScript). Full file: public/playground/babylon-fast-nav.ts
-const sw: any = await import('https://cdn.jsdelivr.net/npm/@splatwalk/core@0.3.7/wasm_splatwalk.js');
+const sw: any = await import('https://cdn.jsdelivr.net/npm/@splatwalk/core@0.6.4/wasm_splatwalk.js');
 await sw.default();        // wasm-bindgen --target web init (fetches the .wasm from the same CDN dir)
 sw.init_splatwalk();       // register the PLY/SPZ parsers (once)
 
@@ -390,10 +411,14 @@ const agentIndex = crowd.addAgent(nav.getClosestPoint(center), agentParams, agen
   exports (`Playground.CreateScene` / `default.CreateScene` / `createScene` /
   `default`) and awaits it. The snippet builds its own DOM UI on the canvas parent,
   so the demo is identical in the real Playground.
-- **Runnable demo + `playground.json` export:** open **`/playground/`** on the dev
+- **Runnable demo + FastNav playground export:** open **`/playground/`** on the dev
   server (`npm run dev` → `http://localhost:5173/playground/index.html`); source
   [`public/playground/index.html`](../public/playground/index.html). It reproduces
-  the Playground TS pipeline and offers a **Download `playground.json`** button.
+  the Playground TS pipeline and offers **Download FastNav playground**
+  (`playground.json` V2). Host owns WebGL/WebGPU — see
+  [`public/playground/PLAYGROUND_README.md`](../public/playground/PLAYGROUND_README.md).
+  Stack-specific zip kits (Vuetify / R3F / Storage / workbench) live under
+  `/integration-kits/` (built with `npm run build:kits`, pin `@splatwalk/core@0.6.4`).
   The file is a Babylon Playground **V2 snippet** (`{ payload, name, description,
   tags }` → V2 manifest), so it loads straight into the Playground for editing. An
   **Open Playground ↗** button opens the published snippet

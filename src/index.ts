@@ -58,6 +58,19 @@ export {
  */
 export * as floor from '@/navigation/floor';
 
+/** Camera-pose → AABB select region (host toolset; WASM still uses region_min/max). */
+export {
+  DEFAULT_CAMERA_SELECT_REGION_OFFSETS,
+  poseFromCameraSelectView,
+  regionBoundsFromCameraPose,
+  regionBoundsFromCameraSelect,
+  type CameraSelectRegionInput,
+  type CameraSelectRegionOffsets,
+  type CameraSelectRegionPose,
+  type CameraSelectView,
+  type RegionBoundsAabb,
+} from '@/navigation/cameraSelectRegion';
+
 /** WASM core data-contract types, published so binary-only integrators get real types. */
 export type {
   MeshSettings,

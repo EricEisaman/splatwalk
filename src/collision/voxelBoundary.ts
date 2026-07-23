@@ -7,10 +7,12 @@ import {
 } from '@/wasm/bridge';
 
 const DEFAULT_CARVE_HEIGHT = 1.6;
-const DEFAULT_CARVE_RADIUS = 0.25;
-const DEFAULT_COLLISION_FILL_SIZE = 1.2;
+/** splat-transform `--voxel-carve` default radius (metres). */
+const DEFAULT_CARVE_RADIUS = 0.2;
+/** splat-transform `--voxel-external-fill` / `--voxel-floor-fill` default (metres). */
+const DEFAULT_COLLISION_FILL_SIZE = 1.6;
 const DEFAULT_COLLISION_OPACITY_THRESHOLD = 0.1;
-const DEFAULT_COLLISION_VOXEL_SIZE = 0.08;
+const DEFAULT_COLLISION_VOXEL_SIZE = 0.05;
 const DEFAULT_MAX_SCALE = 5.0;
 const DEFAULT_MIN_ALPHA = 0.05;
 const DEFAULT_PRUNE_FLOATERS_K = 16;
@@ -26,6 +28,8 @@ export interface CollisionBoundaryArtifact {
 export interface CollisionBoundaryDefaultsOptions {
   readonly base?: Partial<CollisionVoxelBoundarySettings>;
   readonly emitGlb?: boolean;
+  /** Pack solid + nav_region for voxel walk (default true for nav path). */
+  readonly emitVolume?: boolean;
   readonly flipY?: boolean;
   readonly rotation?: readonly number[];
   readonly seed?: readonly number[] | null;
@@ -50,6 +54,7 @@ export interface CollisionRegionBounds {
 export const buildCollisionBoundarySettings = ({
   base = {},
   emitGlb = false,
+  emitVolume = true,
   flipY = false,
   rotation = DEFAULT_ROTATION,
   seed = DEFAULT_SEED,
@@ -64,12 +69,12 @@ export const buildCollisionBoundarySettings = ({
   sdf_influence_radius_scale: 2.5,
   collision_voxel_size: DEFAULT_COLLISION_VOXEL_SIZE,
   collision_opacity_threshold: DEFAULT_COLLISION_OPACITY_THRESHOLD,
-  collision_scene_type: 'outdoor',
+  collision_scene_type: 'indoor',
   collision_seed: seed ? [...seed] : undefined,
   collision_fill_size: DEFAULT_COLLISION_FILL_SIZE,
   collision_carve_height: DEFAULT_CARVE_HEIGHT,
   collision_carve_radius: DEFAULT_CARVE_RADIUS,
-  collision_mesh_mode: 'faces',
+  collision_mesh_mode: 'walkable_floors',
   min_alpha: DEFAULT_MIN_ALPHA,
   max_scale: DEFAULT_MAX_SCALE,
   prune_floaters: true,
@@ -89,6 +94,7 @@ export const buildCollisionBoundarySettings = ({
   flip_y: flipY,
   ...base,
   emit_glb: emitGlb,
+  emit_volume: emitVolume,
 });
 
 export const collisionBoundaryDiagnosticsSummary = (diagnostics: ReconstructionDiagnostics): string =>

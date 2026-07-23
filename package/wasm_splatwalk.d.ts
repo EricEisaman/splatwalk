@@ -248,6 +248,17 @@ export interface RoomFloorSettings extends MeshSettings {
 export interface CollisionVoxelBoundarySettings extends MeshSettings {
   /** When true, also emit a GLB of the collision boundary mesh in `glb`. Default false. */
   emit_glb?: boolean;
+  /** When true, also emit packed `solid` + `nav_region` in `volume`. Default false. */
+  emit_volume?: boolean;
+}
+
+/** Packed dense voxel volume for PC-style runtime walk (capability `collision_voxel_volume`). */
+export interface CollisionVoxelVolume {
+  origin: [number, number, number];
+  dims: [number, number, number];
+  voxel_size: number;
+  solid: Uint8Array;
+  nav_region: Uint8Array;
 }
 
 // ---------------------------------------------------------------------------
@@ -289,6 +300,8 @@ export interface CollisionVoxelBoundaryResult extends ResultContract {
   mesh: MeshBuffers;
   /** GLB bytes of the collision mesh, present only when `emit_glb` was set. */
   glb?: Uint8Array;
+  /** Dense solid + nav_region, present only when `emit_volume` was set. */
+  volume?: CollisionVoxelVolume;
   space: CoordinateSpace;
   basis: FieldBasis;
   floor_plane: FloorPlane;

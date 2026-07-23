@@ -2,6 +2,19 @@
 // ============================================
 // Prefer the Vue demo at /storage-adapter and the Playground paste target
 // public/playground/storage-adapter.ts (budgeted GaussianSplattingStream).
+//
+// Deep-link query API (chain: mode → pose → autoload settle → fastNav):
+//   stream     https lod-meta.json or root (root appends /lod-meta.json)
+//   autoload   true|1 — load CDN after init
+//   mode       fly|orbit — set before load (pose requires fly)
+//   pos        [x,y,z] world meters (with eulerDeg)
+//   eulerDeg   [x,y,z] degrees (with pos) — matches Camera Information "Copy pose"
+//   fastNav    true|1 — after successful load, run floor-field Fast Nav
+//              (keeps deep-link view via cameraSelect; skips top-down focus)
+//
+// Example (Skatepark + pose + Fast Nav):
+// /storage-adapter?stream=https://code.playcanvas.com/examples_data/example_skatepark_02/lod-meta.json&autoload=true&pos=[-2.255,4.854,-6.133]&eulerDeg=[-6.2,-263.5,0.0]&mode=fly&fastNav=true
+
 
 // ============================================
 // 0. CDN lod-meta.json (Babylon 9.16 / Playground TS)

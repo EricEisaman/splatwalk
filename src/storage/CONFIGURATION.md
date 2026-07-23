@@ -6,6 +6,16 @@
  */
 
 /**
+ * ## Demo renderer (Babylon host)
+ *
+ * Storage Adapter playground: prefer WebGPU or WebGL via Stream settings, or
+ * `?renderer=webgpu` / `?renderer=webgl`. WebGPU uses `setMaximumLimits` for the
+ * GS work-buffer MRT and falls back to WebGL when unsupported
+ * (`src/scene/createBabylonEngine.ts`). Not a WASM concern. Download the Storage
+ * Adapter kit from the demo UI (`/integration-kits/`, v0.6.4). Oval may arm
+ * `cameraSelect` (view + offsets → AABB). Region/prune can **Apply select region
+ * from camera** with editable offsets; see `regionBoundsFromCameraSelect`.
+ *
  * ## Storage Adapter System
  *
  * The storage adapter system provides a unified interface for streaming SOG LOD bundles

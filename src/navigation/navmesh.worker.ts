@@ -58,7 +58,12 @@ ctx.onmessage = async (e: MessageEvent) => {
         try {
             await initialize();
 
-            if (sourceLabel && !String(sourceLabel).includes('collider') && !String(sourceLabel).includes('floor_field')) {
+            const label = String(sourceLabel ?? '');
+            const allowed =
+                label.includes('collider') ||
+                label.includes('floor_field') ||
+                label.includes('voxel_volume');
+            if (sourceLabel && !allowed) {
                 ctx.postMessage({ type: 'error', payload: `Rejected non-collider Recast input source: ${sourceLabel}` });
                 return;
             }
@@ -90,6 +95,7 @@ ctx.onmessage = async (e: MessageEvent) => {
             const width = maxX - minX;
             const height = maxY - minY;
             const depth = maxZ - minZ;
+            const footprint = Math.min(width, depth);
 
             if (positions.length === 0 || indices.length === 0) {
                 ctx.postMessage({ type: 'error', payload: 'Collision mesh is empty. Check voxel seed, fill/carve settings, and scene type.' });
@@ -124,9 +130,17 @@ ctx.onmessage = async (e: MessageEvent) => {
             // Disabled (params.autoCellSize === false) for the manual path, which
             // honours the operator's literal cs input.
             let finalCS = params.cs;
+            let walkableRadiusM = params.walkableRadius;
+            if (footprint > 0 && walkableRadiusM > footprint * 0.45) {
+                walkableRadiusM = Math.max(0.05, footprint * 0.35);
+                console.warn(
+                    `[WORKER] Clamping walkableRadius ${params.walkableRadius.toFixed(3)}m -> ` +
+                    `${walkableRadiusM.toFixed(3)}m for ${footprint.toFixed(2)}m collider footprint`
+                );
+            }
             if (params.autoCellSize !== false) {
                 const budget = params.maxNavCells && params.maxNavCells > 0 ? params.maxNavCells : DEFAULT_MAX_NAV_CELLS;
-                finalCS = autoNavCellSize(width, depth, params.walkableRadius, budget);
+                finalCS = autoNavCellSize(width, depth, walkableRadiusM, budget);
                 console.log(
                     `[WORKER] Auto cell size: cs=${finalCS.toFixed(3)} ` +
                     `(agentRadius=${params.walkableRadius}m -> [${(params.walkableRadius / 3).toFixed(3)}, ${(params.walkableRadius / 2).toFixed(3)}], ` +
@@ -136,7 +150,7 @@ ctx.onmessage = async (e: MessageEvent) => {
             const maxDimension = Math.max(width, depth);
             const minResolution = 50; // We want at least 50 cells across the longest side
 
-            if (maxDimension / finalCS < minResolution) {
+            if (params.autoCellSize !== false && maxDimension >= 2.0 && maxDimension / finalCS < minResolution) {
                 const recommendedCS = Number((maxDimension / minResolution).toFixed(3));
                 console.warn(`[WORKER] Cell Size (${finalCS}) too coarse for mesh size (${width.toFixed(1)}x${depth.toFixed(1)}). Overriding to ${recommendedCS}.`);
                 finalCS = recommendedCS;
@@ -146,7 +160,7 @@ ctx.onmessage = async (e: MessageEvent) => {
             const gridD = Math.ceil(depth / finalCS);
             const gridH = Math.ceil((paddedMaxY - minY) / params.ch);
 
-            const activeParams = { ...params, cs: finalCS };
+            const activeParams = { ...params, cs: finalCS, walkableRadius: walkableRadiusM };
 
             // Recast's rcConfig stores walkableHeight/Climb/Radius as INTEGER VOXEL
             // COUNTS, not world-space metres (see @recast-navigation createRcConfig: it
@@ -246,7 +260,26 @@ ctx.onmessage = async (e: MessageEvent) => {
                 console.log(`[WORKER] Winding flip applied to ${indices.length / 3} triangles.`);
             }
 
-            console.log(`[WORKER] Generating navmesh via ${sourceLabel === 'fast_floor_field' ? 'floor-sheet (no ledge filter)' : 'generateSoloNavMesh'}...`);
+            const useFloorSheetBake =
+                sourceLabel === 'fast_floor_field' ||
+                sourceLabel === 'generated_voxel_collider' ||
+                sourceLabel === 'generated_voxel_volume';
+            if (sourceLabel === 'generated_voxel_volume') {
+                console.log(
+                    '[WORKER] Voxel volume spans — floor-sheet Recast bake (treads + step ramps from carve).'
+                );
+            } else if (sourceLabel === 'generated_voxel_collider') {
+                console.log(
+                    '[WORKER] Voxel collider — floor-sheet Recast bake (skip ledge filter) for stair connectivity.'
+                );
+            }
+            if (sourceLabel === 'generated_voxel_collider' && height < 0.2) {
+                console.log(
+                    `[WORKER] Voxel collider height ${height.toFixed(3)}m — still using floor-sheet bake for multi-level connectivity.`
+                );
+            }
+
+            console.log(`[WORKER] Generating navmesh via ${useFloorSheetBake ? 'floor-sheet (no ledge filter)' : 'generateSoloNavMesh'}...`);
 
             // Headroom must be applied via `bounds` (SoloNavMeshGeneratorConfig).
             // Passing legacy `bmin`/`bmax` is ignored by @recast-navigation — Recast then
@@ -267,7 +300,7 @@ ctx.onmessage = async (e: MessageEvent) => {
             // hole/border as a cliff and can wipe the entire walkable surface. Use a
             // dedicated bake that keeps low-hanging + headroom filters but skips ledges.
             const { success, navMesh, intermediates, error: bakeError } =
-                sourceLabel === 'fast_floor_field'
+                useFloorSheetBake
                     ? generateFloorSheetSoloNavMesh(
                           positions,
                           finalIndices,

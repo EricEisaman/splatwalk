@@ -1,6 +1,7 @@
 use crate::splat::PointNormal;
 use crate::{
-    CollisionVoxelBoundaryResult, CoordinateSpace, FieldBasis, FloorPlane, GroundFieldCell,
+    CollisionVoxelBoundaryResult, CollisionVoxelVolume, CoordinateSpace, FieldBasis, FloorPlane,
+    GroundFieldCell,
     GroundFieldCellState, MeshBuffers, MeshSettings, NavmeshBasisResult, ReconstructionDiagnostics,
     ReconstructionResult, SplatBounds, SuggestedRegion, WalkableGroundFieldResult,
 };
@@ -62,6 +63,36 @@ struct CollisionBuild {
     basis: FieldBasis,
     plane: FloorPlane,
     diagnostics: ReconstructionDiagnostics,
+    volume: Option<CollisionVoxelVolume>,
+}
+
+/// Pack bool occupancy LSB-first (bit i → byte[i/8] bit i%8).
+fn pack_bool_mask(bits: &[bool]) -> serde_bytes::ByteBuf {
+    let mut out = vec![0_u8; (bits.len() + 7) / 8];
+    for (i, &b) in bits.iter().enumerate() {
+        if b {
+            out[i / 8] |= 1 << (i % 8);
+        }
+    }
+    serde_bytes::ByteBuf::from(out)
+}
+
+fn pack_collision_volume(
+    grid: &VoxelGrid,
+    solid: &[bool],
+    nav_region: &[bool],
+) -> CollisionVoxelVolume {
+    CollisionVoxelVolume {
+        origin: [grid.min.x, grid.min.y, grid.min.z],
+        dims: [
+            grid.dims[0] as u32,
+            grid.dims[1] as u32,
+            grid.dims[2] as u32,
+        ],
+        voxel_size: grid.voxel_size,
+        solid: pack_bool_mask(solid),
+        nav_region: pack_bool_mask(nav_region),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -206,7 +237,7 @@ pub fn convert_splat_to_navmesh_basis(
 ) -> NavmeshBasisResult {
     let context = build_context(points, settings);
     let mut diagnostics = context.diagnostics.clone();
-    let collision = build_collision_mesh(&context, settings, &mut diagnostics);
+    let collision = build_collision_mesh(&context, settings, &mut diagnostics, false);
     let (mesh, basis, plane, diagnostics) = if let Some(collision) = collision {
         (
             collision.mesh,
@@ -244,16 +275,18 @@ pub fn convert_splat_to_navmesh_basis(
 pub fn build_collision_voxel_boundary(
     points: &[PointNormal],
     settings: &MeshSettings,
+    emit_volume: bool,
 ) -> CollisionVoxelBoundaryResult {
     let context = build_context(points, settings);
     let mut diagnostics = context.diagnostics.clone();
-    let collision = build_collision_mesh(&context, settings, &mut diagnostics);
-    let (mesh, basis, plane, diagnostics) = if let Some(collision) = collision {
+    let collision = build_collision_mesh(&context, settings, &mut diagnostics, emit_volume);
+    let (mesh, basis, plane, diagnostics, volume) = if let Some(collision) = collision {
         (
             collision.mesh,
             collision.basis,
             collision.plane,
             collision.diagnostics,
+            collision.volume,
         )
     } else {
         (
@@ -267,6 +300,7 @@ pub fn build_collision_voxel_boundary(
                 d: 0.0,
             },
             diagnostics,
+            None,
         )
     };
 
@@ -276,6 +310,7 @@ pub fn build_collision_voxel_boundary(
         capabilities: crate::capabilities(),
         mesh: MeshBuffers::new(mesh.vertices, mesh.indices),
         glb: None,
+        volume,
         space: CoordinateSpace::splatwalk_oriented(),
         basis,
         floor_plane: plane,
@@ -446,7 +481,7 @@ fn reconstruct_voxel_navmesh(
     settings: &MeshSettings,
     diagnostics: &mut ReconstructionDiagnostics,
 ) -> ReconstructedMesh {
-    let Some(collision) = build_collision_mesh(context, settings, diagnostics) else {
+    let Some(collision) = build_collision_mesh(context, settings, diagnostics, false) else {
         return ReconstructedMesh {
             vertices: vec![],
             indices: vec![],
@@ -457,32 +492,120 @@ fn reconstruct_voxel_navmesh(
     collision.mesh
 }
 
+fn collision_grid_bounds(
+    diagnostics: &ReconstructionDiagnostics,
+    settings: &MeshSettings,
+) -> Option<(Vector3<f64>, Vector3<f64>)> {
+    // When region is pinned, size the voxel grid to that box (PlayCanvas writeVoxel pads
+    // around the working volume). Using full splat AABB for city-scale materialized
+    // streams forces coarse voxel_size under the dense-grid cap and destroys stairs.
+    if let (Some(rmin), Some(rmax)) = (&settings.region_min, &settings.region_max) {
+        if rmin.len() == 3 && rmax.len() == 3 {
+            return Some((
+                Vector3::new(rmin[0], rmin[1], rmin[2]),
+                Vector3::new(rmax[0], rmax[1], rmax[2]),
+            ));
+        }
+    }
+
+    let min = diagnostics.oriented_min?;
+    let max = diagnostics.oriented_max?;
+    Some((
+        Vector3::new(min[0], min[1], min[2]),
+        Vector3::new(max[0], max[1], max[2]),
+    ))
+}
+
+fn write_collision_grid_diagnostics(
+    diagnostics: &mut ReconstructionDiagnostics,
+    grid: &VoxelGrid,
+    occupied_before: usize,
+    cluster_kept: usize,
+    cluster_discarded: usize,
+    filled: usize,
+    carved: usize,
+    scene_type: &str,
+    external_fill_leaked: bool,
+) {
+    diagnostics.collision_voxel_size = grid.voxel_size;
+    diagnostics.collision_grid_width = grid.dims[0];
+    diagnostics.collision_grid_height = grid.dims[1];
+    diagnostics.collision_grid_depth = grid.dims[2];
+    diagnostics.collision_occupied_voxels = occupied_before;
+    diagnostics.collision_cluster_kept_voxels = cluster_kept;
+    diagnostics.collision_cluster_discarded_voxels = cluster_discarded;
+    diagnostics.collision_filled_voxels = filled;
+    diagnostics.collision_carved_voxels = carved;
+    diagnostics.collision_scene_type = scene_type.to_string();
+    diagnostics.collision_external_fill_leaked = external_fill_leaked;
+}
+
 fn build_collision_mesh(
     context: &ReconstructionContext,
     settings: &MeshSettings,
     diagnostics: &mut ReconstructionDiagnostics,
+    emit_volume: bool,
 ) -> Option<CollisionBuild> {
-    let points = &context.filtered_points;
+    let mut points = context.filtered_points.clone();
     if points.is_empty() {
         diagnostics.collision_failure_reason = Some("no_filtered_points".to_string());
         return None;
     }
 
-    let min = diagnostics.oriented_min?;
-    let max = diagnostics.oriented_max?;
-    let bounds_min = Vector3::new(min[0], min[1], min[2]);
-    let bounds_max = Vector3::new(max[0], max[1], max[2]);
+    let cluster_seed = resolve_cluster_seed(settings, diagnostics);
+    if settings.collision_filter_cluster.unwrap_or(true) {
+        crate::emit_progress("collision_cluster", None);
+        let opacity_threshold = settings
+            .collision_opacity_threshold
+            .unwrap_or(0.1)
+            .max(0.05);
+        let discarded =
+            filter_splats_coarse_cluster(&mut points, cluster_seed, opacity_threshold);
+        if discarded > 0 {
+            web_sys::console::log_1(
+                &format!(
+                    "Coarse filter-cluster (PC --filter-cluster): kept {} splats, removed {} disconnected",
+                    points.len(),
+                    discarded
+                )
+                .into(),
+            );
+        }
+        if points.is_empty() {
+            diagnostics.collision_failure_reason = Some("filter_cluster_removed_all".to_string());
+            return None;
+        }
+    }
+
+    let (bounds_min, bounds_max) = collision_grid_bounds(diagnostics, settings)?;
+    let scene_type = settings
+        .collision_scene_type
+        .as_deref()
+        .unwrap_or("indoor")
+        .to_string();
     let mut voxel_size = settings
         .collision_voxel_size
         .filter(|v| v.is_finite() && *v > 0.0)
-        .unwrap_or(0.08)
+        .unwrap_or(0.05)
         .clamp(0.025, 0.5);
-    let padding = settings.collision_fill_size.unwrap_or(1.2).max(0.3);
-    let max_voxels = 1_500_000usize;
+    let fill_size = settings.collision_fill_size.unwrap_or(1.6);
+    // PlayCanvas writeVoxel: pad grid by exterior/floor fill radius + 1 voxel before voxelize.
+    let pad = if scene_type == "indoor" {
+        (fill_size / voxel_size).ceil().max(1.0) * voxel_size + voxel_size
+    } else if scene_type == "outdoor" {
+        (fill_size / voxel_size).ceil().max(1.0) * voxel_size + voxel_size
+    } else {
+        fill_size.max(0.3)
+    };
+    let max_voxels = settings
+        .collision_max_voxels
+        .filter(|v| *v > 0)
+        .unwrap_or(1_500_000usize)
+        .min(2_500_000);
 
     let grid = loop {
-        let padded_min = bounds_min - Vector3::new(padding, padding, padding);
-        let padded_max = bounds_max + Vector3::new(padding, padding, padding);
+        let padded_min = bounds_min - Vector3::new(pad, pad, pad);
+        let padded_max = bounds_max + Vector3::new(pad, pad, pad);
         let extent = padded_max - padded_min;
         let dims = [
             (extent.x / voxel_size).ceil().max(1.0) as usize + 1,
@@ -494,18 +617,70 @@ fn build_collision_mesh(
             dims,
             voxel_size,
         };
-        if grid.len() <= max_voxels || voxel_size >= 0.5 {
+        if grid.len() <= max_voxels {
             break grid;
+        }
+        web_sys::console::log_1(
+            &format!(
+                "Collision grid {} voxels exceeds cap {} — coarsening voxel {:.3}m → {:.3}m",
+                grid.len(),
+                max_voxels,
+                voxel_size,
+                voxel_size * 1.25
+            )
+            .into(),
+        );
+        if voxel_size >= 0.5 {
+            diagnostics.collision_failure_reason = Some("region_too_large".to_string());
+            write_collision_grid_diagnostics(
+                diagnostics,
+                &grid,
+                0,
+                0,
+                0,
+                0,
+                0,
+                &scene_type,
+                false,
+            );
+            return None;
         }
         voxel_size *= 1.25;
     };
+
+    let region_pinned = settings
+        .region_min
+        .as_ref()
+        .zip(settings.region_max.as_ref())
+        .map(|(min, max)| min.len() == 3 && max.len() == 3)
+        .unwrap_or(false);
+
+    crate::emit_progress("collision_grid", Some(1.0));
+    web_sys::console::log_1(
+        &format!(
+            "Collision grid: {}x{}x{} ({} voxels), voxel={:.3}m, splats={}, region_pinned={}",
+            grid.dims[0],
+            grid.dims[1],
+            grid.dims[2],
+            grid.len(),
+            grid.voxel_size,
+            points.len(),
+            region_pinned
+        )
+        .into(),
+    );
 
     let threshold = settings
         .collision_opacity_threshold
         .unwrap_or(0.1)
         .max(0.001);
     let mut density = vec![0.0_f64; grid.len()];
-    for p in points {
+    let point_count = points.len();
+    let report_every = (point_count / 50).max(1);
+    for (pi, p) in points.iter().enumerate() {
+        if pi % report_every == 0 {
+            crate::emit_progress("collision_voxelize", Some(pi as f64 / point_count as f64));
+        }
         let center = Vector3::new(p.point.x, p.point.y, p.point.z);
         let scale_avg = ((p.scale.x + p.scale.y + p.scale.z) / 3.0).max(voxel_size * 0.5);
         let radius = (scale_avg * 2.5).max(voxel_size).min(voxel_size * 6.0);
@@ -539,6 +714,17 @@ fn build_collision_mesh(
     let occupied_before = solid.iter().filter(|&&v| v).count();
     if occupied_before == 0 {
         diagnostics.collision_failure_reason = Some("no_occupied_voxels".to_string());
+        write_collision_grid_diagnostics(
+            diagnostics,
+            &grid,
+            occupied_before,
+            0,
+            0,
+            0,
+            0,
+            &scene_type,
+            false,
+        );
         return None;
     }
 
@@ -549,41 +735,65 @@ fn build_collision_mesh(
         &solid,
         seed,
         settings.collision_carve_height.unwrap_or(1.6),
-        settings.collision_carve_radius.unwrap_or(0.25),
+        settings.collision_carve_radius.unwrap_or(0.2),
     );
-    let (cluster_kept, cluster_discarded) = filter_occupied_seed_cluster(&grid, &mut solid, seed);
-    let scene_type = settings
-        .collision_scene_type
-        .as_deref()
-        .unwrap_or("outdoor")
-        .to_string();
+    // PlayCanvas writeVoxel uses optional pre-voxel `--filter-cluster` on splats, not a
+    // post-voxel solid trim. Post-voxel cluster filtering removed for carve parity.
+    let cluster_kept = occupied_before;
+    let cluster_discarded = 0usize;
+    crate::emit_progress("collision_fill", None);
     let (filled, external_fill_leaked) = apply_collision_fill(
         &grid,
         &mut solid,
         &scene_type,
-        settings.collision_fill_size.unwrap_or(1.2),
+        fill_size,
         seed,
+        region_pinned,
     );
-    let reachable = carve_reachable_empty(
+    crate::emit_progress("collision_carve", None);
+    let nav_region = carve_pc_style(
         &grid,
         &solid,
         seed,
         settings.collision_carve_height.unwrap_or(1.6),
-        settings.collision_carve_radius.unwrap_or(0.25),
+        settings.collision_carve_radius.unwrap_or(0.2),
     );
-    let carved = reachable.iter().filter(|&&v| v).count();
+    let carved = nav_region.iter().filter(|&&v| v).count();
     if carved == 0 {
         diagnostics.collision_failure_reason =
             Some("seed_not_reachable_or_capsule_blocked".to_string());
+        diagnostics.collision_seed_state = seed_state(
+            &grid,
+            &solid,
+            seed,
+            settings.collision_carve_height.unwrap_or(1.6),
+            settings.collision_carve_radius.unwrap_or(0.2),
+        );
+        write_collision_grid_diagnostics(
+            diagnostics,
+            &grid,
+            occupied_before,
+            cluster_kept,
+            cluster_discarded,
+            filled,
+            carved,
+            &scene_type,
+            external_fill_leaked,
+        );
         return None;
     }
 
     let mesh_mode = settings
         .collision_mesh_mode
         .as_deref()
-        .unwrap_or("faces")
+        .unwrap_or("walkable_floors")
         .to_string();
-    let mesh = mesh_from_voxels(&grid, &solid, &reachable);
+    crate::emit_progress("collision_mesh", None);
+    let mesh = match mesh_mode.as_str() {
+        "obstacle_shell" | "faces" => mesh_from_obstacle_shell(&grid, &solid, &nav_region),
+        "walkable_floors" => mesh_from_walkable_floors(&grid, &solid, &nav_region),
+        _ => mesh_from_walkable_floors(&grid, &solid, &nav_region),
+    };
     let surface_faces = mesh.indices.len() / 3;
 
     diagnostics.floor_plane = Some(FloorPlane {
@@ -613,7 +823,7 @@ fn build_collision_mesh(
         &solid,
         seed,
         settings.collision_carve_height.unwrap_or(1.6),
-        settings.collision_carve_radius.unwrap_or(0.25),
+        settings.collision_carve_radius.unwrap_or(0.2),
     );
     diagnostics.collision_scene_type = scene_type;
     diagnostics.collision_mesh_mode = mesh_mode;
@@ -621,7 +831,7 @@ fn build_collision_mesh(
     diagnostics.collision_failure_reason = None;
 
     web_sys::console::log_1(&format!(
-        "PlayCanvas-style collision: grid={}x{}x{}, voxel={:.3}, occupied={}, kept={}, discarded={}, filled={}, carved={}, faces={}",
+        "Collision carve: grid={}x{}x{}, voxel={:.3}, occupied={}, kept={}, discarded={}, filled={}, carved={}, faces={}",
         grid.dims[0], grid.dims[1], grid.dims[2], grid.voxel_size, occupied_before, cluster_kept, cluster_discarded, filled, carved, surface_faces
     ).into());
 
@@ -636,11 +846,18 @@ fn build_collision_mesh(
         d: -seed.y,
     });
 
+    let volume = if emit_volume {
+        Some(pack_collision_volume(&grid, &solid, &nav_region))
+    } else {
+        None
+    };
+
     Some(CollisionBuild {
         mesh,
         basis,
         plane,
         diagnostics: diagnostics.clone(),
+        volume,
     })
 }
 
@@ -668,81 +885,16 @@ fn collision_seed(
     )
 }
 
-fn filter_occupied_seed_cluster(
-    grid: &VoxelGrid,
-    solid: &mut [bool],
-    seed: Vector3<f64>,
-) -> (usize, usize) {
-    let Some(seed_idx) = nearest_solid_voxel(grid, solid, seed) else {
-        let occupied = solid.iter().filter(|&&v| v).count();
-        return (occupied, 0);
-    };
-    let mut keep = vec![false; solid.len()];
-    let mut queue = std::collections::VecDeque::new();
-    keep[seed_idx] = true;
-    queue.push_back(seed_idx);
-
-    while let Some(idx) = queue.pop_front() {
-        for nidx in voxel_neighbors6(grid, idx) {
-            if solid[nidx] && !keep[nidx] {
-                keep[nidx] = true;
-                queue.push_back(nidx);
-            }
-        }
-    }
-
-    let mut kept = 0usize;
-    let mut discarded = 0usize;
-    for idx in 0..solid.len() {
-        if solid[idx] {
-            if keep[idx] {
-                kept += 1;
-            } else {
-                solid[idx] = false;
-                discarded += 1;
-            }
-        }
-    }
-    (kept, discarded)
-}
-
-fn nearest_solid_voxel(grid: &VoxelGrid, solid: &[bool], seed: Vector3<f64>) -> Option<usize> {
-    let seed_voxel = grid.point_to_voxel(&seed).unwrap_or((
-        grid.dims[0] / 2,
-        grid.dims[1] / 2,
-        grid.dims[2] / 2,
-    ));
-    let max_radius = grid.dims.iter().copied().max().unwrap_or(0).min(64) as isize;
-    for radius in 0..=max_radius {
-        for y in (seed_voxel.1 as isize - radius).max(0)
-            ..=(seed_voxel.1 as isize + radius).min(grid.dims[1] as isize - 1)
-        {
-            for z in (seed_voxel.2 as isize - radius).max(0)
-                ..=(seed_voxel.2 as isize + radius).min(grid.dims[2] as isize - 1)
-            {
-                for x in (seed_voxel.0 as isize - radius).max(0)
-                    ..=(seed_voxel.0 as isize + radius).min(grid.dims[0] as isize - 1)
-                {
-                    let idx = grid.idx(x as usize, y as usize, z as usize);
-                    if solid[idx] {
-                        return Some(idx);
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
 fn apply_collision_fill(
     grid: &VoxelGrid,
     solid: &mut [bool],
     scene_type: &str,
     fill_size: f64,
     seed: Vector3<f64>,
+    skip_exterior_leak_check: bool,
 ) -> (usize, bool) {
     match scene_type {
-        "indoor" => apply_external_fill(grid, solid, fill_size, seed),
+        "indoor" => apply_external_fill(grid, solid, fill_size, seed, skip_exterior_leak_check),
         "object" => (0, false),
         _ => (apply_floor_fill(grid, solid, fill_size), false),
     }
@@ -802,6 +954,7 @@ fn apply_external_fill(
     solid: &mut [bool],
     fill_size: f64,
     seed: Vector3<f64>,
+    skip_exterior_leak_check: bool,
 ) -> (usize, bool) {
     let dilated = dilate_solid(
         grid,
@@ -824,9 +977,14 @@ fn apply_external_fill(
         }
     }
 
-    if let Some((sx, sy, sz)) = grid.point_to_voxel(&seed) {
-        if exterior[grid.idx(sx, sy, sz)] {
-            return (0, true);
+    // Pinned region_min/max: grid faces are the working volume, not real building exterior.
+    // Open box faces would falsely mark the seed as "leaked" (splat-transform skips fill but
+    // continues; we apply fill anyway so indoor sealing works inside the selection box).
+    if !skip_exterior_leak_check {
+        if let Some((sx, sy, sz)) = grid.point_to_voxel(&seed) {
+            if exterior[grid.idx(sx, sy, sz)] {
+                return (0, true);
+            }
         }
     }
 
@@ -912,70 +1070,6 @@ fn seed_state(
     }
 }
 
-fn carve_reachable_empty(
-    grid: &VoxelGrid,
-    solid: &[bool],
-    seed: Vector3<f64>,
-    height: f64,
-    radius: f64,
-) -> Vec<bool> {
-    let mut reachable = vec![false; solid.len()];
-    let Some(seed_empty) = nearest_capsule_fit_voxel(grid, solid, seed, height, radius) else {
-        return reachable;
-    };
-
-    let mut queue = std::collections::VecDeque::new();
-    reachable[seed_empty] = true;
-    queue.push_back(seed_empty);
-    while let Some(idx) = queue.pop_front() {
-        for nidx in voxel_neighbors6(grid, idx) {
-            if !reachable[nidx] {
-                let (x, y, z) = grid.coords(nidx);
-                if capsule_fits(grid, solid, x, y, z, height, radius) {
-                    reachable[nidx] = true;
-                    queue.push_back(nidx);
-                }
-            }
-        }
-    }
-    reachable
-}
-
-fn nearest_capsule_fit_voxel(
-    grid: &VoxelGrid,
-    solid: &[bool],
-    seed: Vector3<f64>,
-    height: f64,
-    radius: f64,
-) -> Option<usize> {
-    let seed_voxel = grid.point_to_voxel(&seed).unwrap_or((
-        grid.dims[0] / 2,
-        grid.dims[1] / 2,
-        grid.dims[2] / 2,
-    ));
-    let max_radius = grid.dims.iter().copied().max().unwrap_or(0).min(64) as isize;
-    for search in 0..=max_radius {
-        for y in (seed_voxel.1 as isize - search).max(0)
-            ..=(seed_voxel.1 as isize + search).min(grid.dims[1] as isize - 1)
-        {
-            for z in (seed_voxel.2 as isize - search).max(0)
-                ..=(seed_voxel.2 as isize + search).min(grid.dims[2] as isize - 1)
-            {
-                for x in (seed_voxel.0 as isize - search).max(0)
-                    ..=(seed_voxel.0 as isize + search).min(grid.dims[0] as isize - 1)
-                {
-                    if capsule_fits(
-                        grid, solid, x as usize, y as usize, z as usize, height, radius,
-                    ) {
-                        return Some(grid.idx(x as usize, y as usize, z as usize));
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
 fn capsule_fits(
     grid: &VoxelGrid,
     solid: &[bool],
@@ -1007,7 +1101,346 @@ fn capsule_fits(
     true
 }
 
-fn mesh_from_voxels(grid: &VoxelGrid, solid: &[bool], reachable: &[bool]) -> ReconstructedMesh {
+/// PlayCanvas `carve.ts`: dilate solid → BFS empty through dilated obstacles → dilate
+/// reachable empty → navigable volume (matches `gpuDilate3` + `twoLevelBFS` + invert mesh).
+fn carve_pc_style(
+    grid: &VoxelGrid,
+    solid: &[bool],
+    seed: Vector3<f64>,
+    capsule_height: f64,
+    capsule_radius: f64,
+) -> Vec<bool> {
+    let kernel_r = (capsule_radius / grid.voxel_size).ceil().max(0.0) as usize;
+    let y_half = (capsule_height / (2.0 * grid.voxel_size)).ceil().max(1.0) as usize;
+
+    let blocked = dilate_voxels_box(grid, solid, kernel_r, y_half);
+
+    let Some(mut seed_voxel) = grid.point_to_voxel(&seed) else {
+        return vec![false; solid.len()];
+    };
+
+    let max_radius = (kernel_r.max(y_half) * 2) as isize;
+    let Some(found) = nearest_free_voxel(grid, &blocked, seed_voxel, max_radius) else {
+        return vec![false; solid.len()];
+    };
+    seed_voxel = found;
+
+    let visited = bfs_free_voxels(grid, &blocked, seed_voxel);
+    let empty: Vec<bool> = visited
+        .iter()
+        .zip(blocked.iter())
+        .map(|(&v, &b)| v && !b)
+        .collect();
+
+    dilate_voxels_box(grid, &empty, kernel_r, y_half)
+}
+
+fn dilate_voxels_box(
+    grid: &VoxelGrid,
+    input: &[bool],
+    half_extent_xz: usize,
+    half_extent_y: usize,
+) -> Vec<bool> {
+    if half_extent_xz == 0 && half_extent_y == 0 {
+        return input.to_vec();
+    }
+    let after_x = dilate_voxels_axis(grid, input, 0, half_extent_xz);
+    let after_z = dilate_voxels_axis(grid, &after_x, 2, half_extent_xz);
+    dilate_voxels_axis(grid, &after_z, 1, half_extent_y)
+}
+
+fn dilate_voxels_axis(
+    grid: &VoxelGrid,
+    input: &[bool],
+    axis: u8,
+    half: usize,
+) -> Vec<bool> {
+    if half == 0 {
+        return input.to_vec();
+    }
+    let mut out = vec![false; input.len()];
+    let progress_every = (grid.dims[1] / 32).max(1);
+    for y in 0..grid.dims[1] {
+        if axis == 1 && y % progress_every == 0 {
+            crate::emit_progress("collision_carve", Some(y as f64 / grid.dims[1] as f64));
+        }
+        for z in 0..grid.dims[2] {
+            for x in 0..grid.dims[0] {
+                let mut set = false;
+                match axis {
+                    0 => {
+                        let x0 = x.saturating_sub(half);
+                        let x1 = (x + half).min(grid.dims[0] - 1);
+                        for xx in x0..=x1 {
+                            if input[grid.idx(xx, y, z)] {
+                                set = true;
+                                break;
+                            }
+                        }
+                    }
+                    1 => {
+                        let y0 = y.saturating_sub(half);
+                        let y1 = (y + half).min(grid.dims[1] - 1);
+                        for yy in y0..=y1 {
+                            if input[grid.idx(x, yy, z)] {
+                                set = true;
+                                break;
+                            }
+                        }
+                    }
+                    _ => {
+                        let z0 = z.saturating_sub(half);
+                        let z1 = (z + half).min(grid.dims[2] - 1);
+                        for zz in z0..=z1 {
+                            if input[grid.idx(x, y, zz)] {
+                                set = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                out[grid.idx(x, y, z)] = set;
+            }
+        }
+    }
+    out
+}
+
+fn nearest_free_voxel(
+    grid: &VoxelGrid,
+    blocked: &[bool],
+    seed: (usize, usize, usize),
+    max_radius: isize,
+) -> Option<(usize, usize, usize)> {
+    if !blocked[grid.idx(seed.0, seed.1, seed.2)] {
+        return Some(seed);
+    }
+    for search in 1..=max_radius {
+        for y in (seed.1 as isize - search).max(0)
+            ..=(seed.1 as isize + search).min(grid.dims[1] as isize - 1)
+        {
+            for z in (seed.2 as isize - search).max(0)
+                ..=(seed.2 as isize + search).min(grid.dims[2] as isize - 1)
+            {
+                for x in (seed.0 as isize - search).max(0)
+                    ..=(seed.0 as isize + search).min(grid.dims[0] as isize - 1)
+                {
+                    let idx = grid.idx(x as usize, y as usize, z as usize);
+                    if !blocked[idx] {
+                        return Some((x as usize, y as usize, z as usize));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn bfs_free_voxels(
+    grid: &VoxelGrid,
+    blocked: &[bool],
+    start: (usize, usize, usize),
+) -> Vec<bool> {
+    let mut visited = vec![false; blocked.len()];
+    let start_idx = grid.idx(start.0, start.1, start.2);
+    if blocked[start_idx] {
+        return visited;
+    }
+    visited[start_idx] = true;
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(start_idx);
+    while let Some(idx) = queue.pop_front() {
+        for nidx in voxel_neighbors6(grid, idx) {
+            if !visited[nidx] && !blocked[nidx] {
+                visited[nidx] = true;
+                queue.push_back(nidx);
+            }
+        }
+    }
+    visited
+}
+
+fn resolve_cluster_seed(
+    settings: &MeshSettings,
+    diagnostics: &ReconstructionDiagnostics,
+) -> Vector3<f64> {
+    if let Some(seed) = &settings.collision_seed {
+        if seed.len() == 3 && seed.iter().all(|v| v.is_finite()) {
+            return Vector3::new(seed[0], seed[1], seed[2]);
+        }
+    }
+    let min = diagnostics.oriented_min.unwrap_or([0.0, 0.0, 0.0]);
+    let max = diagnostics.oriented_max.unwrap_or(min);
+    Vector3::new(
+        (min[0] + max[0]) * 0.5,
+        diagnostics.floor_y_percentile_02.unwrap_or(min[1]) + 1.0,
+        (min[2] + max[2]) * 0.5,
+    )
+}
+
+fn filter_splats_coarse_cluster(
+    points: &mut Vec<PointNormal>,
+    seed: Vector3<f64>,
+    opacity_threshold: f64,
+) -> usize {
+    const COARSE_VOXEL: f64 = 1.0;
+    if points.is_empty() {
+        return 0;
+    }
+
+    let mut bounds_min = Vector3::new(f64::MAX, f64::MAX, f64::MAX);
+    let mut bounds_max = Vector3::new(f64::MIN, f64::MIN, f64::MIN);
+    for p in points.iter() {
+        if p.opacity < opacity_threshold {
+            continue;
+        }
+        bounds_min.x = bounds_min.x.min(p.point.x);
+        bounds_min.y = bounds_min.y.min(p.point.y);
+        bounds_min.z = bounds_min.z.min(p.point.z);
+        bounds_max.x = bounds_max.x.max(p.point.x);
+        bounds_max.y = bounds_max.y.max(p.point.y);
+        bounds_max.z = bounds_max.z.max(p.point.z);
+    }
+
+    let extent = bounds_max - bounds_min;
+    let dims = [
+        (extent.x / COARSE_VOXEL).ceil().max(1.0) as usize + 1,
+        (extent.y / COARSE_VOXEL).ceil().max(1.0) as usize + 1,
+        (extent.z / COARSE_VOXEL).ceil().max(1.0) as usize + 1,
+    ];
+    if dims[0] * dims[1] * dims[2] > 2_000_000 {
+        return 0;
+    }
+
+    let grid = VoxelGrid {
+        min: bounds_min,
+        dims,
+        voxel_size: COARSE_VOXEL,
+    };
+    let mut occupied = vec![false; grid.len()];
+    for p in points.iter() {
+        if p.opacity < opacity_threshold {
+            continue;
+        }
+        let Some((x, y, z)) = grid.point_to_voxel(&Vector3::new(p.point.x, p.point.y, p.point.z))
+        else {
+            continue;
+        };
+        occupied[grid.idx(x, y, z)] = true;
+    }
+
+    let Some(mut seed_voxel) = grid.point_to_voxel(&seed) else {
+        return 0;
+    };
+    let max_radius = (grid.dims.iter().copied().max().unwrap_or(0) as isize).min(512);
+    if !occupied[grid.idx(seed_voxel.0, seed_voxel.1, seed_voxel.2)] {
+        let Some(found) = nearest_occupied_voxel(&grid, &occupied, seed_voxel, max_radius) else {
+            return 0;
+        };
+        seed_voxel = found;
+    }
+
+    let visited = bfs_occupied_voxels(&grid, &occupied, seed_voxel);
+    let before = points.len();
+    points.retain(|p| {
+        if p.opacity < opacity_threshold {
+            return false;
+        }
+        let Some((x, y, z)) = grid.point_to_voxel(&Vector3::new(p.point.x, p.point.y, p.point.z))
+        else {
+            return false;
+        };
+        visited[grid.idx(x, y, z)]
+    });
+    before.saturating_sub(points.len())
+}
+
+fn nearest_occupied_voxel(
+    grid: &VoxelGrid,
+    occupied: &[bool],
+    seed: (usize, usize, usize),
+    max_radius: isize,
+) -> Option<(usize, usize, usize)> {
+    if occupied[grid.idx(seed.0, seed.1, seed.2)] {
+        return Some(seed);
+    }
+    for search in 1..=max_radius {
+        for y in (seed.1 as isize - search).max(0)
+            ..=(seed.1 as isize + search).min(grid.dims[1] as isize - 1)
+        {
+            for z in (seed.2 as isize - search).max(0)
+                ..=(seed.2 as isize + search).min(grid.dims[2] as isize - 1)
+            {
+                for x in (seed.0 as isize - search).max(0)
+                    ..=(seed.0 as isize + search).min(grid.dims[0] as isize - 1)
+                {
+                    let idx = grid.idx(x as usize, y as usize, z as usize);
+                    if occupied[idx] {
+                        return Some((x as usize, y as usize, z as usize));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn bfs_occupied_voxels(
+    grid: &VoxelGrid,
+    occupied: &[bool],
+    start: (usize, usize, usize),
+) -> Vec<bool> {
+    let mut visited = vec![false; occupied.len()];
+    let start_idx = grid.idx(start.0, start.1, start.2);
+    if !occupied[start_idx] {
+        return visited;
+    }
+    visited[start_idx] = true;
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(start_idx);
+    while let Some(idx) = queue.pop_front() {
+        for nidx in voxel_neighbors6(grid, idx) {
+            if !visited[nidx] && occupied[nidx] {
+                visited[nidx] = true;
+                queue.push_back(nidx);
+            }
+        }
+    }
+    visited
+}
+
+fn mesh_from_obstacle_shell(
+    grid: &VoxelGrid,
+    solid: &[bool],
+    nav_region: &[bool],
+) -> ReconstructedMesh {
+    let combined: Vec<bool> = solid
+        .iter()
+        .zip(nav_region.iter())
+        .map(|(&s, &n)| s || n)
+        .collect();
+    let Some((occ_min, occ_max)) = occupied_voxel_bounds(grid, &combined) else {
+        return ReconstructedMesh {
+            vertices: Vec::new(),
+            indices: Vec::new(),
+        };
+    };
+    let grid_span = [
+        occ_max[0].saturating_sub(occ_min[0]),
+        occ_max[1].saturating_sub(occ_min[1]),
+        occ_max[2].saturating_sub(occ_min[2]),
+    ];
+    let max_span = grid_span[0].max(grid_span[1]).max(grid_span[2]);
+    let crop_margin_voxels = if max_span <= 48 {
+        10usize
+    } else if max_span <= 96 {
+        6
+    } else {
+        4
+    };
+    let (crop_min, crop_max) =
+        crop_voxel_range_with_margin(grid.dims, occ_min, occ_max, crop_margin_voxels);
+
     let mut vertices = Vec::<f32>::new();
     let mut indices = Vec::<u32>::new();
     let mut vertex_map = std::collections::HashMap::<(usize, usize, usize), u32>::new();
@@ -1020,63 +1453,219 @@ fn mesh_from_voxels(grid: &VoxelGrid, solid: &[bool], reachable: &[bool]) -> Rec
         ((0, 0, -1), [(0, 0, 0), (0, 1, 0), (1, 1, 0), (1, 0, 0)]),
     ];
 
-    for idx in 0..solid.len() {
-        if !solid[idx] {
-            continue;
-        }
-        let (x, y, z) = grid.coords(idx);
-        for (dir, corners) in faces {
-            let nx = x as isize + dir.0;
-            let ny = y as isize + dir.1;
-            let nz = z as isize + dir.2;
-            let expose = if nx < 0
-                || ny < 0
-                || nz < 0
-                || nx >= grid.dims[0] as isize
-                || ny >= grid.dims[1] as isize
-                || nz >= grid.dims[2] as isize
-            {
-                false
-            } else {
-                reachable[grid.idx(nx as usize, ny as usize, nz as usize)]
-            };
-            if !expose {
-                continue;
-            }
-
-            let mut face_indices = [0_u32; 4];
-            for (slot, corner) in corners.iter().enumerate() {
-                let key = (x + corner.0, y + corner.1, z + corner.2);
-                if let Some(existing) = vertex_map.get(&key) {
-                    face_indices[slot] = *existing;
+    for y in crop_min[1]..crop_max[1] {
+        for z in crop_min[2]..crop_max[2] {
+            for x in crop_min[0]..crop_max[0] {
+                let idx = grid.idx(x, y, z);
+                if !solid[idx] {
                     continue;
                 }
-                let p = grid.min
-                    + Vector3::new(
-                        key.0 as f64 * grid.voxel_size,
-                        key.1 as f64 * grid.voxel_size,
-                        key.2 as f64 * grid.voxel_size,
-                    );
-                let new_idx = (vertices.len() / 3) as u32;
-                vertices.push(p.x as f32);
-                vertices.push(p.y as f32);
-                vertices.push(p.z as f32);
-                vertex_map.insert(key, new_idx);
-                face_indices[slot] = new_idx;
-            }
+                for (dir, corners) in faces {
+                    let nx = x as isize + dir.0;
+                    let ny = y as isize + dir.1;
+                    let nz = z as isize + dir.2;
+                    let expose = if nx < crop_min[0] as isize
+                        || ny < crop_min[1] as isize
+                        || nz < crop_min[2] as isize
+                        || nx >= crop_max[0] as isize
+                        || ny >= crop_max[1] as isize
+                        || nz >= crop_max[2] as isize
+                        || nx < 0
+                        || ny < 0
+                        || nz < 0
+                        || nx >= grid.dims[0] as isize
+                        || ny >= grid.dims[1] as isize
+                        || nz >= grid.dims[2] as isize
+                    {
+                        false
+                    } else {
+                        nav_region[grid.idx(nx as usize, ny as usize, nz as usize)]
+                    };
+                    if !expose {
+                        continue;
+                    }
 
-            indices.extend_from_slice(&[
-                face_indices[0],
-                face_indices[1],
-                face_indices[2],
-                face_indices[0],
-                face_indices[2],
-                face_indices[3],
-            ]);
+                    let mut face_indices = [0_u32; 4];
+                    for (slot, corner) in corners.iter().enumerate() {
+                        let key = (x + corner.0, y + corner.1, z + corner.2);
+                        if let Some(existing) = vertex_map.get(&key) {
+                            face_indices[slot] = *existing;
+                            continue;
+                        }
+                        let p = grid.min
+                            + Vector3::new(
+                                key.0 as f64 * grid.voxel_size,
+                                key.1 as f64 * grid.voxel_size,
+                                key.2 as f64 * grid.voxel_size,
+                            );
+                        let new_idx = (vertices.len() / 3) as u32;
+                        vertices.push(p.x as f32);
+                        vertices.push(p.y as f32);
+                        vertices.push(p.z as f32);
+                        vertex_map.insert(key, new_idx);
+                        face_indices[slot] = new_idx;
+                    }
+
+                    indices.extend_from_slice(&[
+                        face_indices[0],
+                        face_indices[1],
+                        face_indices[2],
+                        face_indices[0],
+                        face_indices[2],
+                        face_indices[3],
+                    ]);
+                }
+            }
         }
     }
 
     ReconstructedMesh { vertices, indices }
+}
+
+/// Walkable floor + stair tread tops for Recast (PC-style): upward-facing quads on
+/// solid voxels that border carved nav volume above. Skips wall/ceiling shells that
+/// fragment Recast into green shards.
+fn mesh_from_walkable_floors(
+    grid: &VoxelGrid,
+    solid: &[bool],
+    nav_region: &[bool],
+) -> ReconstructedMesh {
+    let combined: Vec<bool> = solid
+        .iter()
+        .zip(nav_region.iter())
+        .map(|(&s, &n)| s || n)
+        .collect();
+    let Some((occ_min, occ_max)) = occupied_voxel_bounds(grid, &combined) else {
+        return ReconstructedMesh {
+            vertices: Vec::new(),
+            indices: Vec::new(),
+        };
+    };
+    let grid_span = [
+        occ_max[0].saturating_sub(occ_min[0]),
+        occ_max[1].saturating_sub(occ_min[1]),
+        occ_max[2].saturating_sub(occ_min[2]),
+    ];
+    let max_span = grid_span[0].max(grid_span[1]).max(grid_span[2]);
+    let crop_margin_voxels = if max_span <= 48 {
+        10usize
+    } else if max_span <= 96 {
+        6
+    } else {
+        4
+    };
+    let (crop_min, crop_max) =
+        crop_voxel_range_with_margin(grid.dims, occ_min, occ_max, crop_margin_voxels);
+
+    let mut vertices = Vec::<f32>::new();
+    let mut indices = Vec::<u32>::new();
+    let mut vertex_map = std::collections::HashMap::<(usize, usize, usize), u32>::new();
+
+    let emit_corner = |vertices: &mut Vec<f32>,
+                       vertex_map: &mut std::collections::HashMap<(usize, usize, usize), u32>,
+                       key: (usize, usize, usize),
+                       grid: &VoxelGrid| -> u32 {
+        if let Some(existing) = vertex_map.get(&key) {
+            return *existing;
+        }
+        let p = grid.min
+            + Vector3::new(
+                key.0 as f64 * grid.voxel_size,
+                key.1 as f64 * grid.voxel_size,
+                key.2 as f64 * grid.voxel_size,
+            );
+        let new_idx = (vertices.len() / 3) as u32;
+        vertices.push(p.x as f32);
+        vertices.push(p.y as f32);
+        vertices.push(p.z as f32);
+        vertex_map.insert(key, new_idx);
+        new_idx
+    };
+
+    for y in crop_min[1]..crop_max[1] {
+        for z in crop_min[2]..crop_max[2] {
+            for x in crop_min[0]..crop_max[0] {
+                let idx = grid.idx(x, y, z);
+                if !solid[idx] {
+                    continue;
+                }
+                let above_y = y + 1;
+                if above_y >= grid.dims[1] {
+                    continue;
+                }
+                if !nav_region[grid.idx(x, above_y, z)] {
+                    continue;
+                }
+
+                let top_y = y + 1;
+                let corners = [
+                    (x, top_y, z),
+                    (x + 1, top_y, z),
+                    (x + 1, top_y, z + 1),
+                    (x, top_y, z + 1),
+                ];
+                let mut face_indices = [0_u32; 4];
+                for (slot, corner) in corners.iter().enumerate() {
+                    face_indices[slot] = emit_corner(&mut vertices, &mut vertex_map, *corner, grid);
+                }
+                indices.extend_from_slice(&[
+                    face_indices[0],
+                    face_indices[2],
+                    face_indices[1],
+                    face_indices[0],
+                    face_indices[3],
+                    face_indices[2],
+                ]);
+            }
+        }
+    }
+
+    ReconstructedMesh { vertices, indices }
+}
+
+fn occupied_voxel_bounds(
+    grid: &VoxelGrid,
+    solid: &[bool],
+) -> Option<([usize; 3], [usize; 3])> {
+    let mut min = [usize::MAX; 3];
+    let mut max = [0_usize; 3];
+    let mut any = false;
+    for idx in 0..solid.len() {
+        if !solid[idx] {
+            continue;
+        }
+        any = true;
+        let (x, y, z) = grid.coords(idx);
+        min[0] = min[0].min(x);
+        min[1] = min[1].min(y);
+        min[2] = min[2].min(z);
+        max[0] = max[0].max(x);
+        max[1] = max[1].max(y);
+        max[2] = max[2].max(z);
+    }
+    if !any {
+        return None;
+    }
+    Some((min, max))
+}
+
+fn crop_voxel_range_with_margin(
+    dims: [usize; 3],
+    min: [usize; 3],
+    max: [usize; 3],
+    margin: usize,
+) -> ([usize; 3], [usize; 3]) {
+    let crop_min = [
+        min[0].saturating_sub(margin),
+        min[1].saturating_sub(margin),
+        min[2].saturating_sub(margin),
+    ];
+    let crop_max = [
+        (max[0] + margin + 1).min(dims[0]),
+        (max[1] + margin + 1).min(dims[1]),
+        (max[2] + margin + 1).min(dims[2]),
+    ];
+    (crop_min, crop_max)
 }
 
 fn voxel_neighbors6(grid: &VoxelGrid, idx: usize) -> Vec<usize> {
@@ -1225,13 +1814,30 @@ fn build_field(
     let rows = (depth_m / cell_size).ceil() as usize;
     let width = cols.max(1);
     let height = rows.max(1);
-    let num_cells = width * height;
+    let num_cells = match width.checked_mul(height) {
+        Some(n) if n > 0 => n,
+        _ => {
+            web_sys::console::error_1(
+                &"Ground field grid size overflow — pin region_min/max for huge AABBs.".into(),
+            );
+            return None;
+        }
+    };
     let y_padding = obstacle_height_epsilon.max(floor_projection_epsilon) * 2.0;
     let profile_min_y = min_y - y_padding;
     let profile_max_y = max_y + y_padding;
     let profile_bins =
         (((profile_max_y - profile_min_y) / sdf_vertical_cell_size).ceil() as usize).clamp(2, 256);
-    let mut profiles = vec![0.0_f64; num_cells * profile_bins];
+    let profile_len = match num_cells.checked_mul(profile_bins) {
+        Some(n) => n,
+        None => {
+            web_sys::console::error_1(
+                &"Ground field profile buffer overflow — pin region_min/max.".into(),
+            );
+            return None;
+        }
+    };
+    let mut profiles = vec![0.0_f64; profile_len];
     let mut normal_weight = vec![0.0_f64; num_cells];
     let mut sample_weight = vec![0.0_f64; num_cells];
 

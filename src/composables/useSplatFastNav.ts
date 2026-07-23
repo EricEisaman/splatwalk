@@ -10,6 +10,13 @@ import {
   seedFromRegionBounds,
   type CollisionBoundaryArtifact,
 } from '@/collision/voxelBoundary';
+import { applyNavArtifactsToViewer } from '@/navigation/applyNavArtifacts';
+import {
+  DEFAULT_CAMERA_SELECT_REGION_OFFSETS,
+  regionBoundsFromCameraSelect,
+  type CameraSelectRegionInput,
+  type CameraSelectRegionOffsets,
+} from '@/navigation/cameraSelectRegion';
 import {
   readSplatBytes,
   runFastNav,
@@ -18,6 +25,13 @@ import {
   type PruneFloatersOptions,
   type FastNavPhase,
 } from '@/navigation/fastNav';
+import {
+  buildMinimalNavArtifactBundle,
+  downloadNavArtifactZip,
+  parseNavArtifactFiles,
+  type NavArtifactBundle,
+} from '@/navigation/navArtifactBundle';
+import { NAV_ARTIFACT_UPLOAD_HINT } from '@/navigation/navArtifactContract';
 import {
   DEFAULT_DEMO_NAV_SETTINGS,
   demoNavSettingsToFastNavTuning,
@@ -34,6 +48,7 @@ import {
   type SliceSettings,
 } from '@/wasm/sogTypes';
 import type { UseBabylonViewer } from '@/composables/useBabylonViewer';
+import { FreeCamera } from '@babylonjs/core/Cameras/freeCamera';
 
 /** Which SOG export to produce. */
 export type SogExportMode = 'streamed' | 'single';
@@ -62,6 +77,15 @@ export interface FastNavProgress {
 
 /** Options for {@link useSplatFastNav}. */
 export interface UseSplatFastNavOptions {
+  /**
+   * Optional camera view + AABB offsets. Pins the yellow select region for the
+   * run and restores that view after nav (skips top-down {@link Viewer.focusOnPlayer}).
+   */
+  readonly cameraSelect?: CameraSelectRegionInput;
+  /**
+   * When `cameraSelect` is set, restore that view after nav (default true).
+   */
+  readonly keepCameraSelectView?: boolean;
   /**
    * Optional override for the adaptive FAST NAV floor-field recovery ladder.
    * When omitted, the built-in default ladder is used (recovery is always on).
@@ -110,6 +134,19 @@ export interface UseSplatFastNav {
   readonly exportSog: (mode: SogExportMode, settings?: SliceSettings) => Promise<SliceArchive>;
   /** Export the generated Recast navmesh binary. */
   readonly exportNavmesh: () => Promise<void>;
+  /** Frame top-down on the player agent when a navmesh session exists. */
+  readonly goToPlayer: () => void;
+  /** Download nav-artifacts zip (session + Recast bin ± collision GLB). */
+  readonly downloadNavArtifacts: () => void;
+  /** Upload zip or multi-select contract files and restore nav. */
+  readonly uploadNavArtifacts: (files: File[] | FileList) => Promise<void>;
+  readonly hasNavArtifactBundle: ComputedRef<boolean>;
+  readonly navArtifactUploadHint: string;
+  /** Editable camera-select AABB offsets (meters). */
+  readonly cameraSelectOffsets: Ref<CameraSelectRegionOffsets>;
+  readonly resetCameraSelectOffsets: () => void;
+  /** Pin yellow box from live FreeCamera + offsets; used on next Fast Nav. */
+  readonly applySelectRegionFromCamera: () => Promise<void>;
   /** Generate and show the collision voxel boundary overlay. */
   readonly generateCollisionBoundary: () => Promise<CollisionBoundaryArtifact>;
   /** Export the collision voxel boundary mesh as `.collision.glb`. */
@@ -198,10 +235,33 @@ export function useSplatFastNav(
   let currentName = 'splat';
   let currentCollisionArtifact: CollisionBoundaryArtifact | null = null;
   let currentNavMeshData: Uint8Array | null = null;
+  let currentNavArtifactBundle: NavArtifactBundle | null = null;
+  let sessionCameraSelect: CameraSelectRegionInput | undefined = options.cameraSelect;
   /** Stashed so Scale Environment set before load applies on first Fast Nav. */
   let pendingEnvironmentScale = 1;
   /** Last selection-region AABB so hide→show can restore the user's box. */
   let cachedSelectionRegion: { min: number[]; max: number[] } | null = null;
+  const cameraSelectOffsets = ref<CameraSelectRegionOffsets>({
+    ...DEFAULT_CAMERA_SELECT_REGION_OFFSETS,
+  });
+  const hasNavArtifactBundle = computed(() => currentNavArtifactBundle !== null);
+
+  const storeMinimalNavArtifacts = (
+    navMeshData: Uint8Array,
+    playerSpawn: { x: number; y: number; z: number } | null | undefined
+  ): void => {
+    const viewer = babylon.viewer.value;
+    const region = viewer?.getWasmRegionBounds() ?? null;
+    currentNavArtifactBundle = buildMinimalNavArtifactBundle({
+      collisionGlb: currentCollisionArtifact?.result.glb ?? null,
+      navMeshData,
+      playerSpawn: playerSpawn
+        ? [playerSpawn.x, playerSpawn.y, playerSpawn.z]
+        : null,
+      regionMax: region?.max ?? null,
+      regionMin: region?.min ?? null,
+    });
+  };
 
   const resolveFastNavTuning = () => {
     const tuning = demoNavSettingsToFastNavTuning(navSettings.value);
@@ -271,7 +331,7 @@ export function useSplatFastNav(
       statusMessage.value = `Loading ${file.name}...`;
       appendLog(`[INFO] Loading file: ${file.name} (${file.size} bytes)`);
 
-      const viewer = babylon.initViewer();
+      const viewer = await babylon.initViewer();
       viewer.setEnvironmentScale(pendingEnvironmentScale);
 
       if (!wasmReady) {
@@ -314,6 +374,8 @@ export function useSplatFastNav(
       const fastNav = await runFastNav({
         viewer,
         bytes,
+        cameraSelect: sessionCameraSelect ?? options.cameraSelect,
+        keepCameraSelectView: options.keepCameraSelectView,
         onLog: appendLog,
         onPhase: (next) => { phase.value = next; },
         recovery: options.recovery,
@@ -322,18 +384,21 @@ export function useSplatFastNav(
       });
       currentNavMeshData = fastNav.navMeshData;
       hasNavMesh.value = true;
+      storeMinimalNavArtifacts(fastNav.navMeshData, fastNav.playerSpawn);
       phase.value = 'done';
       progress.value = null;
 
-      statusMessage.value = 'Framing the player (top-down)...';
-      const framing = viewer.focusOnPlayer();
-      if (framing) {
-        appendLog(
-          `[SUCCESS] Top-down view set above player at ` +
-            `${framing.player.map((v) => v.toFixed(2)).join(', ')}.`
-        );
-      } else {
-        appendLog('[WARN] No player agent to frame; leaving the default camera.');
+      if (!fastNav.keptCameraSelectView) {
+        statusMessage.value = 'Framing the player (top-down)...';
+        const framing = viewer.focusOnPlayer();
+        if (framing) {
+          appendLog(
+            `[SUCCESS] Top-down view set above player at ` +
+              `${framing.player.map((v) => v.toFixed(2)).join(', ')}.`
+          );
+        } else {
+          appendLog('[WARN] No player agent to frame; leaving the default camera.');
+        }
       }
 
       status.value = 'done';
@@ -459,6 +524,23 @@ export function useSplatFastNav(
 
   const setCollisionBoundaryVisible = (visible: boolean): void => {
     babylon.viewer.value?.setColliderVisible(visible);
+  };
+
+  const goToPlayer = (): void => {
+    const viewer = babylon.viewer.value;
+    if (!viewer || !hasNavMesh.value) {
+      appendLog('[WARN] Go to Player: no player agent.');
+      return;
+    }
+    const framing = viewer.focusOnPlayer();
+    if (framing) {
+      appendLog(
+        `[SUCCESS] Go to Player — top-down at ` +
+          `${framing.player.map((v) => v.toFixed(2)).join(', ')}.`
+      );
+      return;
+    }
+    appendLog('[WARN] Go to Player: focusOnPlayer returned null.');
   };
 
   const setNavMeshVisible = (visible: boolean): void => {
@@ -587,6 +669,8 @@ export function useSplatFastNav(
       const fastNav = await runFastNav({
         viewer,
         bytes: currentBytes,
+        cameraSelect: sessionCameraSelect ?? options.cameraSelect,
+        keepCameraSelectView: options.keepCameraSelectView,
         onLog: appendLog,
         onPhase: (next) => {
           phase.value = next;
@@ -597,16 +681,19 @@ export function useSplatFastNav(
       });
       currentNavMeshData = fastNav.navMeshData;
       hasNavMesh.value = true;
+      storeMinimalNavArtifacts(fastNav.navMeshData, fastNav.playerSpawn);
       phase.value = 'done';
       progress.value = null;
 
-      statusMessage.value = 'Framing the player (top-down)...';
-      const framing = viewer.focusOnPlayer();
-      if (framing) {
-        appendLog(
-          `[SUCCESS] Top-down view set above player at ` +
-            `${framing.player.map((v) => v.toFixed(2)).join(', ')}.`
-        );
+      if (!fastNav.keptCameraSelectView) {
+        statusMessage.value = 'Framing the player (top-down)...';
+        const framing = viewer.focusOnPlayer();
+        if (framing) {
+          appendLog(
+            `[SUCCESS] Top-down view set above player at ` +
+              `${framing.player.map((v) => v.toFixed(2)).join(', ')}.`
+          );
+        }
       }
 
       status.value = 'done';
@@ -645,6 +732,104 @@ export function useSplatFastNav(
     await rerunFastNav();
   };
 
+  const resetCameraSelectOffsets = (): void => {
+    cameraSelectOffsets.value = { ...DEFAULT_CAMERA_SELECT_REGION_OFFSETS };
+  };
+
+  const applySelectRegionFromCamera = async (): Promise<void> => {
+    const viewer = babylon.viewer.value;
+    if (!viewer) {
+      throw new Error('Viewer is not ready.');
+    }
+    const cam = viewer.getScene().activeCamera;
+    if (!(cam instanceof FreeCamera)) {
+      appendLog('[WARN] Apply select region from camera requires Fly (FreeCamera) mode.');
+      return;
+    }
+    const radToDeg = 180 / Math.PI;
+    const input: CameraSelectRegionInput = {
+      view: {
+        position: { x: cam.position.x, y: cam.position.y, z: cam.position.z },
+        eulerDegrees: {
+          x: cam.rotation.x * radToDeg,
+          y: cam.rotation.y * radToDeg,
+          z: cam.rotation.z * radToDeg,
+        },
+      },
+      offsets: { ...cameraSelectOffsets.value },
+    };
+    sessionCameraSelect = input;
+    const bounds = regionBoundsFromCameraSelect(input);
+    cachedSelectionRegion = { min: [...bounds.min], max: [...bounds.max] };
+    viewer.enableRegionSelection({ min: bounds.min, max: bounds.max });
+    selectionRegionVisible.value = true;
+    appendLog(
+      `[INFO] Camera select region pinned: ` +
+        `${bounds.min.map((v) => v.toFixed(2)).join(', ')} → ` +
+        `${bounds.max.map((v) => v.toFixed(2)).join(', ')}`
+    );
+  };
+
+  const downloadNavArtifacts = (): void => {
+    if (!currentNavArtifactBundle) {
+      appendLog('[WARN] No nav artifact pack — run Fast Nav first.');
+      return;
+    }
+    downloadNavArtifactZip({ bundle: currentNavArtifactBundle, slug: currentName });
+    appendLog(`[SUCCESS] Downloaded nav-artifacts-${currentName}.zip`);
+  };
+
+  const uploadNavArtifacts = async (files: File[] | FileList): Promise<void> => {
+    const list = Array.from(files);
+    appendLog(
+      `[INFO] Uploading nav artifacts (${list.length} file${list.length === 1 ? '' : 's'}: ` +
+        `${list.map((f) => f.name).join(', ') || '(none)'})…`
+    );
+    if (isBusy.value) {
+      appendLog('[WARN] Upload ignored — another job is still running.');
+      return;
+    }
+    const viewer = babylon.viewer.value;
+    if (!viewer || !hasLoadedSplat.value) {
+      const detail = 'Load a splat before uploading nav artifacts.';
+      appendLog(`[ERROR] ${detail}`);
+      throw new Error(detail);
+    }
+    errorMessage.value = null;
+    try {
+      status.value = 'processing';
+      statusMessage.value = 'Uploading nav artifacts...';
+      const parsed = await parseNavArtifactFiles(list);
+      appendLog(
+        `[INFO] Parsed pack: locomotion=${parsed.session.locomotionMode}` +
+          (parsed.bundle.recastNavmeshBin ? ', recast.navmesh.bin' : '') +
+          (parsed.volume ? ', volume trio' : '')
+      );
+      viewer.clearNavArtifacts();
+      currentNavArtifactBundle = parsed.bundle;
+      if (parsed.bundle.recastNavmeshBin) {
+        currentNavMeshData = parsed.bundle.recastNavmeshBin;
+      }
+      await applyNavArtifactsToViewer({
+        onLog: appendLog,
+        parsed,
+        viewer,
+      });
+      hasNavMesh.value = true;
+      status.value = 'done';
+      statusMessage.value =
+        'Nav artifacts restored. Top-down framed — click the navmesh to move.';
+      appendLog(`[SUCCESS] Uploaded nav artifacts. ${NAV_ARTIFACT_UPLOAD_HINT}`);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      errorMessage.value = detail;
+      appendLog(`[ERROR] ${detail}`);
+      status.value = 'error';
+      statusMessage.value = 'Upload nav artifacts failed.';
+      throw error;
+    }
+  };
+
   return {
     status,
     statusMessage,
@@ -660,6 +845,14 @@ export function useSplatFastNav(
     loadExample,
     exportSog,
     exportNavmesh,
+    goToPlayer,
+    downloadNavArtifacts,
+    uploadNavArtifacts,
+    hasNavArtifactBundle,
+    navArtifactUploadHint: NAV_ARTIFACT_UPLOAD_HINT,
+    cameraSelectOffsets,
+    resetCameraSelectOffsets,
+    applySelectRegionFromCamera,
     generateCollisionBoundary,
     exportCollisionMesh,
     setCollisionBoundaryVisible,

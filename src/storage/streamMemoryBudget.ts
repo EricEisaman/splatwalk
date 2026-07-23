@@ -3,57 +3,82 @@
  * {@link GaussianSplattingStream}.
  *
  * Catalog size (4M → 35M → 200M+) must never drive the work-buffer allocation.
- * Presets match PlayCanvas Low/Medium/High/Ultra (resident budget first);
- * advanced knobs override defaults before Load stream.
+ * Desktop Performance Mode table (2M on / 4M off) is the default;
+ * Low/Medium/High/Ultra remain advanced overrides.
  */
 
 import type { IGaussianSplattingStreamOptions } from '@babylonjs/loaders/SPLAT/gaussianSplattingStream';
 
-/** PlayCanvas Medium-class default — production default for city-scale streams. */
-export const DEFAULT_STREAM_MAX_RESIDENT_SPLATS = 4_000_000;
+/** Desktop Performance Mode off — high quality budget. */
+export const DESKTOP_HIGH_RESIDENT_SPLATS = 4_000_000;
+/** Desktop Performance Mode on — default for freeze-safe fly. */
+export const DESKTOP_PERF_RESIDENT_SPLATS = 2_000_000;
+/** MB ceiling paired with desktop Performance Mode on (~84 bytes/splat). */
+export const DESKTOP_PERF_MEMORY_BUDGET_MB = 192;
+/** MB ceiling paired with desktop Performance Mode off. */
+export const DESKTOP_HIGH_MEMORY_BUDGET_MB = 384;
 
-/** Secondary MB ceiling (~84 bytes/resident splat); Babylon takes min(count, MB). */
-export const DEFAULT_STREAM_MEMORY_BUDGET_MB = 384;
+/** @deprecated Prefer {@link DESKTOP_HIGH_RESIDENT_SPLATS}. */
+export const DEFAULT_STREAM_MAX_RESIDENT_SPLATS = DESKTOP_HIGH_RESIDENT_SPLATS;
+/** @deprecated Prefer {@link DESKTOP_HIGH_MEMORY_BUDGET_MB}. */
+export const DEFAULT_STREAM_MEMORY_BUDGET_MB = DESKTOP_HIGH_MEMORY_BUDGET_MB;
+/** @deprecated Prefer {@link DESKTOP_HIGH_RESIDENT_SPLATS}. */
+export const SS_DESKTOP_HIGH_RESIDENT_SPLATS = DESKTOP_HIGH_RESIDENT_SPLATS;
+/** @deprecated Prefer {@link DESKTOP_PERF_RESIDENT_SPLATS}. */
+export const SS_DESKTOP_PERF_RESIDENT_SPLATS = DESKTOP_PERF_RESIDENT_SPLATS;
+/** @deprecated Prefer {@link DESKTOP_PERF_MEMORY_BUDGET_MB}. */
+export const SS_DESKTOP_PERF_MEMORY_BUDGET_MB = DESKTOP_PERF_MEMORY_BUDGET_MB;
+/** @deprecated Prefer {@link DESKTOP_HIGH_MEMORY_BUDGET_MB}. */
+export const SS_DESKTOP_HIGH_MEMORY_BUDGET_MB = DESKTOP_HIGH_MEMORY_BUDGET_MB;
 
 export const STREAM_QUALITY_PRESETS = ['low', 'medium', 'high', 'ultra'] as const;
 
 export type StreamQualityPreset = (typeof STREAM_QUALITY_PRESETS)[number];
 
-export const DEFAULT_STREAM_QUALITY_PRESET: StreamQualityPreset = 'medium';
+/** Advanced preset label when Performance Mode is not driving the budget. */
+export const DEFAULT_STREAM_QUALITY_PRESET: StreamQualityPreset = 'low';
 
 /**
  * User-tunable stream overrides applied at {@link GaussianSplattingStream} construction.
  * Set before Load stream; changing them requires a reload.
  */
 export interface StreamSettings {
-  /** Frames before an unreferenced LOD file is evicted. PlayCanvas default 100. */
+  /** Frames before an unreferenced LOD file is evicted. Default 100. */
   evictionCooldownFrames: number;
   /** Bias off-screen nodes to coarsest LOD (keeps them in the set). Default true. */
   frustumCulling: boolean;
   /**
-   * First LOD transition distance (local units). Raised above PlayCanvas's 5 so
-   * more of large outdoor scenes stay coarse and fit under the same resident cap
-   * (helps sky/far nodes survive Babylon's set-order base decode).
+   * First LOD transition distance (local units). Raised above 5 so more of large
+   * outdoor scenes stay coarse and fit under the same resident cap.
    */
   lodBaseDistance: number;
-  /** Distance multiplier for nodes behind the camera. PlayCanvas default 1. */
+  /**
+   * Distance multiplier for nodes behind the camera.
+   * Performance Mode path uses 5; engine default is often 1.
+   */
   lodBehindPenalty: number;
-  /** Geometric ratio between successive LOD distances. PlayCanvas default 3. */
+  /** Geometric ratio between successive LOD distances. Default 3. */
   lodMultiplier: number;
-  /** Concurrent LOD file downloads. PlayCanvas default 2. */
+  /** Frames between LOD re-evals once the camera has moved. Default 12. */
+  lodUpdateInterval: number;
+  /** Concurrent LOD file downloads. Default 2. */
   maxConcurrentDownloads: number;
   /** LOD files decoded per frame (spreads GPU work). Default 1. */
   maxDecodesPerFrame: number;
   /**
-   * Finest LOD index allowed (0 = full detail). Prefer 0 like PlayCanvas quality
-   * modes — distance LOD still coarsens far nodes; a high cap can starve sky/distant
-   * refinement under a tight resident budget.
+   * Finest LOD index allowed (0 = full detail). Prefer 0 so distance LOD can still
+   * coarsen far nodes; a high cap can starve sky/distant refinement under a tight budget.
    */
   maxDetailLod: number;
   /** GPU memory budget (MB); combined with maxResidentSplats by taking the smaller. */
   memoryBudgetMb: number;
   /** Max splats in the resident work buffer (enables eviction when catalog is larger). */
   maxResidentSplats: number;
+  /**
+   * Performance Mode. When true (default), desktop budget is 2M/192MB.
+   * When false, 4M/384MB. Advanced quality presets override the numeric fields.
+   */
+  performanceMode: boolean;
   /** Active quality preset label (drives applyPreset). */
   preset: StreamQualityPreset;
 }
@@ -65,19 +90,19 @@ interface StreamPresetConfig {
 }
 
 /**
- * Presets only change resident budget (PlayCanvas-style). maxDetailLod stays 0
- * so distance LOD can still refine sky / far nodes within the budget.
+ * Presets only change resident budget. maxDetailLod stays 0 so distance LOD can
+ * still refine sky / far nodes within the budget.
  */
 const PRESET_CONFIG: Record<StreamQualityPreset, StreamPresetConfig> = {
   low: {
     label: 'Low',
-    maxResidentSplats: 2_000_000,
-    memoryBudgetMb: 192,
+    maxResidentSplats: DESKTOP_PERF_RESIDENT_SPLATS,
+    memoryBudgetMb: DESKTOP_PERF_MEMORY_BUDGET_MB,
   },
   medium: {
     label: 'Medium',
-    maxResidentSplats: DEFAULT_STREAM_MAX_RESIDENT_SPLATS,
-    memoryBudgetMb: DEFAULT_STREAM_MEMORY_BUDGET_MB,
+    maxResidentSplats: DESKTOP_HIGH_RESIDENT_SPLATS,
+    memoryBudgetMb: DESKTOP_HIGH_MEMORY_BUDGET_MB,
   },
   high: {
     label: 'High',
@@ -91,18 +116,20 @@ const PRESET_CONFIG: Record<StreamQualityPreset, StreamPresetConfig> = {
   },
 };
 
-/** Outdoor / city-scale defaults (Medium budget + wider LOD base for sky coverage). */
+/** Defaults match desktop Performance Mode on + behind-camera penalty. */
 export const DEFAULT_STREAM_SETTINGS: StreamSettings = {
   evictionCooldownFrames: 100,
   frustumCulling: true,
   lodBaseDistance: 10,
-  lodBehindPenalty: 1,
+  lodBehindPenalty: 5,
   lodMultiplier: 3,
+  lodUpdateInterval: 12,
   maxConcurrentDownloads: 2,
   maxDecodesPerFrame: 1,
   maxDetailLod: 0,
-  memoryBudgetMb: DEFAULT_STREAM_MEMORY_BUDGET_MB,
-  maxResidentSplats: DEFAULT_STREAM_MAX_RESIDENT_SPLATS,
+  memoryBudgetMb: DESKTOP_PERF_MEMORY_BUDGET_MB,
+  maxResidentSplats: DESKTOP_PERF_RESIDENT_SPLATS,
+  performanceMode: true,
   preset: DEFAULT_STREAM_QUALITY_PRESET,
 };
 
@@ -112,17 +139,41 @@ export const streamQualityPresetLabel = (preset: StreamQualityPreset): string =>
 export const streamQualityPresetResidentSplats = (preset: StreamQualityPreset): number =>
   PRESET_CONFIG[preset].maxResidentSplats;
 
-/** Apply a PlayCanvas-style quality preset onto settings (budget fields only). */
+/** Apply desktop Performance Mode budget table onto settings. */
+export const applyStreamPerformanceMode = (
+  performanceMode: boolean,
+  current: StreamSettings = DEFAULT_STREAM_SETTINGS
+): StreamSettings => {
+  if (performanceMode) {
+    return {
+      ...current,
+      performanceMode: true,
+      maxResidentSplats: DESKTOP_PERF_RESIDENT_SPLATS,
+      memoryBudgetMb: DESKTOP_PERF_MEMORY_BUDGET_MB,
+      preset: 'low',
+    };
+  }
+  return {
+    ...current,
+    performanceMode: false,
+    maxResidentSplats: DESKTOP_HIGH_RESIDENT_SPLATS,
+    memoryBudgetMb: DESKTOP_HIGH_MEMORY_BUDGET_MB,
+    preset: 'medium',
+  };
+};
+
+/** Apply a quality preset onto settings (budget fields only). */
 export const applyStreamQualityPreset = (
   preset: StreamQualityPreset,
   current: StreamSettings = DEFAULT_STREAM_SETTINGS
 ): StreamSettings => {
-  const config = PRESET_CONFIG[preset] ?? PRESET_CONFIG.medium;
+  const config = PRESET_CONFIG[preset] ?? PRESET_CONFIG.low;
   return {
     ...current,
     preset,
     maxResidentSplats: config.maxResidentSplats,
     memoryBudgetMb: config.memoryBudgetMb,
+    performanceMode: preset === 'low',
   };
 };
 
@@ -138,6 +189,7 @@ export const streamOptionsFromSettings = (
   lodBaseDistance: Math.max(0.1, settings.lodBaseDistance),
   lodBehindPenalty: Math.max(0, settings.lodBehindPenalty),
   lodMultiplier: Math.max(1.01, settings.lodMultiplier),
+  lodUpdateInterval: Math.max(1, Math.floor(settings.lodUpdateInterval)),
   maxConcurrentDownloads: Math.max(1, Math.floor(settings.maxConcurrentDownloads)),
   maxDecodesPerFrame: Math.max(1, Math.floor(settings.maxDecodesPerFrame)),
   maxDetailLod: Math.max(0, Math.floor(settings.maxDetailLod)),
@@ -157,12 +209,13 @@ export const formatStreamBudgetLog = (params: {
   settings: StreamSettings;
 }): string => {
   const options = streamOptionsFromSettings(params.settings);
-  const resident = options.maxResidentSplats ?? DEFAULT_STREAM_MAX_RESIDENT_SPLATS;
+  const resident = options.maxResidentSplats ?? DESKTOP_PERF_RESIDENT_SPLATS;
+  const perfLabel = params.settings.performanceMode ? 'Performance Mode on' : 'Performance Mode off';
   return (
-    `Stream budget: ${resident.toLocaleString()} resident / ${options.memoryBudgetMb} MB ` +
-    `(${streamQualityPresetLabel(params.settings.preset)}; eviction on when catalog > budget); ` +
-    `lodBase=${options.lodBaseDistance} mult=${options.lodMultiplier} ` +
-    `maxDetailLod=${options.maxDetailLod} frustumCull=${options.frustumCulling}; ` +
-    `catalog chunks=${params.chunkCount}`
+    `Stream budget: ${resident.toLocaleString()} max · ${options.memoryBudgetMb} MB ` +
+    `(${perfLabel}; ${streamQualityPresetLabel(params.settings.preset)}; eviction on when catalog > budget); ` +
+    `lodBase=${options.lodBaseDistance} mult=${options.lodMultiplier} behind=${options.lodBehindPenalty} ` +
+    `lodInterval=${options.lodUpdateInterval} maxDetailLod=${options.maxDetailLod} ` +
+    `frustumCull=${options.frustumCulling}; catalog chunks=${params.chunkCount}`
   );
 };

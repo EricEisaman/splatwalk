@@ -79,7 +79,7 @@ const pkg = {
   bugs: { url: 'https://github.com/EricEisaman/splatwalk/issues' },
   keywords: [
     'gaussian-splatting', 'splat', 'wasm', 'webassembly', 'navmesh', 'navigation',
-    'recast', 'ply', 'spz', 'sog', 'glb', 'mesh', '3d', 'babylonjs', 'webgl',
+    'recast', 'ply', 'spz', 'sog', 'glb', 'mesh', '3d', 'babylonjs', 'webgl', 'webgpu',
   ],
   main: './wasm_splatwalk.js',
   types: './wasm_splatwalk.d.ts',

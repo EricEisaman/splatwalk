@@ -211,6 +211,15 @@ export class SplatNavController {
   }
 
   /** Last known oriented splat AABB, or null before bounds are captured. */
+  /** Active camera world position (for camera-select AABB), or null if unattached. */
+  public getCameraPosition(): { x: number; y: number; z: number } | null {
+    if (!this.handles) {
+      return null;
+    }
+    const p = this.handles.camera.position;
+    return { x: p.x, y: p.y, z: p.z };
+  }
+
   public getSceneBounds(): { min: number[]; max: number[] } | null {
     return this.sceneBounds
       ? { min: [...this.sceneBounds.min], max: [...this.sceneBounds.max] }
@@ -563,6 +572,38 @@ export class SplatNavController {
     this.handles.scene.add(label);
     this.npcLabels.push(label);
     this.updateLabel(label, mesh);
+  }
+
+  /**
+   * Apply a FreeCamera-style view (degrees) after Fast Nav when `cameraSelect` is
+   * set — R3F OrbitControls approximate of Babylon {@link Viewer.applyCameraSelectView}.
+   */
+  public applyCameraSelectView(view: {
+    readonly position: { readonly x: number; readonly y: number; readonly z: number };
+    readonly eulerDegrees: { readonly x: number; readonly y: number; readonly z: number };
+  }): void {
+    if (!this.handles) {
+      return;
+    }
+    const degToRad = Math.PI / 180;
+    const pitch = view.eulerDegrees.x * degToRad;
+    const yaw = view.eulerDegrees.y * degToRad;
+    const lookDist = 10;
+    // Babylon LH: yaw 0 looks +Z. Aim OrbitControls target along that forward.
+    const fx = Math.sin(yaw) * Math.cos(pitch);
+    const fy = -Math.sin(pitch);
+    const fz = Math.cos(yaw) * Math.cos(pitch);
+    const { x, y, z } = view.position;
+    this.handles.camera.position.set(x, y, z);
+    const tx = x + fx * lookDist;
+    const ty = y + fy * lookDist;
+    const tz = z + fz * lookDist;
+    if (this.handles.controls) {
+      this.handles.controls.target.set(tx, ty, tz);
+      this.handles.controls.update();
+    } else {
+      this.handles.camera.lookAt(tx, ty, tz);
+    }
   }
 
   /**

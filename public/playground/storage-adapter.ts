@@ -9,6 +9,7 @@
  * alone cannot pass those options through SPLATFileLoader.
  *
  * Options mirror SplatWalk Storage Adapter → Stream settings (PlayCanvas Medium).
+ * The Playground host owns `engine` (WebGL or WebGPU); this paste does not toggle it.
  */
 class Playground {
   public static CreateScene(engine: BABYLON.Engine, canvas: HTMLCanvasElement): BABYLON.Scene {

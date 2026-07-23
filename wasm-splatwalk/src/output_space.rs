@@ -216,6 +216,9 @@ pub fn apply_collision_voxel_boundary(
         apply_basis(&t, &mut result.basis);
         apply_floor_plane(&t, &mut result.floor_plane);
         result.space = t.coordinate_space();
+        // Dense volume bitmasks are axis-aligned in splatwalk_oriented; drop under
+        // output_space rather than silently remapping an incompatible index order.
+        result.volume = None;
     }
 }
 

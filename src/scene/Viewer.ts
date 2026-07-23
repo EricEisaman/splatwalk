@@ -1,24 +1,29 @@
 import {
-    Engine,
-    Matrix,
-    Scene,
     ArcRotateCamera,
-    Vector3,
-    HemisphericLight,
-    Color3,
-    SceneLoader,
     AbstractMesh,
-    Mesh,
-    VertexData,
-    StandardMaterial,
-    Material,
-    PointerEventTypes,
-    GizmoManager,
+    Color3,
     DynamicTexture,
+    FreeCamera,
+    GizmoManager,
+    HemisphericLight,
+    Material,
+    Matrix,
+    Mesh,
+    PointerEventTypes,
+    Scene,
+    SceneLoader,
+    StandardMaterial,
+    Vector3,
+    VertexData,
 } from '@babylonjs/core';
+import type { AbstractEngine } from '@babylonjs/core/Engines/abstractEngine';
+import {
+    createBabylonEngine,
+    type BabylonRendererPreference,
+} from './createBabylonEngine';
 import '@babylonjs/loaders'; // Import loaders (OBJ, GLTF, STL)
 import { GLTF2Export } from '@babylonjs/serializers/glTF';
-import { Crowd, NavMesh as RecastNavMesh, init as initRecast, importNavMesh, CrowdAgent } from 'recast-navigation';
+import { Crowd, NavMesh as RecastNavMesh, NavMeshQuery, init as initRecast, importNavMesh, CrowdAgent } from 'recast-navigation';
 import type { GroundFieldCellState, WalkableGroundFieldResult } from '../wasm/bridge';
 import {
     ensureRegionSelectionVolume,
@@ -26,26 +31,65 @@ import {
     regionSelectionSize,
 } from '../navigation/regionSelection';
 import { SplatPerfHud, installSplatWalkPerfProbe } from './splatPerfHud';
+import {
+    captureActiveCameraView,
+    configureOrbitCamera,
+    createFlyCameraFromView,
+    createOrbitCameraFromView,
+    type DemoCameraMode,
+    frameFlyCameraToScene,
+    frameOrbitCameraToScene,
+} from './demoCameraControls';
+import { worldRegionToRawSogBounds } from '../storage/materializeNavSourceFromStreamedSog';
+import {
+    findGaussianStreamInScene,
+    NavSessionRuntimeController,
+} from '../navigation/navSessionRuntime';
+import {
+    pickNavDebugMeshPoint,
+    pickNavSurfacePoint,
+    resolveNavMoveTarget,
+} from '../navigation/navClickTarget';
+import {
+    VoxelWalkController,
+    VoxelWalkRuntime,
+} from '../navigation/voxelWalkRuntime';
+import type { CollisionVoxelVolume } from '../wasm/bridge';
+
+const AGENT_BOX_SIZE = 0.5;
+const AGENT_HALF_HEIGHT = AGENT_BOX_SIZE * 0.5;
+const VOXEL_WALK_CLICK_RAY_MAX = 200;
+import type { GaussianSplattingStream } from '@babylonjs/loaders/SPLAT/gaussianSplattingStream';
 
 /** Existing Babylon engine/scene to adopt (e.g. stream → nav handoff). */
 export interface ViewerExistingContext {
-    readonly engine: Engine;
+    readonly engine: AbstractEngine;
     /**
      * Keep streamed SOG / existing visual meshes and only install nav camera +
      * overlays. PLY materialize stays an off-canvas intermediary for WASM.
      */
     readonly preserveVisual?: boolean;
+    /**
+     * Keep the storage-adapter fly camera (WASD + mouse look) instead of replacing
+     * it with an orbit camera on stream → nav handoff.
+     */
+    readonly preserveFlyCamera?: FreeCamera;
     readonly scene: Scene;
 }
 
 /** Construction options for {@link Viewer}. */
 export interface ViewerOptions {
     /**
-     * Adopt an existing engine+scene instead of creating a new WebGL context.
+     * Adopt an existing engine+scene instead of creating a new GPU context.
      * Used by the Storage Adapter stream → Fast Nav handoff so the canvas does
      * not flicker/black-out from dispose+recreate on the same canvas element.
      */
     readonly existing?: ViewerExistingContext;
+    /**
+     * Preferred renderer when creating a new engine. WebGPU falls back to WebGL
+     * when unsupported. Ignored when {@link existing} is set.
+     */
+    readonly renderer?: BabylonRendererPreference;
     /**
      * Render in a right-handed scene (`scene.useRightHandedSystem = true`) instead
      * of Babylon's default left-handed one. Off by default; this is a
@@ -58,26 +102,33 @@ export interface ViewerOptions {
 }
 
 export class Viewer {
-  private engine: Engine;
+  private engine: AbstractEngine;
   private scene: Scene;
-    private camera!: ArcRotateCamera;
+    private camera!: ArcRotateCamera | FreeCamera;
     private readonly rightHanded: boolean;
+    private _isFlyCamera = false;
     private _orbitShiftDispose: (() => void) | null = null;
 
-    constructor(canvas: HTMLCanvasElement, options: ViewerOptions = {}) {
+    /**
+     * Prefer {@link Viewer.create} for a new canvas (supports WebGPU). Sync
+     * construction is for adopting an existing engine (`options.existing`).
+     */
+    constructor(_canvas: HTMLCanvasElement, options: ViewerOptions = {}) {
         this.rightHanded = options.rightHanded ?? false;
 
-        if (options.existing) {
-            this.engine = options.existing.engine;
-            this.scene = options.existing.scene;
-            this.engine.stopRenderLoop();
-            this.prepareAdoptedScene(options.existing.preserveVisual === true);
-        } else {
-            this.engine = new Engine(canvas, true);
-            this.scene = this.createScene();
-            this.camera = this.createCamera();
-            this.createLights();
+        if (!options.existing) {
+            throw new Error(
+                'Viewer requires options.existing for sync construction. Use await Viewer.create(canvas, options) for a new engine.'
+            );
         }
+
+        this.engine = options.existing.engine;
+        this.scene = options.existing.scene;
+        this.engine.stopRenderLoop();
+        this.prepareAdoptedScene(
+            options.existing.preserveVisual === true,
+            options.existing.preserveFlyCamera
+        );
 
         installSplatWalkPerfProbe(this._perfHud);
         this.engine.runRenderLoop(() => {
@@ -91,15 +142,42 @@ export class Viewer {
     }
 
     /**
+     * Create a Viewer with a new engine (WebGPU preferred, WebGL fallback).
+     */
+    static async create(
+        canvas: HTMLCanvasElement,
+        options: ViewerOptions = {}
+    ): Promise<Viewer> {
+        if (options.existing) {
+            return new Viewer(canvas, options);
+        }
+        const created = await createBabylonEngine({
+            canvas,
+            preference: options.renderer ?? 'webgpu',
+        });
+        return new Viewer(canvas, {
+            ...options,
+            existing: {
+                engine: created.engine,
+                scene: new Scene(created.engine),
+            },
+        });
+    }
+
+    /**
      * Install Viewer camera + lighting on an adopted scene. When
      * `preserveVisual` is set, keep streamed SOG meshes and bind them as the
      * splat target for bounds / flip / rotation (nav overlays only).
      */
-    private prepareAdoptedScene(preserveVisual: boolean): void {
+    private prepareAdoptedScene(preserveVisual: boolean, preserveFlyCamera?: FreeCamera): void {
         this.scene.useRightHandedSystem = this.rightHanded;
         this.scene.clearColor = new Color3(0.1, 0.1, 0.1).toColor4();
 
         for (const cam of [...this.scene.cameras]) {
+            if (preserveFlyCamera && cam === preserveFlyCamera) {
+                cam.detachControl();
+                continue;
+            }
             cam.detachControl();
             cam.dispose();
         }
@@ -110,7 +188,13 @@ export class Viewer {
             }
         }
 
-        this.camera = this.createCamera();
+        if (preserveFlyCamera) {
+            this._isFlyCamera = true;
+            this.camera = preserveFlyCamera;
+        } else {
+            this._isFlyCamera = false;
+            this.camera = this.createCamera();
+        }
         this.scene.activeCamera = this.camera;
 
         if (this.scene.lights.length === 0) {
@@ -119,7 +203,10 @@ export class Viewer {
 
         if (preserveVisual) {
             this.bindStreamVisualMeshes();
-            this.frameCameraToSplat();
+            // Keep the adopted fly camera pose (e.g. Oval stairs default / user framing).
+            if (!preserveFlyCamera) {
+                this.frameCameraToSplat();
+            }
         }
     }
 
@@ -153,6 +240,7 @@ export class Viewer {
         }
         this.splatMeshes = meshes;
         this.splatMesh = meshes[0]!;
+        this.splatMesh.isPickable = true;
         this.splatMesh.computeWorldMatrix(true);
         this._streamVisualRotation = {
             x: this.splatMesh.rotation.x,
@@ -161,6 +249,7 @@ export class Viewer {
         };
         this.rotation = { ...this._streamVisualRotation };
         this._navRotationDecoupledFromVisual = false;
+        this._usesMaterializedStreamNavSource = true;
     }
 
     private applyStreamVisualRotationToMeshes(): void {
@@ -172,6 +261,7 @@ export class Viewer {
             if (mesh.isDisposed()) {
                 continue;
             }
+            mesh.isPickable = true;
             mesh.rotation.x = this._streamVisualRotation.x;
             mesh.rotation.y = this._streamVisualRotation.y;
             mesh.rotation.z = this._streamVisualRotation.z;
@@ -192,11 +282,11 @@ export class Viewer {
     }
 
     private frameCameraToSplat(): void {
-        const worldExtends = this.scene.getWorldExtends();
-        const center = worldExtends.min.add(worldExtends.max).scale(0.5);
-        const radius = worldExtends.max.subtract(worldExtends.min).length() / 2;
-        this.camera.setTarget(center);
-        this.camera.radius = Math.max(2, radius * 2.0);
+        if (this._isFlyCamera) {
+            frameFlyCameraToScene(this.scene, this.camera as FreeCamera);
+            return;
+        }
+        frameOrbitCameraToScene(this.scene, this.camera as ArcRotateCamera);
     }
 
     /**
@@ -305,17 +395,6 @@ export class Viewer {
         this.engine.resize();
     }
 
-    private createScene(): Scene {
-        const scene = new Scene(this.engine);
-        // Opt-in right-handed scene: SplatWalk emits geometry in splatwalk_oriented
-        // space (right-handed, +Y up), which matches a right-handed Babylon scene
-        // directly, so the navmesh/floor render with no extra mirror. This is the
-        // PR #18606 RH counterpart; default stays left-handed for the showcase.
-        scene.useRightHandedSystem = this.rightHanded;
-        scene.clearColor = new Color3(0.1, 0.1, 0.1).toColor4();
-        return scene;
-    }
-
     /** Whether this viewer renders in a right-handed scene (`?rh=1`). */
     public isRightHanded(): boolean {
         return this.rightHanded;
@@ -330,49 +409,100 @@ export class Viewer {
             Vector3.Zero(),
             this.scene
         );
-        camera.attachControl(this.engine.getRenderingCanvas(), true);
-
-        // Lower wheelPrecision / panningSensibility = faster orbit drive / pan.
-        const baseWheelPrecision = 50;
-        const basePanningSensibility = 1000;
-        const shiftSpeedMultiplier = 10;
-        camera.wheelPrecision = baseWheelPrecision;
-        camera.panningSensibility = basePanningSensibility;
-
-        let shiftHeld = false;
-        const syncOrbitSpeed = (): void => {
-            const factor = shiftHeld ? shiftSpeedMultiplier : 1;
-            camera.wheelPrecision = baseWheelPrecision / factor;
-            camera.panningSensibility = basePanningSensibility / factor;
-        };
-        const onKeyDown = (event: KeyboardEvent): void => {
-            if (event.code !== 'ShiftLeft' && event.code !== 'ShiftRight') {
-                return;
-            }
-            if (shiftHeld) {
-                return;
-            }
-            shiftHeld = true;
-            syncOrbitSpeed();
-        };
-        const onKeyUp = (event: KeyboardEvent): void => {
-            if (event.code !== 'ShiftLeft' && event.code !== 'ShiftRight') {
-                return;
-            }
-            shiftHeld = false;
-            syncOrbitSpeed();
-        };
-
-        this._orbitShiftDispose?.();
-        window.addEventListener('keydown', onKeyDown);
-        window.addEventListener('keyup', onKeyUp);
-        this._orbitShiftDispose = (): void => {
-            window.removeEventListener('keydown', onKeyDown);
-            window.removeEventListener('keyup', onKeyUp);
-            this._orbitShiftDispose = null;
-        };
+        const canvas = this.engine.getRenderingCanvas();
+        if (canvas) {
+            this._orbitShiftDispose = configureOrbitCamera(camera, canvas);
+        }
 
         return camera;
+    }
+
+    public getCameraMode(): DemoCameraMode {
+        return this._isFlyCamera ? 'fly' : 'orbit';
+    }
+
+    /**
+     * Apply a FreeCamera-style view (position + euler degrees). Switches to fly
+     * mode when currently in orbit (view is not preserved across the switch).
+     */
+    public applyCameraSelectView(view: {
+        readonly position: { readonly x: number; readonly y: number; readonly z: number };
+        readonly eulerDegrees: { readonly x: number; readonly y: number; readonly z: number };
+    }): void {
+        if (!this._isFlyCamera) {
+            this.setCameraMode('fly');
+        }
+        const fly = this.camera as FreeCamera;
+        const degToRad = Math.PI / 180;
+        fly.position.set(view.position.x, view.position.y, view.position.z);
+        fly.rotation.x = view.eulerDegrees.x * degToRad;
+        fly.rotation.y = view.eulerDegrees.y * degToRad;
+        fly.rotation.z = view.eulerDegrees.z * degToRad;
+    }
+
+    /**
+     * Switch between WASD fly and orbit inspect cameras.
+     * Fly controls are attached by the caller (storage adapter demo) via {@link configureFlyCamera}.
+     */
+    public setCameraMode(mode: DemoCameraMode, options?: { preserveView?: boolean }): void {
+        if (this.getCameraMode() === mode) {
+            return;
+        }
+
+        const preservedView =
+            options?.preserveView === true ? captureActiveCameraView(this.camera) : null;
+
+        this._orbitShiftDispose?.();
+        this._orbitShiftDispose = null;
+        this.camera.detachControl();
+        this.camera.dispose();
+
+        if (preservedView) {
+            if (mode === 'fly') {
+                this._isFlyCamera = true;
+                this.camera = createFlyCameraFromView(this.scene, 'flyCamera', preservedView);
+            } else {
+                this._isFlyCamera = false;
+                this.camera = createOrbitCameraFromView(this.scene, 'camera', preservedView);
+                const canvas = this.engine.getRenderingCanvas();
+                if (canvas) {
+                    this._orbitShiftDispose = configureOrbitCamera(this.camera as ArcRotateCamera, canvas);
+                }
+            }
+        } else {
+            const worldExtends = this.scene.getWorldExtends();
+            const center = worldExtends.min.add(worldExtends.max).scale(0.5);
+            const radius = worldExtends.max.subtract(worldExtends.min).length() / 2;
+
+            if (mode === 'fly') {
+                const distance = Math.max(6, radius * 1.3);
+                const fly = new FreeCamera(
+                    'flyCamera',
+                    center.add(new Vector3(0, distance * 0.25, -distance)),
+                    this.scene
+                );
+                fly.setTarget(center);
+                this._isFlyCamera = true;
+                this.camera = fly;
+            } else {
+                const orbit = new ArcRotateCamera(
+                    'camera',
+                    -Math.PI / 2,
+                    Math.PI / 2.5,
+                    Math.max(2, radius * 2),
+                    center,
+                    this.scene
+                );
+                this._isFlyCamera = false;
+                this.camera = orbit;
+                const canvas = this.engine.getRenderingCanvas();
+                if (canvas) {
+                    this._orbitShiftDispose = configureOrbitCamera(orbit, canvas);
+                }
+            }
+        }
+
+        this.scene.activeCamera = this.camera;
     }
 
     private createLights(): void {
@@ -395,6 +525,11 @@ export class Viewer {
      * into local bounds instead of reading the live stream mesh world AABB.
      */
     private _navRotationDecoupledFromVisual = false;
+    /**
+     * Stream handoff keeps live {@link GaussianSplattingStream} on canvas while WASM
+     * consumes materialized SOG→PLY bytes (raw PlayCanvas coords, not Babylon PLY load).
+     */
+    private _usesMaterializedStreamNavSource = false;
     /** Absolute uniform environment scale (default 1). Does not scale player/NPC markers. */
     private _environmentScale = 1;
     private readonly _perfHud = new SplatPerfHud();
@@ -421,6 +556,7 @@ export class Viewer {
             // Reset rotation
             this.rotation = { x: 0, y: 0, z: 0 };
             this._navRotationDecoupledFromVisual = false;
+            this._usesMaterializedStreamNavSource = false;
             this.splatMesh = null;
             this.splatMeshes = [];
 
@@ -440,8 +576,16 @@ export class Viewer {
                 const center = worldExtends.min.add(worldExtends.max).scale(0.5);
                 const radius = worldExtends.max.subtract(worldExtends.min).length() / 2;
 
-                this.camera.setTarget(center);
-                this.camera.radius = Math.max(2, radius * 2.0);
+                if (this._isFlyCamera) {
+                    const fly = this.camera as FreeCamera;
+                    const distance = Math.max(6, radius * 1.3);
+                    fly.position = center.add(new Vector3(0, distance * 0.25, -distance));
+                    fly.setTarget(center);
+                } else {
+                    const orbit = this.camera as ArcRotateCamera;
+                    orbit.setTarget(center);
+                    orbit.radius = Math.max(2, radius * 2.0);
+                }
             }
 
             this._perfHud.recordSplatLoad(
@@ -481,8 +625,16 @@ export class Viewer {
         const worldExtends = this.scene.getWorldExtends();
         const center = worldExtends.min.add(worldExtends.max).scale(0.5);
         const radius = worldExtends.max.subtract(worldExtends.min).length() / 2;
-        this.camera.setTarget(center);
-        this.camera.radius = Math.max(2, radius * 2.0);
+        if (this._isFlyCamera) {
+            const fly = this.camera as FreeCamera;
+            const distance = Math.max(6, radius * 1.3);
+            fly.position = center.add(new Vector3(0, distance * 0.25, -distance));
+            fly.setTarget(center);
+        } else {
+            const orbit = this.camera as ArcRotateCamera;
+            orbit.setTarget(center);
+            orbit.radius = Math.max(2, radius * 2.0);
+        }
         this.engine.resize();
         this.scene.render();
     }
@@ -507,13 +659,18 @@ export class Viewer {
         return this._navRotationDecoupledFromVisual;
     }
 
+    /** True when WASM reads materialized SOG→PLY while the stream supplies the visual. */
+    public usesMaterializedStreamNavSource(): boolean {
+        return this._usesMaterializedStreamNavSource;
+    }
+
     /**
      * `flip_y` for WASM mesh settings. Streamed nav PLY is raw PlayCanvas Z-up
      * (never through Babylon's PLY loader) but must match the stream's Y-flip
      * contract (`GaussianSplattingStream` negates mesh.scaling.y).
      */
     public getWasmFlipY(): boolean {
-        if (this._navRotationDecoupledFromVisual) {
+        if (this._usesMaterializedStreamNavSource || this._navRotationDecoupledFromVisual) {
             return true;
         }
         return this.isSplatYFlipped();
@@ -666,10 +823,19 @@ export class Viewer {
         const center = boundingInfo.boundingBox.centerWorld;
         const radius = boundingInfo.boundingSphere.radiusWorld;
 
-        this.camera.setTarget(center);
-        this.camera.radius = radius * 3.0; // Zoom out to fit
-        this.camera.alpha = Math.PI / 4;
-        this.camera.beta = Math.PI / 3;
+        if (this._isFlyCamera) {
+            const fly = this.camera as FreeCamera;
+            const distance = Math.max(6, radius * 3.0);
+            fly.position = center.add(new Vector3(0, distance * 0.35, -distance));
+            fly.setTarget(center);
+            return;
+        }
+
+        const orbit = this.camera as ArcRotateCamera;
+        orbit.setTarget(center);
+        orbit.radius = radius * 3.0;
+        orbit.alpha = Math.PI / 4;
+        orbit.beta = Math.PI / 3;
     }
 
     // Place the camera directly above the player agent looking straight down,
@@ -715,13 +881,19 @@ export class Viewer {
         const offset = Math.min(maxOffset, Math.max(minOffset, offsetToCeiling));
         const cameraHeight = playerTopY + offset;
 
-        this.camera.setTarget(position.clone());
-        // beta near 0 places the camera on the +Y axis above the target looking down.
-        this.camera.beta = 0.0001;
-        const framedRadius = cameraHeight - position.y;
-        this.camera.radius = Number.isFinite(framedRadius) && framedRadius > 0.5
-            ? framedRadius
-            : Math.max(2, this.camera.radius || 8);
+        if (this._isFlyCamera) {
+            const fly = this.camera as FreeCamera;
+            fly.position = new Vector3(position.x, cameraHeight, position.z);
+            fly.setTarget(position);
+        } else {
+            const orbit = this.camera as ArcRotateCamera;
+            orbit.setTarget(position.clone());
+            orbit.beta = 0.0001;
+            const framedRadius = cameraHeight - position.y;
+            orbit.radius = Number.isFinite(framedRadius) && framedRadius > 0.5
+                ? framedRadius
+                : Math.max(2, orbit.radius || 8);
+        }
         this.engine.resize();
         this.scene.render();
 
@@ -735,6 +907,7 @@ export class Viewer {
 
     private crowd: Crowd | null = null;
     private recastNavMesh: RecastNavMesh | null = null;
+    private navMeshQuery: NavMeshQuery | null = null;
     private npcAgents: CrowdAgent[] = [];
     private userAgent: CrowdAgent | null = null;
     private userMesh: AbstractMesh | null = null;
@@ -750,12 +923,15 @@ export class Viewer {
     private groundFieldOverlayMeshes: Mesh[] = [];
     private colliderMeshes: AbstractMesh[] = [];
     private colliderMaterial: StandardMaterial | null = null;
+    private navSessionRuntime: NavSessionRuntimeController | null = null;
     /** True when collider GLB is in authoring space and needs environment scale on the mesh. */
     private _colliderNeedsEnvironmentScale = false;
     private seedMarker: Mesh | null = null;
     private markerLabels: Mesh[] = [];
     private preferredPlayerSpawn: Vector3 | null = null;
     private preferredNpcSpawn: Vector3 | null = null;
+    private voxelWalkUpdateObserver: any = null;
+    private voxelWalkController: VoxelWalkController | null = null;
 
     private collectLoadedSplatMeshes(): Set<AbstractMesh> {
         const meshes = new Set<AbstractMesh>();
@@ -903,7 +1079,10 @@ export class Viewer {
             );
         } else {
             this.selectionMesh.scaling.set(5, MIN_REGION_HEIGHT_METERS, 5);
-            this.selectionMesh.position.copyFrom(this.camera.target);
+            const fallbackTarget = this._isFlyCamera
+                ? (this.camera as FreeCamera).target
+                : (this.camera as ArcRotateCamera).target;
+            this.selectionMesh.position.copyFrom(fallbackTarget);
             console.warn("[Viewer] Could not determine splat bounds. Region selector placed at camera target.");
         }
 
@@ -951,6 +1130,255 @@ export class Viewer {
     }
 
     /**
+     * When nav PLY rotation matches the stream visual, WASM `splatwalk_oriented` vertices
+     * already coincide with Babylon world space (`streamWorld * raw = env * R * flip(raw)`).
+     */
+    private usesOrientedWorldIdentity(): boolean {
+        return !this._navRotationDecoupledFromVisual;
+    }
+
+    /**
+     * Maps nav-PLY / WASM oriented coords into Babylon world when stream visual rotation
+     * is decoupled. Returns null when oriented == world (identity).
+     */
+    private buildNavOrientedToWorldMatrix(): Matrix | null {
+        if (this.usesOrientedWorldIdentity()) {
+            return null;
+        }
+        const visual = Matrix.RotationYawPitchRoll(
+            this._streamVisualRotation.y,
+            this._streamVisualRotation.x,
+            this._streamVisualRotation.z
+        );
+        const nav = Matrix.RotationYawPitchRoll(
+            this.rotation.y,
+            this.rotation.x,
+            this.rotation.z
+        );
+        const navInv = Matrix.Invert(nav);
+        if (!navInv) {
+            return null;
+        }
+        return visual.multiply(navInv);
+    }
+
+    /**
+     * Selection-region AABB in `splatwalk_oriented` space for WASM `region_min` / `region_max`.
+     * When nav rotation matches the stream, oriented == world and the yellow box passes through.
+     */
+    public getWasmRegionBounds(): { min: number[]; max: number[] } | null {
+        const world = this.getRegionBounds();
+        if (!world) {
+            return null;
+        }
+
+        if (this.usesOrientedWorldIdentity()) {
+            return {
+                min: [...world.min],
+                max: [...world.max],
+            };
+        }
+
+        const worldToOriented = this.buildWorldToWasmOrientedMatrix();
+        if (!worldToOriented) {
+            return {
+                min: [...world.min],
+                max: [...world.max],
+            };
+        }
+
+        return Viewer.transformAabbByMatrix(world, worldToOriented);
+    }
+
+    /** Maps Babylon world → WASM oriented (inverse of {@link buildNavOrientedToWorldMatrix}). */
+    private buildWorldToWasmOrientedMatrix(): Matrix | null {
+        const orientedToWorld = this.buildNavOrientedToWorldMatrix();
+        if (!orientedToWorld) {
+            return Matrix.Identity();
+        }
+        return Matrix.Invert(orientedToWorld);
+    }
+
+    public orientedNavPointToWorld(point: Vector3): Vector3 {
+        const matrix = this.buildNavOrientedToWorldMatrix();
+        if (!matrix) {
+            return point.clone();
+        }
+        return Vector3.TransformCoordinates(point, matrix);
+    }
+
+    public worldNavPointToOriented(point: Vector3): Vector3 {
+        if (this.usesOrientedWorldIdentity()) {
+            return point.clone();
+        }
+        const matrix = this.buildWorldToWasmOrientedMatrix();
+        if (!matrix) {
+            return point.clone();
+        }
+        return Vector3.TransformCoordinates(point, matrix);
+    }
+
+    /** True when a Babylon world point lies inside the loaded splat AABB (with padding). */
+    private isWorldPointInsideSplatBounds(world: Vector3, paddingMeters = 0.25): boolean {
+        const bounds = this.getLoadedSplatBounds();
+        if (!bounds) {
+            return true;
+        }
+        return (
+            world.x >= bounds.min.x - paddingMeters
+            && world.x <= bounds.max.x + paddingMeters
+            && world.y >= bounds.min.y - paddingMeters
+            && world.y <= bounds.max.y + paddingMeters
+            && world.z >= bounds.min.z - paddingMeters
+            && world.z <= bounds.max.z + paddingMeters
+        );
+    }
+
+    /**
+     * Ensures crowd spawn sits inside the splat volume in world space. Falls back to the
+     * nearest Recast point when oriented spawn drifts outside (coordinate mismatch guard).
+     */
+    private resolveValidatedOrientedSpawn(orientedSpawn: Vector3): Vector3 {
+        const world = this.orientedNavPointToWorld(orientedSpawn);
+        if (this.isWorldPointInsideSplatBounds(world)) {
+            return orientedSpawn;
+        }
+
+        if (this.navMeshQuery) {
+            const snapped = this.navMeshQuery.findClosestPoint(
+                { x: orientedSpawn.x, y: orientedSpawn.y, z: orientedSpawn.z },
+                { halfExtents: { x: 5, y: 8, z: 5 } }
+            );
+            if (snapped.success && snapped.point) {
+                const snappedOriented = new Vector3(snapped.point.x, snapped.point.y, snapped.point.z);
+                const snappedWorld = this.orientedNavPointToWorld(snappedOriented);
+                if (this.isWorldPointInsideSplatBounds(snappedWorld)) {
+                    console.warn(
+                        `[WARN] Spawn outside splat bounds at world ${world.toString()} — ` +
+                        `snapped to navmesh at ${snappedWorld.toString()}.`
+                    );
+                    return snappedOriented;
+                }
+            }
+        }
+
+        console.warn(
+            `[WARN] Spawn outside splat bounds at world ${world.toString()} — using oriented point anyway.`
+        );
+        return orientedSpawn;
+    }
+
+    private transformOrientedPositionsToWorld(positions: Float32Array | readonly number[]): Float32Array {
+        const src = positions instanceof Float32Array ? positions : Float32Array.from(positions);
+        const matrix = this.buildNavOrientedToWorldMatrix();
+        if (!matrix) {
+            return src;
+        }
+        const out = new Float32Array(src.length);
+        for (let i = 0; i < src.length; i += 3) {
+            const world = Vector3.TransformCoordinates(new Vector3(src[i]!, src[i + 1]!, src[i + 2]!), matrix);
+            out[i] = world.x;
+            out[i + 1] = world.y;
+            out[i + 2] = world.z;
+        }
+        return out;
+    }
+
+    private closestOrientedPointOnNavGeometry(
+        positions: Float32Array,
+        indices: Uint32Array,
+        target: Vector3
+    ): Vector3 | null {
+        if (indices.length < 3) {
+            return null;
+        }
+        let best: Vector3 | null = null;
+        let bestDistSq = Infinity;
+        for (let i = 0; i + 2 < indices.length; i += 3) {
+            const i0 = indices[i]! * 3;
+            const i1 = indices[i + 1]! * 3;
+            const i2 = indices[i + 2]! * 3;
+            const cx = (positions[i0]! + positions[i1]! + positions[i2]!) / 3;
+            const cy = (positions[i0 + 1]! + positions[i1 + 1]! + positions[i2 + 1]!) / 3;
+            const cz = (positions[i0 + 2]! + positions[i1 + 2]! + positions[i2 + 2]!) / 3;
+            const dx = cx - target.x;
+            const dy = cy - target.y;
+            const dz = cz - target.z;
+            const distSq = dx * dx + dy * dy + dz * dz;
+            if (distSq < bestDistSq) {
+                bestDistSq = distSq;
+                best = new Vector3(cx, cy, cz);
+            }
+        }
+        return best;
+    }
+
+    private resolveOrientedNavSpawn(
+        positions: Float32Array,
+        indices: Uint32Array,
+        seedOriented?: number[] | null
+    ): Vector3 | null {
+        if (seedOriented && seedOriented.length >= 3) {
+            const seed = new Vector3(seedOriented[0]!, seedOriented[1]!, seedOriented[2]!);
+            const snapped = this.closestOrientedPointOnNavGeometry(positions, indices, seed);
+            if (snapped) {
+                return snapped;
+            }
+        }
+        return this.getMostInteriorNavMeshPoint(positions, indices)
+            ?? this.getFirstNavMeshPoint(positions, indices);
+    }
+
+    /**
+     * Selection-region AABB in raw PlayCanvas / SOG coordinates (lod-meta tree space).
+     * Used to materialize full-density finest-LOD chunks overlapping the pinned box.
+     */
+    public getRawSogRegionBounds(): { min: number[]; max: number[] } | null {
+        const world = this.getRegionBounds();
+        if (!world) {
+            return null;
+        }
+
+        const mesh = this.splatMesh ?? this.splatMeshes[0];
+        if (!mesh) {
+            return null;
+        }
+
+        mesh.computeWorldMatrix(true);
+        const raw = worldRegionToRawSogBounds(world, mesh.getWorldMatrix());
+        return {
+            min: [...raw.min],
+            max: [...raw.max],
+        };
+    }
+
+    private static transformAabbByMatrix(
+        bounds: { min: number[]; max: number[] },
+        matrix: Matrix
+    ): { min: number[]; max: number[] } {
+        const xs = [bounds.min[0], bounds.max[0]];
+        const ys = [bounds.min[1], bounds.max[1]];
+        const zs = [bounds.min[2], bounds.max[2]];
+        let minOut: Vector3 | null = null;
+        let maxOut: Vector3 | null = null;
+
+        for (const x of xs) {
+            for (const y of ys) {
+                for (const z of zs) {
+                    const corner = Vector3.TransformCoordinates(new Vector3(x, y, z), matrix);
+                    minOut = minOut ? Vector3.Minimize(minOut, corner) : corner.clone();
+                    maxOut = maxOut ? Vector3.Maximize(maxOut, corner) : corner.clone();
+                }
+            }
+        }
+
+        return {
+            min: [minOut!.x, minOut!.y, minOut!.z],
+            max: [maxOut!.x, maxOut!.y, maxOut!.z],
+        };
+    }
+
+    /**
      * Scale the region selection box about the origin by `ratio` so it stays
      * aligned when the environment scale changes.
      */
@@ -979,7 +1407,7 @@ export class Viewer {
 
         for (const mesh of this.colliderMeshes) {
             mesh.material = this.colliderMaterial;
-            this.prepareOverlayMesh(mesh, this.colliderMaterial, { pickable: false, liftY: 0.03 });
+            this.prepareOverlayMesh(mesh, this.colliderMaterial, { pickable: true, liftY: 0.03 });
         }
         this.applyEnvironmentScaleToMeshes();
 
@@ -997,9 +1425,12 @@ export class Viewer {
         this.clearColliderMesh();
         // WASM bake already includes environment_scale in vertex positions.
         this._colliderNeedsEnvironmentScale = false;
+        const worldPositions = this.transformOrientedPositionsToWorld(
+            positions instanceof Float32Array ? positions : Float32Array.from(positions)
+        );
         const mesh = new Mesh("collider_mesh_generated", this.scene);
         const vertexData = new VertexData();
-        vertexData.positions = Array.from(positions);
+        vertexData.positions = Array.from(worldPositions);
         vertexData.indices = Array.from(indices);
         vertexData.applyToMesh(mesh);
 
@@ -1007,7 +1438,7 @@ export class Viewer {
         this.colliderMaterial.diffuseColor = new Color3(0.0, 0.85, 1.0);
         this.applyAlphaOpacity(this.colliderMaterial, opacity);
         this.colliderMaterial.backFaceCulling = false;
-        this.prepareOverlayMesh(mesh, this.colliderMaterial, { pickable: false, liftY: 0.03 });
+        this.prepareOverlayMesh(mesh, this.colliderMaterial, { pickable: true, liftY: 0.03 });
         this.colliderMeshes = [mesh];
     }
 
@@ -1025,8 +1456,26 @@ export class Viewer {
 
     public setColliderVisible(visible: boolean): void {
         for (const mesh of this.colliderMeshes) {
-            mesh.setEnabled(visible);
+            mesh.isVisible = visible;
         }
+    }
+
+    /** Freeze streamed SOG LOD for the nav session (static explore, no decode thrash). */
+    public startNavSessionRuntime(stream?: GaussianSplattingStream | null): void {
+        this.stopNavSessionRuntime();
+        this.navSessionRuntime = new NavSessionRuntimeController({
+            onLog: (message) => console.log(message),
+            scene: this.scene,
+        });
+        this.navSessionRuntime.attach(stream ?? findGaussianStreamInScene(this.scene));
+    }
+
+    public stopNavSessionRuntime(): void {
+        if (!this.navSessionRuntime) {
+            return;
+        }
+        this.navSessionRuntime.dispose();
+        this.navSessionRuntime = null;
     }
 
     public setColliderOpacity(opacity: number): void {
@@ -1060,7 +1509,7 @@ export class Viewer {
      * overlay composites on top (otherwise dense splat depth fully occludes green nav).
      */
     private prepareOverlayMesh(
-        mesh: Mesh,
+        mesh: AbstractMesh,
         material: StandardMaterial,
         options: { liftY?: number; pickable: boolean }
     ): void {
@@ -1141,23 +1590,36 @@ export class Viewer {
     }
 
     public displaySeedMarker(seed: [number, number, number] | number[]): void {
+        const world = this.orientedNavPointToWorld(Vector3.FromArray(seed));
+        this.displaySeedMarkerWorld([world.x, world.y, world.z]);
+        console.log(
+            `[INFO] Seed marker placed at world ${world.toString()} (oriented ${seed.map((v) => Number(v).toFixed(3)).join(', ')})`
+        );
+    }
+
+    /** Place SEED marker at an already-world position (e.g. voxel-walk feet). */
+    public displaySeedMarkerWorld(world: readonly [number, number, number] | number[]): void {
         if (this.seedMarker) {
             this.seedMarker.dispose();
             this.seedMarker = null;
         }
 
         this.seedMarker = Mesh.CreateSphere("collision_seed_marker", 16, 0.25, this.scene);
-        this.seedMarker.position.set(seed[0], seed[1], seed[2]);
+        this.seedMarker.position.set(world[0]!, world[1]!, world[2]!);
         const mat = new StandardMaterial("collision_seed_marker_mat", this.scene);
         mat.diffuseColor = new Color3(1.0, 0.0, 1.0);
         mat.emissiveColor = new Color3(0.5, 0.0, 0.5);
         this.seedMarker.material = mat;
         this.seedMarker.isPickable = false;
         this.attachMarkerLabel(this.seedMarker, "SEED", new Color3(1.0, 0.0, 1.0));
-        console.log(`[INFO] Seed marker placed at ${seed.map((v) => Number(v).toFixed(3)).join(', ')}`);
+    }
+
+    public getNavMeshSpawnOriented(): Vector3 | null {
+        return this.navMeshSpawnPoint?.clone() ?? null;
     }
 
     public setPreferredNavSpawnPoints(player: [number, number, number] | number[] | null, npc?: [number, number, number] | number[] | null): void {
+        // Stored in WASM oriented / Recast space (not Babylon world).
         this.preferredPlayerSpawn = player ? Vector3.FromArray(player) : null;
         this.preferredNpcSpawn = npc ? Vector3.FromArray(npc) : null;
     }
@@ -1193,17 +1655,26 @@ export class Viewer {
         this.markerLabels.push(label);
     }
 
-    public async displayNavMesh(positions: Float32Array, indices: Uint32Array, visualOffsetY = 0): Promise<Vector3 | null> {
+    public async displayNavMesh(
+        positions: Float32Array,
+        indices: Uint32Array,
+        visualOffsetY = 0,
+        seedOriented?: number[] | null,
+        /** Green overlay lift; use 0 for voxel walk so feet align with solid tops. */
+        overlayLiftY = 0.05
+    ): Promise<Vector3 | null> {
         this.clearNavMeshOverlay();
+
+        const orientedSpawn = this.resolveOrientedNavSpawn(positions, indices, seedOriented);
+        this.navMeshSpawnPoint = orientedSpawn;
+        const worldPositions = this.transformOrientedPositionsToWorld(positions);
 
         const mesh = new Mesh("navmesh_debug", this.scene);
         const vertexData = new VertexData();
-        vertexData.positions = positions;
+        vertexData.positions = worldPositions;
         vertexData.indices = indices;
         vertexData.applyToMesh(mesh);
-        // Slight lift above ground splats so the green sheet reads clearly over dense GS depth.
-        const liftY = 0.05;
-        mesh.position.y = visualOffsetY + liftY;
+        mesh.position.y = visualOffsetY + overlayLiftY;
 
         const mat = new StandardMaterial("navmesh_mat", this.scene);
         mat.diffuseColor = new Color3(0, 1, 0);
@@ -1213,15 +1684,14 @@ export class Viewer {
 
         this.navMeshDebugMesh = mesh;
         this.navMeshMaterial = mat;
-        this.navMeshVisualOffset = new Vector3(0, visualOffsetY + liftY, 0);
-        this.navMeshSpawnPoint = this.getMostInteriorNavMeshPoint(positions, indices)
-            ?? this.getFirstNavMeshPoint(positions, indices);
+        this.navMeshVisualOffset = new Vector3(0, visualOffsetY + overlayLiftY, 0);
+        // navMeshSpawnPoint stays in oriented space for Recast crowd; callers get world coords.
 
         mesh.setEnabled(true);
         console.log(
             `[Viewer] Navmesh visualized${visualOffsetY !== 0 ? ` with Y offset ${visualOffsetY.toFixed(3)}` : ""} (overlay group 1)`
         );
-        return this.navMeshSpawnPoint?.clone() ?? null;
+        return orientedSpawn ? this.orientedNavPointToWorld(orientedSpawn) : null;
     }
 
     public displayGroundFieldOverlay(fieldResult: WalkableGroundFieldResult, visibleStates: Set<GroundFieldCellState>): void {
@@ -1326,20 +1796,26 @@ export class Viewer {
 
         const { navMesh } = importNavMesh(navMeshData);
         this.recastNavMesh = navMesh;
+        this.navMeshQuery = new NavMeshQuery(navMesh);
 
         this.crowd = new Crowd(this.recastNavMesh, {
             maxAgents: 100,
             maxAgentRadius: 1.0
         });
 
-        // Setup user agent
-        const startPoint = this.preferredPlayerSpawn?.clone() ?? spawnPoint?.clone() ?? this.navMeshSpawnPoint?.clone();
-        if (!startPoint) {
+        // Setup user agent — spawn in oriented Recast space; mesh sync maps to world.
+        let orientedSpawn =
+            this.preferredPlayerSpawn?.clone()
+            ?? spawnPoint?.clone()
+            ?? this.navMeshSpawnPoint?.clone();
+        if (!orientedSpawn) {
             console.warn("[WARN] Cannot initialize crowd: no valid navmesh spawn point.");
             return;
         }
 
-        this.userAgent = this.crowd.addAgent(startPoint, {
+        orientedSpawn = this.resolveValidatedOrientedSpawn(orientedSpawn);
+
+        this.userAgent = this.crowd.addAgent(orientedSpawn, {
             radius: 0.5,
             height: 2.0,
             maxAcceleration: 20.0,
@@ -1352,27 +1828,40 @@ export class Viewer {
         this.userMesh.material = userMat;
         this.attachMarkerLabel(this.userMesh, "PLAYER", new Color3(0.1, 0.5, 1.0));
         this.syncAgentMesh(this.userMesh, this.userAgent);
-        console.log(`[INFO] Player agent spawned at ${startPoint.x.toFixed(3)}, ${startPoint.y.toFixed(3)}, ${startPoint.z.toFixed(3)}.`);
+        const spawnWorld = this.orientedNavPointToWorld(orientedSpawn);
+        console.log(
+            `[INFO] Player agent spawned at world ${spawnWorld.toString()} ` +
+            `(oriented ${orientedSpawn.x.toFixed(3)}, ${orientedSpawn.y.toFixed(3)}, ${orientedSpawn.z.toFixed(3)}).`
+        );
 
-        // Register pointer click for movement
+        // HEAD click-to-move: pick the green navmesh overlay, undo visual Y lift,
+        // map world→oriented when stream visual is decoupled (identity on Vuetify PLY).
         this.pointerObserver = this.scene.onPointerObservable.add((pointerInfo) => {
-            if (pointerInfo.type === PointerEventTypes.POINTERTAP) {
-                const pickResult = this.scene.pick(
-                    this.scene.pointerX,
-                    this.scene.pointerY,
-                    (mesh) => mesh === this.navMeshDebugMesh
-                );
-                if (pickResult?.hit && pickResult.pickedPoint && this.userAgent) {
-                    const target = pickResult.pickedPoint.subtract(this.navMeshVisualOffset);
-                    this.userAgent.requestMoveTarget(target);
-                    console.log(`[Viewer] User move target: ${target.toString()}`);
-                }
+            if (pointerInfo.type !== PointerEventTypes.POINTERTAP || !this.userAgent) {
+                return;
             }
+
+            const pickResult = this.scene.pick(
+                this.scene.pointerX,
+                this.scene.pointerY,
+                (mesh) => mesh === this.navMeshDebugMesh
+            );
+            if (!pickResult?.hit || !pickResult.pickedPoint) {
+                return;
+            }
+
+            const picked = pickResult.pickedPoint.subtract(this.navMeshVisualOffset);
+            const target = this.worldNavPointToOriented(picked);
+            this.userAgent.requestMoveTarget(target);
+            console.log(`[Viewer] User move target: ${target.toString()}`);
         });
 
         // Update loop for crowd
         this.crowdUpdateObserver = this.scene.onBeforeRenderObservable.add(() => {
             if (this.crowd) {
+                if (this.navSessionRuntime?.shouldSkipCrowdUpdate()) {
+                    return;
+                }
                 const delta = this.engine.getDeltaTime() / 1000;
                 this.crowd.update(delta);
 
@@ -1391,7 +1880,194 @@ export class Viewer {
             }
         });
 
-        console.log("[SUCCESS] Crowd simulation initialized. Click the green navmesh to move the blue player agent.");
+        console.log('[SUCCESS] Crowd simulation initialized. Click the green navmesh to move the blue player agent.');
+    }
+
+    /**
+     * Voxel walk — solid ray pick, XZ steer, downward ground probes, capsule slide.
+     * @param preferredFeetWorld - Optional saved feet (world); used when still on a walkable floor cell.
+     */
+    public initVoxelWalk(
+        volume: CollisionVoxelVolume,
+        seedOriented: readonly [number, number, number] | number[],
+        preferredFeetWorld?: readonly [number, number, number] | number[] | null
+    ): Vector3 {
+        this.destroyCrowdSimulation();
+
+        const runtime = new VoxelWalkRuntime({
+            agentHeight: 1.6,
+            agentRadius: 0.2,
+            stepUpMeters: 0.75,
+            volume,
+        });
+        this.assertVolumeAlignedWithSplat(runtime);
+
+        const seedWorld = this.orientedNavPointToWorld(
+            new Vector3(seedOriented[0]!, seedOriented[1]!, seedOriented[2]!)
+        );
+        const preferred =
+            preferredFeetWorld && preferredFeetWorld.length >= 3
+                ? runtime.tryPreferredFeet([
+                      preferredFeetWorld[0]!,
+                      preferredFeetWorld[1]!,
+                      preferredFeetWorld[2]!,
+                  ])
+                : null;
+        const feet =
+            preferred ??
+            runtime.findCylinderSpawn([seedWorld.x, seedWorld.y, seedWorld.z]) ??
+            runtime.findCylinderSpawn([seedOriented[0]!, seedOriented[1]!, seedOriented[2]!]) ??
+            runtime.findCylinderSpawnAtVolumeCenter();
+        if (!feet) {
+            const hasRegion = Boolean(this.getWasmRegionBounds());
+            throw new Error(
+                hasRegion
+                    ? 'Voxel walk: no cylinder spawn near collision seed. Tighten the yellow box onto open floor.'
+                    : 'Voxel walk: no cylinder spawn in volume. Enable Selection region for large indoor ' +
+                      'scenes (region OFF uses the full AABB and may coarsen).'
+            );
+        }
+
+        this.voxelWalkController = new VoxelWalkController(runtime, feet);
+        // Recast crowd sync uses navMeshVisualOffset; voxel walk places the cube on solid tops.
+        this.navMeshVisualOffset = Vector3.Zero();
+        this.displaySeedMarkerWorld(feet);
+
+        this.userMesh = Mesh.CreateBox('user_agent', AGENT_BOX_SIZE, this.scene);
+        const userMat = new StandardMaterial('user_mat', this.scene);
+        userMat.diffuseColor = new Color3(0, 0, 1);
+        this.userMesh.material = userMat;
+        this.userMesh.position.set(feet[0], feet[1] + AGENT_HALF_HEIGHT, feet[2]);
+        this.attachMarkerLabel(this.userMesh, 'PLAYER', new Color3(0.1, 0.5, 1.0));
+
+        this.pointerObserver = this.scene.onPointerObservable.add((pointerInfo) => {
+            if (pointerInfo.type !== PointerEventTypes.POINTERTAP || !this.userMesh || !this.voxelWalkController) {
+                return;
+            }
+
+            const skipMeshes = new Set<AbstractMesh>();
+            skipMeshes.add(this.userMesh);
+            for (const label of this.markerLabels) {
+                skipMeshes.add(label);
+            }
+            if (this.seedMarker) {
+                skipMeshes.add(this.seedMarker);
+            }
+            if (this.selectionMesh) {
+                skipMeshes.add(this.selectionMesh);
+            }
+
+            const hit = this.pickVoxelWalkGoal(this.voxelWalkController.getRuntime(), skipMeshes);
+            if (!hit) {
+                return;
+            }
+
+            // XZ navigate only — do not gate on isFloorCell (stairs may lack green overlay).
+            this.voxelWalkController.navigateTo(hit);
+            console.log(`[Viewer] Voxel walk goal: ${hit[0].toFixed(3)}, ${hit[1].toFixed(3)}, ${hit[2].toFixed(3)}`);
+        });
+
+        this.voxelWalkUpdateObserver = this.scene.onBeforeRenderObservable.add(() => {
+            if (!this.userMesh || !this.voxelWalkController) {
+                return;
+            }
+            const delta = this.engine.getDeltaTime() / 1000;
+            const next = this.voxelWalkController.update(delta);
+            this.userMesh.position.set(next[0], next[1] + AGENT_HALF_HEIGHT, next[2]);
+        });
+
+        console.log(
+            `[SUCCESS] Voxel walk initialized at feet (${feet[0].toFixed(3)}, ${feet[1].toFixed(3)}, ${feet[2].toFixed(3)}) — ` +
+            'click surfaces to walk (stairs via ground probes).'
+        );
+        return new Vector3(feet[0], feet[1], feet[2]);
+    }
+
+    /** Solid volume ray from the camera, else surface / green-mesh pick. */
+    private pickVoxelWalkGoal(
+        runtime: VoxelWalkRuntime,
+        skipMeshes: ReadonlySet<AbstractMesh>
+    ): [number, number, number] | null {
+        const ray = this.scene.createPickingRay(
+            this.scene.pointerX,
+            this.scene.pointerY,
+            null,
+            this.camera,
+            false
+        );
+        if (ray) {
+            const hit = runtime.queryRay(
+                [ray.origin.x, ray.origin.y, ray.origin.z],
+                [ray.direction.x, ray.direction.y, ray.direction.z],
+                VOXEL_WALK_CLICK_RAY_MAX
+            );
+            if (hit) {
+                return hit.position;
+            }
+        }
+
+        const surface =
+            pickNavSurfacePoint({
+                camera: this.camera,
+                colliderMeshes: this.colliderMeshes,
+                isSplatVisualMesh: (mesh) => this.isStreamVisualMesh(mesh),
+                scene: this.scene,
+                skipMeshes,
+            }) ??
+            pickNavDebugMeshPoint(this.scene, this.navMeshDebugMesh);
+
+        if (!surface) {
+            return null;
+        }
+        return [surface.x, surface.y, surface.z];
+    }
+
+    /**
+     * Fail-fast when exported volume / seed sits outside the splat world AABB
+     * (classic void-spawn / floating-overlay bug).
+     */
+    public assertVolumeAlignedWithSplat(runtime: VoxelWalkRuntime): void {
+        const splat = this.getLoadedSplatBounds();
+        if (!splat) {
+            return;
+        }
+        const vol = runtime.worldAabb();
+        const overlaps =
+            vol.max[0] >= splat.min.x - 1 &&
+            vol.min[0] <= splat.max.x + 1 &&
+            vol.max[1] >= splat.min.y - 1 &&
+            vol.min[1] <= splat.max.y + 1 &&
+            vol.max[2] >= splat.min.z - 1 &&
+            vol.min[2] <= splat.max.z + 1;
+        if (!overlaps) {
+            const mesh = this.splatMesh ?? this.splatMeshes[0];
+            const scaleY = mesh?.scaling?.y ?? 1;
+            const rot = this.getSplatRotation();
+            const visual = this.getStreamVisualRotation();
+            throw new Error(
+                `Voxel volume AABB misses splat world bounds — transform mismatch. ` +
+                `volume=[${vol.min.map((v) => v.toFixed(2)).join(',')}]→[${vol.max.map((v) => v.toFixed(2)).join(',')}] ` +
+                `splat=[${splat.min.x.toFixed(2)},${splat.min.y.toFixed(2)},${splat.min.z.toFixed(2)}]→` +
+                `[${splat.max.x.toFixed(2)},${splat.max.y.toFixed(2)},${splat.max.z.toFixed(2)}] ` +
+                `flip_y=${this.getWasmFlipY()} env=${this.getEnvironmentScale()} ` +
+                `navRot=[${rot.x.toFixed(3)},${rot.y.toFixed(3)},${rot.z.toFixed(3)}] ` +
+                `streamRot=[${visual.x.toFixed(3)},${visual.y.toFixed(3)},${visual.z.toFixed(3)}] ` +
+                `streamScaleY=${scaleY.toFixed(3)}`
+            );
+        }
+    }
+
+    public getVoxelPcWalkPlayerPosition(): Vector3 | null {
+        return this.userMesh?.position.clone() ?? null;
+    }
+
+    /** World-space feet under the player box center, or null when no agent exists. */
+    public getPlayerFeetWorld(): Vector3 | null {
+        if (!this.userMesh) {
+            return null;
+        }
+        const center = this.userMesh.position;
+        return new Vector3(center.x, center.y - AGENT_HALF_HEIGHT, center.z);
     }
 
     public addNPC(): void {
@@ -1561,10 +2237,12 @@ export class Viewer {
 
     private syncAgentMesh(mesh: AbstractMesh, agent: CrowdAgent): void {
         const pos = agent.position();
+        const oriented = new Vector3(pos.x, pos.y, pos.z);
+        const world = this.orientedNavPointToWorld(oriented);
         mesh.position.set(
-            pos.x + this.navMeshVisualOffset.x,
-            pos.y + this.navMeshVisualOffset.y + 0.25,
-            pos.z + this.navMeshVisualOffset.z
+            world.x + this.navMeshVisualOffset.x,
+            world.y + this.navMeshVisualOffset.y + AGENT_HALF_HEIGHT,
+            world.z + this.navMeshVisualOffset.z
         );
     }
 
@@ -1577,6 +2255,11 @@ export class Viewer {
             this.scene.onBeforeRenderObservable.remove(this.crowdUpdateObserver);
             this.crowdUpdateObserver = null;
         }
+        if (this.voxelWalkUpdateObserver) {
+            this.scene.onBeforeRenderObservable.remove(this.voxelWalkUpdateObserver);
+            this.voxelWalkUpdateObserver = null;
+        }
+        this.voxelWalkController = null;
     }
 
     private destroyCrowdSimulation(): void {
@@ -1590,6 +2273,7 @@ export class Viewer {
             this.recastNavMesh.destroy();
             this.recastNavMesh = null;
         }
+        this.navMeshQuery = null;
 
         this.userAgent = null;
         this.npcAgents = [];
@@ -1612,6 +2296,7 @@ export class Viewer {
     }
 
     private resetDerivedSceneState(): void {
+        this.stopNavSessionRuntime();
         this.destroyCrowdSimulation();
 
         if (this.seedMarker) {
@@ -1623,6 +2308,12 @@ export class Viewer {
         this.preferredNpcSpawn = null;
         this.clearNavMeshOverlay();
         this.clearColliderMesh();
+    }
+
+    /** Strip nav/collision overlays and agents; keep splat / stream visual loaded. */
+    public clearNavArtifacts(): void {
+        this.disableRegionSelection();
+        this.resetDerivedSceneState();
     }
 
     private clearNavMeshOverlay(): void {

@@ -26,7 +26,7 @@ The engine-free WASM core is the product; renderers are just consumers. The **sa
 
 - **Engine-free core, by contract** — pure Rust/WASM. No Babylon, no three.js, no bundler required. Splat bytes go in; meshes, navmesh geometry, bounds, and SOG/GLB come out.
 - **You own the coordinate space** — align to any renderer once, at the boundary, via `flip_y` / `output_space`. No per-output hacks.
-- **Proven on multiple stacks** — a **Babylon.js** showcase and a **React Three Fiber / three.js** demo call the *identical* WASM entry points and the shared, engine-free floor module.
+- **Proven on multiple stacks** — a **Babylon.js** showcase (WebGPU preferred with WebGL fallback, in-demo toggle or `?renderer=`) and a **React Three Fiber / three.js** demo (WebGL) call the *identical* WASM entry points and the shared, engine-free floor module.
 - **Binary-only friendly** — drive the whole pipeline headless, with **no 3D engine at all** (see [`examples/`](examples/)).
 
 ```mermaid
@@ -72,6 +72,20 @@ One **`FAST NAV`** click takes a raw splat all the way to a walkable navmesh wit
 
 > **New here?** Start with the [Integration Guide](docs/INTEGRATION.md) and the runnable [`examples/`](examples/). Install the published core with `npm install @splatwalk/core` (MIT, free forever).
 
+### Download FastNav kits
+
+Each live demo has a **Download … kit** button that ships a zip under `/integration-kits/` (built by `npm run build:kits`):
+
+| Demo | Route | Kit zip |
+| --- | --- | --- |
+| Vuetify + Babylon FastNav | [`/vuetify`](vuetify.html) | `splatwalk-fastnav-vuetify.zip` |
+| React / R3F FastNav | [`/react`](react.html) | `splatwalk-fastnav-r3f.zip` |
+| Storage Adapter | [`/storage-adapter`](storage-adapter-app.html) | `splatwalk-storage-adapter.zip` |
+| 3D Workbench | [`/`](index.html) | `splatwalk-fastnav-babylon-workbench.zip` |
+| Babylon Playground | [`/playground/`](public/playground/index.html) | **Download FastNav playground** → `playground.json` |
+
+Each zip includes `INTEGRATE.md` and `package.peers.json`. Babylon demos expose a **WebGPU / WebGL** toggle (WebGPU uses raised color-attachment limits for GS work buffers). The R3F demo shows the same control with WebGPU disabled — the Three splat path is WebGL-only.
+
 There are two supported integration levels:
 
 1. **Published core** (`@splatwalk/core`): the wasm binary, wasm-bindgen glue, hand-authored types, and the framework-agnostic `floor` module, versioned together. `npm install @splatwalk/core`.
@@ -82,7 +96,7 @@ There are two supported integration levels:
 A copy-paste [Babylon.js Playground](https://playground.babylonjs.com) snippet that is a full interactive demo — a workbench-style experience with its own in-scene UI (in the spirit of [babylon-game-starter](https://github.com/EricEisaman/babylon-game-starter)). It loads `@splatwalk/core` from a CDN, renders a real Gaussian splat, runs `build_room_floor_mesh` to extract the walkable floor (respecting the `flip_y` contract), builds a **Babylon Recast navmesh** from that floor, spawns a crowd agent, and lets you **click the floor to walk** the agent around the splat world. A scene picker switches between example `.ply`/`.spz` splats; toggles show/hide the splat, floor, and navmesh; and a **Full screen** toggle hijacks the Playground split so the canvas fills the view (`?fullscreen=true` enables it on load).
 
 - **Snippet (TypeScript Playground form):** [`public/playground/babylon-fast-nav.ts`](public/playground/babylon-fast-nav.ts) — paste into the Playground's TS editor and Run. The snippet builds its own UI, so the experience is identical in the real Playground.
-- **Runnable demo:** open **`/playground/`** on the dev server (`npm run dev` → <http://localhost:5173/playground/index.html>) or the deployed site. Source: [`public/playground/index.html`](public/playground/index.html). It reproduces the Playground TS pipeline (same Babylon CDN build, in-browser transpile) and adds a **Download `playground.json`** button. The downloaded file is a Babylon Playground **V2 snippet** (`{ payload, name, description, tags }`), so you can load it straight into the Playground and edit it. An **Open Playground ↗** button opens the saved snippet directly, and a home icon links back to this site.
+- **Runnable demo:** open **`/playground/`** on the dev server (`npm run dev` → <http://localhost:5173/playground/index.html>) or the deployed site. Source: [`public/playground/index.html`](public/playground/index.html). It reproduces the Playground TS pipeline (same Babylon CDN build, in-browser transpile) and adds a **Download FastNav playground** button (`playground.json` V2 snippet). The Playground **host** owns WebGL/WebGPU (see [`public/playground/PLAYGROUND_README.md`](public/playground/PLAYGROUND_README.md)). An **Open Playground ↗** button opens the saved snippet directly, and a home icon links back to this site.
 
 > Served from `public/` so Vite/your bundler ships it **verbatim** — the in-browser TypeScript transpile (and the `playground.json` export) need the raw source, not a bundler-rewritten module. The navmesh uses Babylon's `RecastJSPlugin` (recast.js loaded from the Babylon CDN), the same path that runs inside the real Playground.
 - **Saved Playground:** <https://playground.babylonjs.com/#VXTB9K>

@@ -2,6 +2,18 @@
 
 A clean, unified interface for streaming Spatially Ordered Gaussians (SOG) LOD splats from various backends with secure credential management.
 
+## Renderer (Babylon host)
+
+The Storage Adapter playground can prefer **WebGPU** or **WebGL** (`Stream settings`
+toggle, or `?renderer=webgpu|webgl`). WebGPU uses `setMaximumLimits` for the GS
+work-buffer MRT and falls back to WebGL when unsupported or below the color-
+attachment budget. Engine creation: `src/scene/createBabylonEngine.ts`. The WASM
+core stays renderer-agnostic. Use **Download Storage Adapter kit** for the
+Playground paste zip (`/integration-kits/splatwalk-storage-adapter.zip`, v0.6.4).
+**Oval interior** arms `cameraSelect` (preset fly view + AABB offsets) after settle
+and restores that view after nav. **Region and prune** exposes editable offsets and
+**Apply select region from camera**. Other CDN examples do not force `cameraSelect`.
+
 ## Navigation from stream (collision / Fast Nav)
 
 After a CDN or zip stream is loaded in the Storage Adapter playground
@@ -12,6 +24,22 @@ After a CDN or zip stream is loaded in the Storage Adapter playground
    `build_collision_voxel_boundary`, shows the boundary on the Viewer.
 3. **Run Fast Nav** — same materialize step, then floor field → Recast → crowd /
    NPC / top-down player framing (same end as `/vuetify`).
+
+### Deep-link query params
+
+`/storage-adapter` accepts (order: mode → pose → load → Fast Nav):
+
+| Param | Meaning |
+|-------|---------|
+| `stream` | CDN lod-meta URL or root (appends `/lod-meta.json`) |
+| `autoload` | `true`/`1` — load after scene init |
+| `mode` | `fly` \| `orbit` — camera before load |
+| `pos` | `[x,y,z]` world meters (with `eulerDeg`; fly only) |
+| `eulerDeg` | `[x,y,z]` degrees — same shape as **Copy pose** |
+| `fastNav` | `true`/`1` — after load, run floor-field Fast Nav (keeps pose view) |
+
+Helpers: `src/storage/storageAdapterDeepLink.ts`. Root URLs without
+`lod-meta.json` resolve via `resolveLodMetaCdnUrl`.
 
 Implementation:
 

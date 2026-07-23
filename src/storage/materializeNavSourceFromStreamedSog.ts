@@ -11,6 +11,7 @@
  */
 
 import type { Scene } from '@babylonjs/core/scene';
+import { Matrix, Vector3 } from '@babylonjs/core/Maths/math';
 import type { ISOGLODMetadata } from '@babylonjs/loaders/SPLAT/gaussianSplattingStream';
 import { ParseSogMeta } from '@babylonjs/loaders/SPLAT/sog.pure';
 
@@ -29,6 +30,18 @@ export interface MaterializeNavSourceOptions {
   readonly minSplats?: number;
   readonly maxSplats?: number;
   readonly onProgress?: (message: string) => void;
+  /**
+   * Raw PlayCanvas / SOG coordinate AABB (same space as lod-meta `tree.bound`).
+   * When set with {@link fullRegionCoverage}, only overlapping chunks at the chosen
+   * LOD are decoded at full density — matching PC / SS collision on the full asset
+   * within that volume instead of a budget-subsampled global slice.
+   */
+  readonly regionCoverage?: {
+    readonly max: readonly [number, number, number];
+    readonly min: readonly [number, number, number];
+  };
+  /** Decode every splat in {@link regionCoverage} chunks (no per-chunk subsampling). */
+  readonly fullRegionCoverage?: boolean;
 }
 
 /** Default minimum splat count before Fast Nav / collision materialize stops refining LODs. */
@@ -126,6 +139,90 @@ export const selectChunkMetaPathsForLod = (
     }
   }
   return paths;
+};
+
+/** Axis-aligned box overlap test in raw SOG coordinates. */
+export const aabbOverlaps = (
+  a: { min: readonly number[]; max: readonly number[] },
+  b: { min: readonly number[]; max: readonly number[] }
+): boolean =>
+  a.min[0]! <= b.max[0]! &&
+  a.max[0]! >= b.min[0]! &&
+  a.min[1]! <= b.max[1]! &&
+  a.max[1]! >= b.min[1]! &&
+  a.min[2]! <= b.max[2]! &&
+  a.max[2]! >= b.min[2]!;
+
+type LodMetaTreeNode = {
+  readonly bound: { readonly min: number[]; readonly max: number[] };
+  readonly children?: readonly LodMetaTreeNode[];
+  readonly lods?: Readonly<Record<string, { readonly file: number }>>;
+};
+
+/**
+ * Map a pinned world-space selection box to raw SOG coords (inverse stream mesh transform).
+ * lod-meta tree bounds and decoded splat positions live in this space before WASM rotation.
+ */
+export const worldRegionToRawSogBounds = (
+  world: { min: readonly number[]; max: readonly number[] },
+  streamWorldMatrix: Matrix
+): { min: [number, number, number]; max: [number, number, number] } => {
+  const inv = Matrix.Invert(streamWorldMatrix);
+  const xs = [world.min[0]!, world.max[0]!];
+  const ys = [world.min[1]!, world.max[1]!];
+  const zs = [world.min[2]!, world.max[2]!];
+  let minOut: Vector3 | null = null;
+  let maxOut: Vector3 | null = null;
+
+  for (const x of xs) {
+    for (const y of ys) {
+      for (const z of zs) {
+        const corner = Vector3.TransformCoordinates(new Vector3(x, y, z), inv);
+        minOut = minOut ? Vector3.Minimize(minOut, corner) : corner.clone();
+        maxOut = maxOut ? Vector3.Maximize(maxOut, corner) : corner.clone();
+      }
+    }
+  }
+
+  return {
+    min: [minOut!.x, minOut!.y, minOut!.z],
+    max: [maxOut!.x, maxOut!.y, maxOut!.z],
+  };
+};
+
+/** Collect chunk meta.json paths whose lod-meta tree bounds overlap a raw SOG region. */
+export const collectChunkMetaPathsOverlappingRegion = (
+  metadata: ISOGLODMetadata,
+  lodIndex: number,
+  region: { min: readonly number[]; max: readonly number[] }
+): string[] => {
+  const tree = metadata.tree as LodMetaTreeNode | undefined;
+  if (!tree) {
+    return [];
+  }
+
+  const visit = (node: LodMetaTreeNode): string[] => {
+    if (!aabbOverlaps(node.bound, region)) {
+      return [];
+    }
+    const paths: string[] = [];
+    const lodRef = node.lods?.[String(lodIndex)];
+    if (lodRef !== undefined) {
+      const rawPath = metadata.filenames[lodRef.file];
+      if (rawPath) {
+        const path = normalizePath(rawPath);
+        if (path.endsWith(`/${META_BASENAME}`) || path === META_BASENAME) {
+          paths.push(path);
+        }
+      }
+    }
+    for (const child of node.children ?? []) {
+      paths.push(...visit(child));
+    }
+    return paths;
+  };
+
+  return [...new Set(visit(tree))];
 };
 
 const fetchBytes = async (url: string): Promise<Uint8Array> => {
@@ -266,6 +363,71 @@ const boundsFromSplatBuffer = (
   };
 };
 
+const SPLAT_ROW_BYTES = 32;
+const SPLAT_STRIDE_FLOATS = 8;
+
+/**
+ * Keep only splat rows inside a raw SOG AABB (selection region). Chunk overlap
+ * materialize can otherwise include far-away splats that slow WASM and add floater solids.
+ */
+export const clipSplatBufferToAabb = (
+  splatBuffer: Uint8Array,
+  region: {
+    readonly max: readonly [number, number, number];
+    readonly min: readonly [number, number, number];
+  },
+  rowBytes = SPLAT_ROW_BYTES
+): { splatBytes: Uint8Array; splatCount: number } => {
+  const view = new Float32Array(
+    splatBuffer.buffer,
+    splatBuffer.byteOffset,
+    Math.floor(splatBuffer.byteLength / 4)
+  );
+  const count = Math.floor(view.length / SPLAT_STRIDE_FLOATS);
+  let kept = 0;
+  for (let i = 0; i < count; i++) {
+    const base = i * SPLAT_STRIDE_FLOATS;
+    const x = view[base]!;
+    const y = view[base + 1]!;
+    const z = view[base + 2]!;
+    if (
+      x >= region.min[0] &&
+      x <= region.max[0] &&
+      y >= region.min[1] &&
+      y <= region.max[1] &&
+      z >= region.min[2] &&
+      z <= region.max[2]
+    ) {
+      kept += 1;
+    }
+  }
+  if (kept === count) {
+    return { splatBytes: splatBuffer, splatCount: count };
+  }
+  const out = new Uint8Array(kept * rowBytes);
+  let dst = 0;
+  for (let i = 0; i < count; i++) {
+    const base = i * SPLAT_STRIDE_FLOATS;
+    const x = view[base]!;
+    const y = view[base + 1]!;
+    const z = view[base + 2]!;
+    if (
+      x < region.min[0] ||
+      x > region.max[0] ||
+      y < region.min[1] ||
+      y > region.max[1] ||
+      z < region.min[2] ||
+      z > region.max[2]
+    ) {
+      continue;
+    }
+    const srcOff = i * rowBytes;
+    out.set(splatBuffer.subarray(srcOff, srcOff + rowBytes), dst);
+    dst += rowBytes;
+  }
+  return { splatBytes: out, splatCount: kept };
+};
+
 /**
  * Decode one LOD level into antimatter15 `.splat` bytes (not yet PLY).
  *
@@ -277,6 +439,7 @@ const boundsFromSplatBuffer = (
 const decodeLodToSplatBuffer = async (params: {
   access: StreamedBundleAccess;
   chunkMetas: readonly string[];
+  fullDecodePaths?: ReadonlySet<string>;
   log: (message: string) => void;
   maxSplats?: number;
   scene: Scene;
@@ -286,28 +449,36 @@ const decodeLodToSplatBuffer = async (params: {
   let splatCount = 0;
   const rowBytes = 32;
   const maxSplats = params.maxSplats;
+  const fullDecodePaths = params.fullDecodePaths ?? new Set<string>();
 
   for (let i = 0; i < chunkMetas.length; i++) {
     const metaPath = chunkMetas[i]!;
+    const decodeFull = fullDecodePaths.has(metaPath);
     const chunksLeft = chunkMetas.length - i;
     const remaining =
-      maxSplats === undefined ? Number.POSITIVE_INFINITY : Math.max(0, maxSplats - splatCount);
+      decodeFull || maxSplats === undefined
+        ? Number.POSITIVE_INFINITY
+        : Math.max(0, maxSplats - splatCount);
     if (remaining <= 0) {
       log(
         `Hit maxSplats=${maxSplats} after ${i}/${chunkMetas.length} chunks (${splatCount} splats).`
       );
       break;
     }
-    // Fair share of whatever budget remains so later octants still contribute.
-    const chunkBudget = Math.max(1, Math.ceil(remaining / chunksLeft));
+    const chunkBudget = decodeFull
+      ? Number.POSITIVE_INFINITY
+      : Math.max(1, Math.ceil(remaining / chunksLeft));
 
-    log(`Decoding chunk ${i + 1}/${chunkMetas.length}: ${metaPath} (budget ≤ ${chunkBudget} splats)`);
+    log(
+      `Decoding chunk ${i + 1}/${chunkMetas.length}: ${metaPath}` +
+        (decodeFull ? ' (full region coverage)' : ` (budget ≤ ${chunkBudget} splats)`)
+    );
     try {
       const fileMap = await loadChunkFileMap(access, metaPath);
       const parsed = await ParseSogMeta(fileMap, '', scene);
       const part = parsed.data;
       const partCount = Math.floor(part.byteLength / rowBytes);
-      const take = Math.min(partCount, chunkBudget, remaining);
+      const take = decodeFull ? partCount : Math.min(partCount, chunkBudget, remaining);
       if (take <= 0) {
         continue;
       }
@@ -318,6 +489,9 @@ const decodeLodToSplatBuffer = async (params: {
         );
       } else {
         splatParts.push(part);
+        if (decodeFull) {
+          log(`Chunk ${metaPath}: kept all ${partCount} splats (region coverage).`);
+        }
       }
       splatCount += take;
     } catch (error) {
@@ -372,6 +546,61 @@ export const materializeNavSourceFromStreamedSog = async (params: {
   await splatwalk.init();
 
   const maxLod = Math.max(0, metadata.lodLevels - 1);
+  const regionCoverage = options.regionCoverage;
+  const fullRegionCoverage = options.fullRegionCoverage === true && Boolean(regionCoverage);
+
+  if (fullRegionCoverage && regionCoverage) {
+    const finestLod = 0;
+    const regionChunks = collectChunkMetaPathsOverlappingRegion(
+      metadata,
+      finestLod,
+      regionCoverage
+    );
+    const fallbackChunks = selectChunkMetaPathsForLod(metadata, finestLod);
+    const chunkMetas =
+      regionChunks.length > 0 ? regionChunks : fallbackChunks;
+    if (chunkMetas.length === 0) {
+      throw new Error(`No chunk metas found for nav materialize. ${SPLAT_TRANSFORM_HINT}`);
+    }
+
+    log(
+      `Materializing voxel nav at finest LOD with full density in ${chunkMetas.length} chunk(s)` +
+        (regionChunks.length > 0
+          ? ` overlapping pinned region (${regionChunks.length} via lod-meta tree).`
+          : ' (region miss — using all finest chunks).')
+    );
+
+    const decoded = await decodeLodToSplatBuffer({
+      access,
+      chunkMetas,
+      fullDecodePaths: new Set(chunkMetas),
+      log,
+      maxSplats: undefined,
+      scene,
+    });
+
+    const clipped = regionCoverage
+      ? clipSplatBufferToAabb(decoded.splatBytes, regionCoverage)
+      : { splatBytes: decoded.splatBytes, splatCount: decoded.splatCount };
+    if (clipped.splatCount < decoded.splatCount) {
+      log(
+        `Clipped nav source to pinned region: ${clipped.splatCount.toLocaleString()}/` +
+          `${decoded.splatCount.toLocaleString()} splats kept.`
+      );
+    }
+
+    log(`Converting ${clipped.splatCount} splats to PLY…`);
+    const plyBytes = await splatwalk.splatToPly(clipped.splatBytes);
+    log(`Nav PLY ready (${(plyBytes.byteLength / (1024 * 1024)).toFixed(2)} MB).`);
+
+    return {
+      bounds: boundsFromSplatBuffer(clipped.splatBytes),
+      lodIndexUsed: finestLod,
+      plyBytes,
+      splatCount: clipped.splatCount,
+    };
+  }
+
   const lodOption = options.lodIndex ?? 'nav';
   const startLod = resolveLodIndex(metadata, lodOption);
   const refineTowardFinest = lodOption === 'nav' || lodOption === 'coarsest';

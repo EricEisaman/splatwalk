@@ -34,6 +34,11 @@ The demo decodes a spatially fair LOD subset into PLY via
 [splat-transform](https://github.com/playcanvas/splat-transform) to PLY and use
 the FastNav showcase instead.
 
+## Renderer (local UI)
+
+On http://localhost:5173/storage-adapter use **Stream settings → WebGPU / WebGL**,
+or `?renderer=webgpu|webgl`. WebGPU falls back to WebGL when unsupported.
+
 ## Babylon Playground (TypeScript)
 
 Paste [`storage-adapter.ts`](./storage-adapter.ts) into [playground.babylonjs.com](https://playground.babylonjs.com) (TypeScript mode):
@@ -41,6 +46,9 @@ Paste [`storage-adapter.ts`](./storage-adapter.ts) into [playground.babylonjs.co
 1. Switch the Playground to **TypeScript**
 2. Replace the default `Playground` class with the file contents
 3. Run — loads the PlayCanvas church `lod-meta.json` with a 4M resident budget
+
+The Playground **host** owns the `Engine` (WebGL or WebGPU per Playground settings).
+The paste demo does not create or toggle the renderer.
 
 ## Related
 

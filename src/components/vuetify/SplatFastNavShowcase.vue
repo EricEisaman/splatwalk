@@ -28,6 +28,8 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref, watch, type Compon
 
 import { useBabylonViewer } from '@/composables/useBabylonViewer';
 import { useSplatFastNav, type LogTag, type SogExportMode } from '@/composables/useSplatFastNav';
+import type { BabylonRendererPreference } from '@/scene/createBabylonEngine';
+import { downloadIntegrationKit } from '@/utils/downloadIntegrationKit';
 import {
   clampSliceSettingsForScene,
   DEFAULT_AUTO_SLICE_THRESHOLD,
@@ -78,8 +80,85 @@ const isFullscreen = ref(false);
 const rightHanded = new URLSearchParams(window.location.search).get('rh') === '1';
 
 const babylon = useBabylonViewer(canvasRef, { rightHanded });
-const { status, statusMessage, errorMessage, logs, isBusy, phase, progress, splatCount, maxShDegree, maxChunkExtent, loadAndProcess, loadExample, exportSog, exportNavmesh, generateCollisionBoundary, exportCollisionMesh, setCollisionBoundaryVisible, setNavMeshVisible, navSettings, resetNavSettings, hasNavMesh, pruneFloaters, hasLoadedSplat, selectionRegionVisible, setSelectionRegionVisible, rerunFastNav, applyEnvironmentScale, setPendingEnvironmentScale, reset } =
-  useSplatFastNav(babylon, { recovery: props.recovery, strayTrim: props.strayTrim, prune: props.prune });
+const { activeRenderer, rendererPreference, setRendererPreference } = babylon;
+const {
+  status,
+  statusMessage,
+  errorMessage,
+  logs,
+  isBusy,
+  phase,
+  progress,
+  splatCount,
+  maxShDegree,
+  maxChunkExtent,
+  loadAndProcess,
+  loadExample,
+  exportSog,
+  exportNavmesh,
+  downloadNavArtifacts,
+  uploadNavArtifacts,
+  hasNavArtifactBundle,
+  navArtifactUploadHint,
+  cameraSelectOffsets,
+  resetCameraSelectOffsets,
+  applySelectRegionFromCamera,
+  generateCollisionBoundary,
+  exportCollisionMesh,
+  setCollisionBoundaryVisible,
+  setNavMeshVisible,
+  goToPlayer,
+  navSettings,
+  resetNavSettings,
+  hasNavMesh,
+  pruneFloaters,
+  hasLoadedSplat,
+  selectionRegionVisible,
+  setSelectionRegionVisible,
+  rerunFastNav,
+  applyEnvironmentScale,
+  setPendingEnvironmentScale,
+  reset,
+} = useSplatFastNav(babylon, { recovery: props.recovery, strayTrim: props.strayTrim, prune: props.prune });
+
+const navArtifactsInputRef = ref<HTMLInputElement | null>(null);
+
+const onApplySelectRegionFromCamera = async (): Promise<void> => {
+  try {
+    await applySelectRegionFromCamera();
+  } catch {
+    // logged in composable
+  }
+};
+
+const onNavArtifactsSelected = async (event: Event): Promise<void> => {
+  const input = event.target as HTMLInputElement;
+  const files = input.files ? Array.from(input.files) : [];
+  input.value = '';
+  if (files.length === 0) {
+    return;
+  }
+  try {
+    await uploadNavArtifacts(files);
+  } catch {
+    // errorMessage set in composable
+  }
+};
+
+const onDownloadFastNavKit = (): void => {
+  downloadIntegrationKit('vuetify');
+};
+
+const onRendererPreferenceChange = (value: unknown): void => {
+  if (value !== 'webgl' && value !== 'webgpu') {
+    return;
+  }
+  const preference = value as BabylonRendererPreference;
+  void (async () => {
+    reset();
+    await setRendererPreference(preference);
+  })();
+};
 
 // --- Streamed SOG export -------------------------------------------------
 // Reactive slice settings seeded from the defaults + any `slice` prop override.
@@ -375,9 +454,47 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
         <div class="text-h5 font-weight-black text-uppercase mb-1">
           Gaussian Splat <span class="text-primary">FAST NAV</span>
         </div>
-        <p class="text-body-2 text-medium-emphasis mb-4">
+        <p class="text-body-2 text-medium-emphasis mb-3">
           Drop a <strong>.ply</strong>, <strong>.spz</strong>, or <strong>.splat</strong> 3D Gaussian Splat. It loads into Babylon.js, auto-runs
           the FAST NAV pipeline (collider &rarr; navmesh &rarr; crowd &rarr; NPC), then frames the player top-down.
+        </p>
+
+        <div class="d-flex flex-wrap align-center ga-3 mb-3">
+          <v-btn
+            color="primary"
+            variant="tonal"
+            prepend-icon="mdi-download"
+            :disabled="isBusy"
+            @click="onDownloadFastNavKit"
+          >
+            Download FastNav kit
+          </v-btn>
+          <div class="d-flex align-center flex-wrap ga-2">
+            <v-btn-toggle
+              :model-value="rendererPreference"
+              mandatory
+              density="comfortable"
+              color="primary"
+              :disabled="isBusy"
+              @update:model-value="onRendererPreferenceChange"
+            >
+              <v-btn value="webgpu" prepend-icon="mdi-memory">WebGPU</v-btn>
+              <v-btn value="webgl" prepend-icon="mdi-video-3d">WebGL</v-btn>
+            </v-btn-toggle>
+            <v-chip
+              v-if="activeRenderer"
+              size="small"
+              variant="tonal"
+              :color="activeRenderer === 'webgpu' ? 'success' : 'secondary'"
+            >
+              active: {{ activeRenderer }}
+            </v-chip>
+          </div>
+        </div>
+        <p class="text-caption text-medium-emphasis mb-4">
+          Renderer recreates the GPU context (clears the scene). WebGPU raises color-attachment
+          limits for the GS work buffer and falls back to WebGL if unsupported.
+          Override with <code>?renderer=webgl</code> or <code>?renderer=webgpu</code>.
         </p>
 
         <div class="d-flex flex-wrap ga-2 mb-4">
@@ -544,12 +661,41 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
                   @update:model-value="onSelectionRegionVisible(Boolean($event))"
                 />
               </div>
-              <p class="text-caption text-medium-emphasis mb-4">
+              <p class="text-caption text-medium-emphasis mb-2">
                 Prune overrides WASM floater removal for Fast Nav and collision (set before load or before Recompute).
                 When Selection region is shown, the yellow box is the pinned consideration
                 region (drag/scale with gizmos); when hidden, Fast Nav auto-selects a boxed region.
                 Selection region unlocks after the splat loads and Fast Nav finishes (success or fail).
               </p>
+              <div class="text-caption text-medium-emphasis mb-2">Camera select AABB (m)</div>
+              <v-row density="comfortable" class="mb-1">
+                <v-col cols="6" sm="4" md="2">
+                  <v-text-field v-model.number="cameraSelectOffsets.left" type="number" label="Left" density="compact" hide-details :min="0" :step="0.5" :disabled="isBusy" />
+                </v-col>
+                <v-col cols="6" sm="4" md="2">
+                  <v-text-field v-model.number="cameraSelectOffsets.right" type="number" label="Right" density="compact" hide-details :min="0" :step="0.5" :disabled="isBusy" />
+                </v-col>
+                <v-col cols="6" sm="4" md="2">
+                  <v-text-field v-model.number="cameraSelectOffsets.forward" type="number" label="Forward" density="compact" hide-details :min="0" :step="0.5" :disabled="isBusy" />
+                </v-col>
+                <v-col cols="6" sm="4" md="2">
+                  <v-text-field v-model.number="cameraSelectOffsets.behind" type="number" label="Behind" density="compact" hide-details :min="0" :step="0.5" :disabled="isBusy" />
+                </v-col>
+                <v-col cols="6" sm="4" md="2">
+                  <v-text-field v-model.number="cameraSelectOffsets.below" type="number" label="Below" density="compact" hide-details :min="0" :step="0.5" :disabled="isBusy" />
+                </v-col>
+                <v-col cols="6" sm="4" md="2">
+                  <v-text-field v-model.number="cameraSelectOffsets.above" type="number" label="Above" density="compact" hide-details :min="0" :step="0.5" :disabled="isBusy" />
+                </v-col>
+              </v-row>
+              <div class="d-flex flex-wrap align-center ga-3 mb-4">
+                <v-btn color="warning" variant="tonal" size="small" :disabled="isBusy || !hasLoadedSplat" @click="onApplySelectRegionFromCamera">
+                  Apply select region from camera
+                </v-btn>
+                <v-btn variant="text" size="small" :disabled="isBusy" @click="resetCameraSelectOffsets">
+                  Reset offsets
+                </v-btn>
+              </div>
 
               <div class="text-subtitle-2 mb-2">Floor coverage</div>
               <v-row density="comfortable">
@@ -828,6 +974,16 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
                   :label="navMeshVisible ? 'Shown' : 'Hidden'"
                   @update:model-value="onNavMeshVisible(Boolean($event))"
                 />
+                <v-btn
+                  size="small"
+                  variant="tonal"
+                  color="secondary"
+                  prepend-icon="mdi-account-arrow-down"
+                  :disabled="isBusy"
+                  @click="goToPlayer"
+                >
+                  Go to Player
+                </v-btn>
               </v-sheet>
 
               <div class="text-subtitle-2 mb-2">Scale</div>
@@ -872,7 +1028,42 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
                 >
                   Export navmesh (.nav)
                 </v-btn>
+                <v-btn
+                  variant="tonal"
+                  color="primary"
+                  prepend-icon="mdi-download"
+                  :disabled="!hasNavArtifactBundle || isBusy"
+                  @click="downloadNavArtifacts"
+                >
+                  Download nav artifacts
+                </v-btn>
+                <div
+                  class="nav-artifacts-upload-wrap"
+                  :class="{ 'nav-artifacts-upload-wrap--disabled': !hasLoadedSplat || isBusy }"
+                  :title="navArtifactUploadHint"
+                >
+                  <v-btn
+                    variant="outlined"
+                    color="secondary"
+                    prepend-icon="mdi-upload"
+                    tabindex="-1"
+                    :disabled="!hasLoadedSplat || isBusy"
+                  >
+                    Upload nav artifacts
+                  </v-btn>
+                  <input
+                    v-if="hasLoadedSplat && !isBusy"
+                    ref="navArtifactsInputRef"
+                    type="file"
+                    multiple
+                    accept=".zip,application/zip,.glb,.bin,.json,application/json"
+                    class="nav-artifacts-file-hit"
+                    :title="navArtifactUploadHint"
+                    @change="onNavArtifactsSelected"
+                  >
+                </div>
               </div>
+              <p class="text-caption text-medium-emphasis mb-4">{{ navArtifactUploadHint }}</p>
 
               <v-sheet
                 border
@@ -1095,6 +1286,24 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
 .logs-scroll {
   max-height: 240px;
   overflow-y: auto;
+}
+
+.nav-artifacts-upload-wrap {
+  position: relative;
+  display: inline-flex;
+}
+
+.nav-artifacts-upload-wrap--disabled {
+  pointer-events: none;
+}
+
+.nav-artifacts-file-hit {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  opacity: 0;
+  cursor: pointer;
+  font-size: 0;
 }
 
 .navmesh-toggle-bar {

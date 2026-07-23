@@ -185,10 +185,25 @@ export interface NavmeshBasisResult extends ResultContract {
     diagnostics: ReconstructionDiagnostics;
 }
 
+/** Packed dense voxel volume for PC-style runtime walk (capability `collision_voxel_volume`). */
+export interface CollisionVoxelVolume {
+    /** Grid minimum corner in `splatwalk_oriented` space. */
+    origin: [number, number, number];
+    /** Voxel counts [x, y, z]. */
+    dims: [number, number, number];
+    voxel_size: number;
+    /** LSB-first bit-packed solid occupancy (`ceil(n/8)` bytes). */
+    solid: Uint8Array;
+    /** LSB-first bit-packed carved nav region (`ceil(n/8)` bytes). */
+    nav_region: Uint8Array;
+}
+
 export interface CollisionVoxelBoundaryResult extends ResultContract {
     mesh: MeshBuffers;
     /** GLB bytes of the collision mesh, present only when `emit_glb` was set. */
     glb?: Uint8Array;
+    /** Dense solid + nav_region, present only when `emit_volume` was set. */
+    volume?: CollisionVoxelVolume;
     space: CoordinateSpace;
     basis: FieldBasis;
     floor_plane: FloorPlane;
@@ -227,6 +242,8 @@ export interface RoomFloorSettings extends MeshSettings {
 export interface CollisionVoxelBoundarySettings extends MeshSettings {
     /** When true, also emit a GLB of the collision boundary mesh in `glb`. Default false. */
     emit_glb?: boolean;
+    /** When true, also emit packed `solid` + `nav_region` in `volume`. Default false. */
+    emit_volume?: boolean;
 }
 
 /** Result of {@link SplatWalkBridge.buildRoomFloorMesh}: a triangulated room-floor mesh. */
@@ -264,7 +281,11 @@ export interface MeshSettings {
     collision_fill_size?: number;
     collision_carve_height?: number;
     collision_carve_radius?: number;
-    collision_mesh_mode?: 'faces' | 'smooth';
+    collision_mesh_mode?: 'faces' | 'obstacle_shell' | 'smooth' | 'walkable_floors';
+    /** PlayCanvas `--filter-cluster` on splats before fine voxelize (default true in WASM). */
+    collision_filter_cluster?: boolean;
+    /** Cap padded voxel grid size; WASM coarsens voxel_size when exceeded. */
+    collision_max_voxels?: number;
     min_alpha?: number;
     max_scale?: number;
     normal_align?: number;
@@ -344,6 +365,9 @@ export class SplatWalkBridge {
      */
     public onProgress: ((stage: string, fraction: number | null) => void) | null = null;
 
+    /** Optional hook for worker/WASM `console.log` lines (parse counts, grid sizing, etc.). */
+    public onWorkerLog: ((message: string) => void) | null = null;
+
     private constructor() { }
 
     public static getInstance(): SplatWalkBridge {
@@ -363,6 +387,7 @@ export class SplatWalkBridge {
                     // existing console capture (e.g. homepage System Logs) sees them.
                     const level = data.level as 'log' | 'warn' | 'error';
                     console[level](data.message);
+                    this.onWorkerLog?.(data.message as string);
                     return;
                 }
                 if (data?.kind === 'progress') {

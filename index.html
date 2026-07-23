@@ -90,7 +90,12 @@
                         </select>
                         <div class="mobile-upload-divider">OR</div>
                         <button id="chooseFileBtn" class="cyber-button-pink">CHOOSE LOCAL FILE</button>
+                        <button id="uploadNavArtifactsBtn" class="cyber-button secondary"
+                            title="Upload nav-artifacts .zip or multi-select contract files">UPLOAD NAV ARTIFACTS</button>
                         <input type="file" id="localFileInput" accept=".ply,.spz,.splat" style="display: none;">
+                        <input type="file" id="navArtifactsInput" multiple
+                            accept=".zip,application/zip,.glb,.bin,.json,application/json"
+                            style="display: none;">
                     </div>
                 </div>
 
@@ -112,8 +117,17 @@
                             </button>
                         </div>
 
-                        <!-- Right: Fullscreen -->
+                        <!-- Right: Download kit + Fullscreen -->
                         <div class="controls-right">
+                            <button id="downloadFastNavKitBtn" class="icon-button glass-btn" type="button"
+                                title="Download FastNav workbench integration kit">
+                                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                    stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                                    <polyline points="7 10 12 15 17 10"></polyline>
+                                    <line x1="12" y1="15" x2="12" y2="3"></line>
+                                </svg>
+                            </button>
                             <button id="fullscreenBtn" class="icon-button glass-btn" title="Fullscreen">
                                 <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                                     stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -134,6 +148,23 @@
                         <!-- Section 1: Setup & Orientation -->
                         <div id="setupSection" class="controls-section">
                             <div class="section-title">Setup & Orientation</div>
+
+                            <div class="control-row">
+                                <label title="Babylon renderer preference (recreates the GPU context)">Renderer:</label>
+                                <div class="radio-cards" id="rendererPreferenceGroup">
+                                    <label>
+                                        <input type="radio" name="rendererPreference" value="webgpu" checked>
+                                        <div class="radio-card-content">WebGPU</div>
+                                    </label>
+                                    <label>
+                                        <input type="radio" name="rendererPreference" value="webgl">
+                                        <div class="radio-card-content">WebGL</div>
+                                    </label>
+                                </div>
+                            </div>
+                            <p class="control-hint" id="rendererActiveHint" style="margin: 0 0 0.75rem; font-size: 0.75rem; opacity: 0.75;">
+                                Active: — · WebGPU falls back to WebGL if unsupported
+                            </p>
 
                             <div class="control-row">
                                 <label>Rotate Splat:</label>
@@ -210,6 +241,35 @@
                                     <button id="defineRegionBtn" class="cyber-button secondary small">DEFINE REGION</button>
                                     <button id="clearRegionBtn" class="cyber-button tertiary small"
                                         style="display: none;">CLEAR</button>
+                                </div>
+                                <div class="section-title" style="margin-top: 12px;">Camera select AABB (m)</div>
+                                <div class="control-row">
+                                    <label title="Meters left of camera">Left</label>
+                                    <input type="number" id="camSelectLeft" value="10" step="0.5" min="0">
+                                </div>
+                                <div class="control-row">
+                                    <label title="Meters right of camera">Right</label>
+                                    <input type="number" id="camSelectRight" value="10" step="0.5" min="0">
+                                </div>
+                                <div class="control-row">
+                                    <label title="Meters forward">Forward</label>
+                                    <input type="number" id="camSelectForward" value="15" step="0.5" min="0">
+                                </div>
+                                <div class="control-row">
+                                    <label title="Meters behind">Behind</label>
+                                    <input type="number" id="camSelectBehind" value="5" step="0.5" min="0">
+                                </div>
+                                <div class="control-row">
+                                    <label title="Meters below camera">Below</label>
+                                    <input type="number" id="camSelectBelow" value="5" step="0.5" min="0">
+                                </div>
+                                <div class="control-row">
+                                    <label title="Meters above camera">Above</label>
+                                    <input type="number" id="camSelectAbove" value="15" step="0.5" min="0">
+                                </div>
+                                <div class="nav-button-group">
+                                    <button id="applyCamSelectRegionBtn" class="cyber-button secondary small"
+                                        title="Pin yellow select region from live fly/orbit camera + offsets">APPLY FROM CAMERA</button>
                                 </div>
                             </div>
 
@@ -354,7 +414,7 @@
                                 <button type="button" id="applyEnvironmentScaleBtn" class="cyber-button tertiary small">APPLY</button>
                             </div>
                             <div class="control-row">
-                                <label title="Use generated collision from the splat or import a dedicated collider GLB from PlayCanvas/SuperSplat/World Labs.">Collider Source:</label>
+                                <label title="Use generated collision from the splat or import a dedicated collider GLB.">Collider Source:</label>
                                 <select id="paramColliderSource" class="cyber-select">
                                     <option value="generated" selected>Generate</option>
                                     <option value="imported">Import GLB</option>
@@ -377,7 +437,7 @@
                                 <input type="range" id="colliderOpacity" min="0" max="1" step="0.1" value="0.35">
                             </div>
                             <div class="control-row">
-                                <label title="PlayCanvas/SuperSplat-style scene handling for voxel fill/carve.">Scene Type:</label>
+                                <label title="Scene handling for voxel fill/carve (indoor sealed, outdoor floor fill, object local).">Scene Type:</label>
                                 <select id="paramCollisionSceneType" class="cyber-select">
                                     <option value="outdoor" selected>Outdoor</option>
                                     <option value="indoor">Indoor</option>
@@ -385,7 +445,7 @@
                                 </select>
                             </div>
                             <div class="control-row">
-                                <label title="Voxel edge length in meters for collision generation. SuperSplat defaults near 0.05m.">Voxel Size:</label>
+                                <label title="Voxel edge length in meters for collision generation (typical indoor default 0.05m).">Voxel Size:</label>
                                 <input type="number" id="paramCollisionVoxelSize" value="0.08" step="0.01" min="0.025">
                             </div>
                             <div class="control-row">
@@ -518,6 +578,10 @@
                                 <button id="generateNavBtn" class="cyber-button secondary">GENERATE NAVMESH</button>
                                 <button id="downloadNavBtn" class="cyber-button secondary"
                                     style="display: none;">DOWNLOAD NAVMESH</button>
+                                <button id="downloadNavArtifactsBtn" class="cyber-button secondary"
+                                    style="display: none;">DOWNLOAD NAV ARTIFACTS</button>
+                                <button id="uploadNavArtifactsNavBtn" class="cyber-button tertiary"
+                                    title="Same as header Upload Nav Artifacts">UPLOAD NAV ARTIFACTS</button>
                             </div>
 
                             <!-- NPC Simulation -->

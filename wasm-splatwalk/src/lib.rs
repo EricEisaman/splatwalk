@@ -35,6 +35,7 @@ pub const API_VERSION: u8 = 2;
 /// on every version bump. See `docs/wasm-api.md` for the documented meaning.
 pub const CAPABILITIES: &[&str] = &[
     "collision_voxel_boundary",
+    "collision_voxel_volume",
     "progress_protocol_v1",
     "glb_export",
     "room_floor_mesh",
@@ -258,6 +259,9 @@ pub struct MeshSettings {
     pub collision_carve_height: Option<f64>,
     pub collision_carve_radius: Option<f64>,
     pub collision_mesh_mode: Option<String>,
+    collision_filter_cluster: Option<bool>,
+    /// Cap dense collision grid voxels (default 1_500_000). Lower under memory pressure.
+    pub collision_max_voxels: Option<usize>,
     pub min_alpha: Option<f64>,
     pub max_scale: Option<f64>,
     pub normal_align: Option<f64>,
@@ -562,6 +566,17 @@ pub struct NavmeshBasisResult {
     pub diagnostics: ReconstructionDiagnostics,
 }
 
+/// Packed dense voxel volume for runtime walk (solid + carved nav).
+/// Bitmasks are LSB-first, length `ceil(n/8)`, index order matching `grid.idx(x,y,z)`.
+#[derive(Serialize)]
+pub struct CollisionVoxelVolume {
+    pub origin: [f64; 3],
+    pub dims: [u32; 3],
+    pub voxel_size: f64,
+    pub solid: serde_bytes::ByteBuf,
+    pub nav_region: serde_bytes::ByteBuf,
+}
+
 #[derive(Serialize)]
 pub struct CollisionVoxelBoundaryResult {
     pub api_version: u8,
@@ -570,6 +585,9 @@ pub struct CollisionVoxelBoundaryResult {
     pub mesh: MeshBuffers,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub glb: Option<serde_bytes::ByteBuf>,
+    /// Present when `emit_volume` was set — dense solid + nav_region for voxel walk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume: Option<CollisionVoxelVolume>,
     pub space: CoordinateSpace,
     pub basis: FieldBasis,
     pub floor_plane: FloorPlane,
@@ -634,6 +652,8 @@ struct RoomFloorOptions {
 #[derive(Deserialize, Default)]
 struct CollisionVoxelBoundaryOptions {
     emit_glb: Option<bool>,
+    /// When true, result includes packed `solid` + `nav_region` bitmasks for runtime walk.
+    emit_volume: Option<bool>,
 }
 
 /// Built-in recovery ladder mirroring the TypeScript `DEFAULT_FAST_NAV_RECOVERY`.
@@ -689,13 +709,13 @@ fn parse_settings(settings: JsValue) -> Result<MeshSettings, JsValue> {
 }
 
 fn validate_collision_mesh_mode(settings: &MeshSettings) -> Result<(), JsValue> {
-    match settings.collision_mesh_mode.as_deref().unwrap_or("faces") {
-        "faces" => Ok(()),
+    match settings.collision_mesh_mode.as_deref().unwrap_or("walkable_floors") {
+        "faces" | "obstacle_shell" | "walkable_floors" => Ok(()),
         "smooth" => Err(JsValue::from_str(
-            "collision_mesh_mode=\"smooth\" is reserved but not implemented; use \"faces\".",
+            "collision_mesh_mode=\"smooth\" is reserved but not implemented; use \"walkable_floors\".",
         )),
         other => Err(JsValue::from_str(&format!(
-            "Invalid collision_mesh_mode: {}. Expected \"faces\" or \"smooth\".",
+            "Invalid collision_mesh_mode: {}. Expected \"walkable_floors\", \"obstacle_shell\", or \"faces\".",
             other
         ))),
     }
@@ -872,12 +892,11 @@ pub fn build_collision_voxel_boundary(data: &[u8], settings: JsValue) -> Result<
     let settings = parse_settings(settings)?;
     validate_collision_mesh_mode(&settings)?;
     let splats = parse_splats(data, &settings)?;
-    let mut result = mesh::build_collision_voxel_boundary(&splats, &settings);
+    let emit_volume = options.emit_volume.unwrap_or(false);
+    let mut result = mesh::build_collision_voxel_boundary(&splats, &settings, emit_volume);
     output_space::apply_collision_voxel_boundary(&settings, &mut result);
     if options.emit_glb.unwrap_or(false) {
-        let bytes = glb::mesh_to_glb(&result.mesh.vertices, &result.mesh.indices)
-            .map_err(|e| JsValue::from_str(&e))?;
-        result.glb = Some(serde_bytes::ByteBuf::from(bytes));
+        result.glb = soft_emit_glb(&result.mesh.vertices, &result.mesh.indices);
     }
     Ok(serde_wasm_bindgen::to_value(&result)?)
 }
@@ -957,9 +976,7 @@ pub fn build_room_floor_mesh(data: &[u8], settings: JsValue) -> Result<JsValue, 
                     space = transform.coordinate_space();
                 }
                 let glb = if emit_glb {
-                    let bytes = glb::mesh_to_glb(&mesh.vertices, &mesh.indices)
-                        .map_err(|e| JsValue::from_str(&e))?;
-                    Some(serde_bytes::ByteBuf::from(bytes))
+                    soft_emit_glb(&mesh.vertices, &mesh.indices)
                 } else {
                     None
                 };
@@ -1136,4 +1153,19 @@ pub fn splat_to_ply(data: &[u8]) -> Result<Vec<u8>, JsValue> {
 #[wasm_bindgen]
 pub fn mesh_to_glb(positions: &[f32], indices: &[u32]) -> Result<Vec<u8>, JsValue> {
     glb::mesh_to_glb(positions, indices).map_err(|e| JsValue::from_str(&e))
+}
+
+/// Optional GLB for `emit_glb`: skip empty meshes instead of failing the whole build.
+fn soft_emit_glb(vertices: &[f32], indices: &[u32]) -> Option<serde_bytes::ByteBuf> {
+    if vertices.is_empty() || indices.is_empty() {
+        log("emit_glb skipped: empty mesh (caller can synthesize GLB from volume)");
+        return None;
+    }
+    match glb::mesh_to_glb(vertices, indices) {
+        Ok(bytes) => Some(serde_bytes::ByteBuf::from(bytes)),
+        Err(err) => {
+            log(&format!("emit_glb skipped: {}", err));
+            None
+        }
+    }
 }

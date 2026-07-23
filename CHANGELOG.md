@@ -15,6 +15,8 @@ Every v2 result advertises a `capabilities` string array. Current flags:
 
 | flag | meaning |
 | --- | --- |
+| `collision_voxel_boundary` | exposes `build_collision_voxel_boundary` |
+| `collision_voxel_volume` | `emit_volume` returns packed `solid` + `nav_region` for voxel walk |
 | `progress_protocol_v1` | emits the documented `@progress <stage> [<fraction>]` line protocol |
 | `glb_export` | exposes `mesh_to_glb` for engine-free GLB serialization |
 | `room_floor_mesh` | exposes `build_room_floor_mesh` (WASM-side FAST NAV floor) |
@@ -25,6 +27,427 @@ Every v2 result advertises a `capabilities` string array. Current flags:
 | `recast_config` | exposes `recast_agent_defaults()` and `recast_config()` |
 | `progress_callback` | exposes `set_progress_callback()` (opt-in structured progress) |
 | `splat_ingest` | exposes `splat_to_ply` (antimatter15 `.splat` -> PLY normalization) alongside `spz_to_ply` |
+
+## [0.6.4] - 2026-07-23
+
+### Added
+
+- **Nav artifacts upload** (zip or multi-select contract files) across Storage Adapter,
+  3D Workbench, Vuetify Fast Nav, and R3F — `parseNavArtifactFiles` /
+  `applyNavArtifactsToViewer` / `applyNavArtifactsToR3F`.
+- **Download nav artifacts** on Workbench / Vuetify / R3F (minimal pack:
+  `nav_session.json` + `recast.navmesh.bin`; full volume packs unchanged on Storage).
+- **3D Workbench**: Upload Nav Artifacts button beside Choose local file; Region/prune
+  camera-select AABB offsets + Apply from camera.
+- Vuetify / R3F Region and prune: same camera-select offset controls + Apply.
+
+### Notes
+
+- WASM **`api_version` stays `2`**. Package **0.6.4**.
+
+## [0.6.3] - 2026-07-23
+
+### Added
+
+- **Storage Adapter Region/prune UI**: editable camera-select AABB offsets (L/R,
+  forward, behind, below, above) and **Apply select region from camera** to rebuild
+  the yellow box from the live fly view + offsets (`applySelectRegionFromCamera`).
+- **Oval fly pose** updated to the stairs framing used with that camera-select path.
+
+### Notes
+
+- WASM **`api_version` stays `2`**. Host UI only; package **0.6.3**.
+
+## [0.6.2] - 2026-07-23
+
+### Added
+
+- **`FastNavOptions.cameraSelect`** (host API): pass a FreeCamera-style `view`
+  (position + euler°) plus optional AABB offsets; Fast Nav derives the select-region
+  AABB via `regionBoundsFromCameraSelect`, pins the yellow box / `region_min`·`region_max`,
+  and restores that view after nav (skips top-down `focusOnPlayer` when
+  `keepCameraSelectView` is not false). Helpers: `CameraSelectView`,
+  `CameraSelectRegionInput`, `poseFromCameraSelectView`, `regionBoundsFromCameraSelect`.
+- **Oval Storage Adapter**: stores pending `cameraSelect` (same stairs fly view +
+  default offsets); settle arms the region; Fast Nav / voxel nav restore the fly view.
+  Church / Skatepark leave `cameraSelect` unset.
+- **R3F**: `useSplatFastNavR3F({ cameraSelect })` pins
+  `SplatNavController.enableRegionSelection` and restores the view when set.
+
+### Notes
+
+- WASM **`api_version` stays `2`** (AABB wire unchanged; no OBB).
+
+## [0.6.1] - 2026-07-23
+
+### Added
+
+- **Camera-based select region** (host toolset): `regionBoundsFromCameraPose` in
+  `src/navigation/cameraSelectRegion.ts` builds a world AABB from camera position +
+  yaw (defaults: 10 m left/right, 15 m forward, 5 m behind, 5 m below / 15 m above). Wire format
+  remains WASM `region_min` / `region_max` AABB; `api_version` stays **2**.
+- **Oval Storage Adapter**: after the preset fly pose applies, auto-arms that camera
+  AABB as the yellow selection region. Church / Skatepark unchanged.
+
+## [0.6.0] - 2026-07-23
+
+### Added
+
+- **WebGPU / WebGL renderer toggle** (Babylon host): Storage Adapter, Vuetify Fast Nav,
+  and homepage 3D Workbench, plus `?renderer=webgpu|webgl`. Preference **WebGPU** uses
+  `WebGPUEngine` when supported and **falls back to WebGL** if unsupported or init fails.
+  Preference **WebGL** always uses `Engine`. Shared helper `src/scene/createBabylonEngine.ts`;
+  `Viewer.create` for new canvases. WASM `api_version` remains **2** (renderer is host-side
+  only). WebGPU requests `setMaximumLimits` so `maxColorAttachmentBytesPerSample` is high
+  enough for Babylon’s GS `gsWorkBuffer` MRT (40 bytes/sample); adapters below that fall
+  back to WebGL. R3F demo shows the same control with WebGPU disabled (Three splat path is
+  WebGL-only).
+- **Download FastNav / Storage integration kits**: each demo ships a zip under
+  `/integration-kits/` (`npm run build:kits`) with `INTEGRATE.md` + peer deps fragment —
+  Vuetify, R3F, Storage Adapter, Babylon workbench host. Playground button retitled
+  **Download FastNav playground** (`playground.json`).
+
+## [0.5.20] - 2026-07-23
+
+### Fixed
+
+- **Oval interior orientation:** Selecting **Oval interior (stairs)** in Storage Adapter arms
+  Stream + Nav PLY orientation **0°/0°/0°**, applied after the next CDN/zip load (overrides
+  capture of the stream’s default Z-up→Y-up euler). Church / Skatepark still use captured defaults.
+
+## [0.5.19] - 2026-07-23
+
+### Fixed
+
+- **Click-to-move (Recast crowd):** Restored HEAD **0.4.2** path — pick the green `navmesh_debug`
+  mesh, subtract `navMeshVisualOffset`, then `requestMoveTarget` (with `worldNavPointToOriented`
+  when stream visual is decoupled; identity for Vuetify Bedroom / PurplePad). Removed the
+  surface-pick + snap path that sent agents to the wrong axis-mirrored location.
+
+## [0.5.18] - 2026-07-23
+
+### Fixed
+
+- **Bedroom / PurplePad indoor Fast Nav (0.5.16–0.5.17 regression):** Restored HEAD **0.4.2**
+  region behavior for default Fast Nav — yellow Selection box only; `suggestRegion` for seed;
+  no auto 100 m outdoor pin. Church outdoor seed-centered pin is opt-in via
+  `FastNavOptions.seedCenteredOutdoor` (enabled from Storage Adapter streamed Fast Nav only).
+
+## [0.5.17] - 2026-07-22
+
+### Fixed
+
+- **Church moth-eaten navmesh (0.5.16 regression):** Seed-centered 100 m pin kept fine outdoor
+  cells over sparse ground. Under that pin Fast Nav now forces `sdf_cell_size=0.4` and
+  `hole_fill_radius=8`, widens the Y band, closes seams up to 2 m, and re-pins region Y from
+  the dense floor band (XZ extent unchanged). No full-AABB auto-coarsen (avoids floating facades).
+
+## [0.5.16] - 2026-07-22
+
+### Fixed
+
+- **Church outdoor courtyard coverage:** When no yellow Selection box is set, Fast Nav pins a
+  seed-centered **100 m × 100 m** working volume (`±50 m` XZ, `floor_y` Y band) instead of the
+  full `suggestRegion` AABB or an unbounded field. Streamed Fast Nav merges same-level Recast
+  islands within `maxSeedDistance` (~80 m) for validation metadata (display/walk still use the
+  Recast floor sheet).
+
+## [0.5.15] - 2026-07-22
+
+### Fixed
+
+- **Church floating navmesh (regression):** Restored original ground-field `sdf_cell_size` clamp
+  `[0.03, 2.0]` and removed the 250k-cell auto-coarsen. Coarsening on the full outdoor AABB made
+  meter-scale cells that treated building facades as floor (mid-air green strip). `checked_mul`
+  still fails cleanly on true grid overflow instead of panicking.
+
+## [0.5.14] - 2026-07-22
+
+### Fixed
+
+- **Church navmesh wrong place (regression):** Reverted Fast Nav auto-pin of `suggestRegion` into
+  `region_min`/`region_max`. That locked the field onto the trees/stairs patch instead of the
+  courtyard/entrance. Original behavior restored: yellow box pins only; `suggestRegion` is seed-only;
+  dense-floor recovery adapts the working volume.
+
+## [0.5.13] - 2026-07-22
+
+### Fixed
+
+- **Ground-field cell budget ceil overrun:** WASM coarsen used `sqrt(area/MAX)` then hard-failed when
+  `ceil(w/cs)*ceil(d/cs)` landed just over 250k (church ~122×187 m). Now loops bumping `cell_size`
+  until the integer grid fits — no false `cell count overflow` abort.
+
+## [0.5.12] - 2026-07-22
+
+### Fixed
+
+- **Church Fast Nav capacity overflow (regression):** `runFastNav` restores `region=auto` — when no
+  yellow-box pin is present, `suggestRegion` sets `region_min`/`region_max` before the ground
+  field so multi‑km parish/sky AABBs no longer allocate a Wasm grid that panics with
+  `capacity overflow`. WASM `build_field` also caps ~250k cells (coarsens `sdf_cell_size` or
+  returns a clear error) as a last-resort guard.
+
+## [0.5.11] - 2026-07-22
+
+### Fixed
+
+- **Church Fast Nav after Oval:** CDN example buttons call `setNavGenerationMode` — Church/Skatepark
+  restore `floor_field` and clear selection-region / region-clipped PLY cache; Oval sets
+  `voxel_collision`. Stops Oval mode from leaking into Church Run Nav.
+
+## [0.5.10] - 2026-07-22
+
+### Fixed
+
+- **region_too_large (clamp):** Auto/suggested selection regions are clamped to ≲20 m XZ (fallback
+  12 m) so Oval-scale `suggestRegion` footprints cannot doom the carve. Oversized live boxes are
+  clamped too. Budget-required rematerialize refuses empty-region→global fallback (no omit-pin).
+  Preflight throws before WASM if the effective AABB still exceeds the dense voxel cap.
+
+## [0.5.9] - 2026-07-22
+
+### Fixed
+
+- **region_too_large:** Regionless full-AABB carves that cannot fit the dense voxel budget even at
+  0.5 m now auto-enable Selection region (`suggestRegion` + stair Y expand), rematerialize a
+  region-clipped PLY, and pin WASM. Error copy for pinned-but-still-too-large tells the user to
+  shrink the yellow box (not “lower opacity”).
+
+## [0.5.8] - 2026-07-22
+
+### Fixed
+
+- **mesh_to_glb empty crash:** Root cause was WASM `emit_glb` hard-failing the whole collision
+  build on an empty surface mesh (regionless full AABB). `emit_glb` now skips empty meshes
+  (`glb=None` + warning). Voxel Run Nav uses `emitGlb: false` and synthesizes `collision.glb` /
+  `walkable_floors.glb` in TS from boundary mesh or solid exterior / solid tops after volume.
+
+## [0.5.7] - 2026-07-22
+
+### Fixed
+
+- **Regionless nav artifacts:** When nav floor cells are empty (common on full-AABB volumes),
+  emit walkable_floors from solid tops with air above. When WASM collision mesh/GLB is empty,
+  emit collision.glb from solid exterior faces. Full artifact pack required — no partial zip.
+
+## [0.5.6] - 2026-07-22
+
+### Added
+
+- **Empty-region fallback:** If the live yellow box keeps fewer than the region min splat count
+  (or yields “No splats decoded”), rematerialize the full scene, omit the WASM region pin for
+  that run, and seed via `suggestRegion` — gizmo stays visible so the box can be moved and re-run.
+
+## [0.5.5] - 2026-07-22
+
+### Fixed
+
+- **Region ON→OFF spawn:** Selection region OFF no longer materializes from the cached yellow
+  box while omitting the WASM pin. Hide clears the region-clipped nav PLY cache (`voxel_global`
+  on next run). Cylinder spawn falls back to volume-center / deck when seed-near search fails;
+  regionless errors tell the user to re-enable Selection region.
+
+## [0.5.4] - 2026-07-22
+
+### Added
+
+- **Region stair headroom:** Enabling Selection region in voxel-collision mode expands Y
+  (−1 m footroom / +carve+4 m headroom) so stairs and upper landings fit the yellow box.
+- **Nav artifact zip:** After voxel nav, **Download nav artifacts** packs `collision.glb`,
+  `volume.meta.json`, `volume.solid.bin`, `volume.nav_region.bin`, `walkable_floors.glb`,
+  `nav_session.json`, and optional `recast.navmesh.bin` (see `navArtifactContract.ts`).
+- **Upload artifacts stub:** Disabled control documents the ingest filenames for a follow-on demo.
+
+### Changed
+
+- **Region OFF warning:** Voxel nav without a pinned region logs a coarsen/stairs warning;
+  carve-reach tip surfaces in status when `navMaxY` is well below the selection box top.
+
+## [0.5.3] - 2026-07-22
+
+### Fixed
+
+- **SS-parity spawn:** Chebyshev `findCylinderSpawn` (`isFreeAt` + solid footprint down-rays) with
+  dominant deck-Y band so SEED/PLAYER land on the main floor plate ([Oval Interior](https://superspl.at/scene/b7c8d8c5) reference).
+- **SS-parity stairs:** Solid `queryRay` ground probes (`groundProbeRange` 1 m) + capsule; click
+  navigate is XZ-only (no `isFloorCell` gate). Green overlay is debug-only.
+- **Carve reachability log:** Reports `nav_region` / floor-cell / region max Y after volume build.
+
+## [0.5.2] - 2026-07-22
+
+### Fixed
+
+- **Floor-cell walk surfaces:** Feet and ground probes use carved `isFloorCell` tops only (ignores
+  floating solid debris). Green overlay and feet share a one-voxel surface bias toward the painted
+  floor; capsule clearance still uses unbiased tops.
+- **Largest-floor spawn:** Player + SEED marker land on the largest same-level floor component in
+  the seed height band (not nearest free cell to box-center mid-capsule).
+- **Stair climb:** Step-up via floor-cell `groundYUnder`; capsule reject skipped while climbing;
+  blocked cancel softened and ignored while Y is rising.
+
+## [0.5.1] - 2026-07-22
+
+### Changed
+
+- **Voxel walk locomotion:** Replaced BFS floor-cell pathfinding with solid DDA `queryRay`, XZ
+  `navigateTo`, five-ray ground probes, and capsule slide (stairs via successive solid tops).
+- **Locomotion id:** `pc_voxel_walk` → `voxel_walk`; nav UI/logs no longer advertise third-party
+  product names for walk mode.
+- WASM collision summary log: `Collision carve:` (was product-branded).
+
+### Fixed
+
+- Player cube sits on probed solid tops (no cosmetic hover / green overlay lift on voxel walk).
+- Cylinder-style spawn near the collision seed (footprint down-rays → floor Y).
+
+## [0.5.0] - 2026-07-22
+
+### Added
+
+- **`collision_voxel_volume` capability:** `build_collision_voxel_boundary` accepts `emit_volume: true`
+  and returns packed dense `solid` + `nav_region` bitmasks (LSB-first) with `origin` / `dims` /
+  `voxel_size` for runtime walk.
+- **Voxel walk runtime:** Capsule walk on exported carve volume (default locomotion for voxel
+  collision). Recast crowd remains an either/or alternate that bakes from voxel spans.
+- **Recast-from-voxels:** When Recast crowd is selected, heightfield spans are built from carved
+  `nav_region` columns instead of re-rasterizing fragmented tread triangles.
+
+### Fixed
+
+- Stair connectivity no longer depends on triangle mesh → Recast double-voxelization.
+- Spawn fail-fast when seed/volume AABB misses the splat world bounds.
+
+## [0.4.15] - 2026-07-22
+
+### Fixed
+
+- **Transform alignment (critical):** WASM `splatwalk_oriented` vertices already coincide with
+  Babylon world when nav-PLY rotation matches the stream (`streamWorld * raw = env * R * flip(raw)`).
+  Removed the erroneous `env · inv(streamWorld)` overlay transform that was lifting green navmesh
+  and the player above the splat floor.
+- **Collider overlay default:** Cyan voxel collider is **shown by default** after nav (toggle still
+  available). Removed the incorrect “hidden while orbiting” copy.
+
+### Added
+
+- **Locomotion mode (voxel collision):** Choose **Recast crowd** (default) or **PC voxel walk**
+  (PlayCanvas / SuperSplat-style surface raycast without Recast crowd) — either/or, not a replacement.
+
+## [0.4.14] - 2026-07-22
+
+### Fixed
+
+- **Stairs (PC-style walk surfaces):** WASM `collision_mesh_mode` defaults to `walkable_floors` —
+  upward-facing floor + stair tread tops only (solid voxels bordering carved nav volume above).
+  Skips wall/ceiling obstacle shells that fragmented Recast into thin green shards.
+- **Post-nav freeze:** Nav session fully freezes streamed SOG LOD decode/downloads for the whole
+  session (like PC/SS walk mode). Removed per-frame camera observer and collider hide/show toggling.
+- **Spawn guard:** Player spawn is validated against splat world bounds; falls back to nearest
+  Recast point when oriented spawn drifts outside the scene.
+- **Coordinate transform:** Simplified world ↔ oriented mapping to `env · inv(streamWorld)` only
+  (no double-applied rotation/flip).
+
+## [0.4.13] - 2026-07-22
+
+### Fixed
+
+- **Spawn/nav aligned with splat (critical):** WASM outputs live in `splatwalk_oriented`
+  space but streamed SOG renders with mesh rotation in Babylon world space. Nav overlays,
+  seed marker, player agent, and click targets now transform oriented ↔ world via the
+  stream matrix. Selection region is always mapped world → oriented for WASM (fixes
+  player at bottom of yellow box while splat sits at top).
+- **Spawn at collision seed:** Player spawns at the collision seed snapped to navmesh
+  (PlayCanvas `findCylinderSpawn` parity), not at a random “most interior” triangle that
+  could land outside the scene.
+- **Stairs:** Removed voxel-path island filter that discarded stair Recast regions;
+  raised `walkableClimb` to 0.75 m on first Recast attempt.
+
+## [0.4.12] - 2026-07-22
+
+### Fixed
+
+- **Voxel nav quality:** Voxel collider Recast now uses the floor-sheet bake (skips ledge
+  filter that was shredding stairs into green shards). Tighter first-pass agent radius,
+  island filter near seed, indoor WASM defaults (fill 1.6, scene indoor), larger crop
+  margin on small regions, and expanded indoor recovery ladder (`bridge gaps`, smaller capsule).
+- **Large selection regions:** WASM region is padded to match materialize, filter-cluster
+  disables above 25 m footprint, and UI warns when the yellow box is too large.
+- **PC/SS click-to-move:** Clicks on splats, cyan collider shell, walls, and ceilings
+  raycast to a surface hit then snap to the nearest navmesh point (XZ projection like
+  SuperSplat walk mode) — no longer requires hitting fragile green debug triangles.
+- **Post-nav freeze:** Stream LOD decodes pause (`maxDecodesPerFrame = 0`) while the
+  camera orbits; crowd updates skip entirely during motion; lower resident budget floor.
+
+## [0.4.11] - 2026-07-22
+
+### Fixed
+
+- **Post-nav orbit stutter (streamed SOG):** After nav completes, camera motion no longer
+  competes as hard with `GaussianSplattingStream` LOD decode/eviction. A nav-session
+  runtime lowers resident budget, widens LOD distance, and hides the cyan collider overlay
+  while orbiting; crowd updates throttle under frame pressure.
+
+## [0.4.10] - 2026-07-21
+
+### fix
+
+- **Stair nav (Recast)**: Mesh obstacle solids facing PC-carved `nav_region` (upward floor normals for Recast) instead of the inverted nav-volume shell (downward normals, no walkable spans). Disables floor-sheet Recast shortcut for voxel colliders — pinned regions with small footprint were flattened to a single floor.
+- **PlayCanvas `--filter-cluster` parity**: Coarse 1 m splat connected-component filter before fine voxelize removes disconnected floater clusters that block stair carve BFS.
+- **Performance / UX**: Carve dilation emits progress; indoor collision recovery capped at two WASM retries; default collision voxel 0.05 m and scene type indoor.
+
+## [0.4.9] - 2026-07-21
+
+### fix
+
+- **WASM voxel collider mesh**: Crop navigable region to occupied bounds (+ 4-voxel margin) before boundary extraction. Meshes the full padded grid with exterior faces exposed at grid edges, producing a giant translucent box filled with voxel faces.
+- **Storage Adapter UI**: Voxel collider overlay toggle (cyan boundary), matching the navmesh overlay switch.
+
+## [0.4.8] - 2026-07-21
+
+### fix
+
+- **WASM voxel collision carve (PlayCanvas parity)**: Replace per-step `capsule_fits` BFS with PlayCanvas `carve.ts` pipeline — dilate solid obstacles, flood empty through dilated grid, dilate reachable empty, mesh navigable-volume boundary (`voxelFaces` style). Default voxel size 0.05 m; default carve radius 0.2 m. Removes post-voxel solid cluster trim (PC uses optional pre-voxel splat `--filter-cluster` instead).
+
+## [0.4.7] - 2026-07-21
+
+### fix
+
+- **WASM voxel collision (indoor/object)**: Re-enable seed-connected solid cluster filtering after voxelize. Without KNN splat prune, airborne floater voxels blocked capsule carve to stairs; cluster trim removes disconnected solid specks in O(voxels) instead of O(splats).
+
+## [0.4.6] - 2026-07-21
+
+### fix
+
+- **Storage Adapter voxel nav**: Floor-field Recast overrides (`walkableRadius` 0.35 m, etc.) no longer overwrite the voxel-collider Recast ladder — stairs were over-eroded. Region clip trims chunk overlap splats before PLY materialize; KNN prune auto-skips above 350k splats with a logged warning.
+- **Camera mode**: Fly ↔ Orbit switches preserve the current view instead of reframing to world bounds.
+- **Voxel collision clarity**: Logs and collider overlay text explain that click-to-move uses a green Recast mesh baked from the cyan voxel collider (not the floor-field path).
+
+## [0.4.5] - 2026-07-21
+
+### fix
+
+- **Voxel collision nav diagnostics**: Storage Adapter / `runNavFromVoxelCollider` now wires WASM worker progress and key parse/grid logs into the UI log panel (`parse`, `prune`, `collision_voxelize`, `collision_fill`, `collision_carve`, `collision_mesh`). Preflight `[INFO]` lines summarize PLY size, prune, region, and collision params before `build_collision_voxel_boundary` runs.
+
+`api_version` remains **2**.
+
+## [0.4.4] - 2026-07-21
+
+### fix
+
+- **WASM collision (`build_collision_voxel_boundary`)**: When `region_min` / `region_max` are pinned, indoor exterior fill no longer treats open grid faces as "real" exterior — fill is applied inside the selection volume instead of aborting with a false seed leak. Dense-grid coarsening no longer breaks early at `voxel_size >= 0.5` with an oversized grid; returns `region_too_large` when the capped region still exceeds 1.5M voxels at max coarseness.
+- **Voxel collision nav (TS)**: Exterior fill leak matches PlayCanvas / splat-transform — warn and continue to carve instead of throwing. Recovery ladder retries with object mode (no fill) when fill leak or seed blockage yields an empty collider.
+
+`api_version` remains **2** (no result-shape change).
+
+## [0.4.3] - 2026-07-21
+
+### fix
+
+- **WASM collision (`build_collision_voxel_boundary`)**: PlayCanvas / splat-transform parity fixes for large pinned regions — voxel grid is sized from `region_min` / `region_max` (plus exterior-fill pad) instead of the full materialized splat AABB, which previously forced coarse `collision_voxel_size` under the dense-grid cap and collapsed indoor stairs. Indoor / object scenes no longer run post-voxel filter-cluster (PC `writeVoxel` only filters splats at coarse resolution via CLI `--filter-cluster`, not after fine voxelize). Carve nearest-empty search radius matches PC capsule dilation. Collision grid diagnostics are populated on failure paths.
+- **Storage Adapter**: materialized-stream `getWasmRegionBounds()` passes gizmo coords directly (workbench parity). Voxel collision seed uses selection-box floor + half agent height when a region is pinned.
+
+`api_version` remains **2** (no result-shape change).
 
 ## [0.4.2] - 2026-07-10
 
