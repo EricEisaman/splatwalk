@@ -14,6 +14,7 @@ import {
     SceneLoader,
     StandardMaterial,
     Vector3,
+    VertexBuffer,
     VertexData,
 } from '@babylonjs/core';
 import type { AbstractEngine } from '@babylonjs/core/Engines/abstractEngine';
@@ -36,6 +37,8 @@ import {
     configureOrbitCamera,
     createFlyCameraFromView,
     createOrbitCameraFromView,
+    freeCameraEulerDegreesFromLookDirection,
+    syncFreeCameraTargetFromRotation,
     type DemoCameraMode,
     frameFlyCameraToScene,
     frameOrbitCameraToScene,
@@ -48,16 +51,35 @@ import {
 import {
     pickNavDebugMeshPoint,
     pickNavSurfacePoint,
-    resolveNavMoveTarget,
 } from '../navigation/navClickTarget';
 import {
     VoxelWalkController,
     VoxelWalkRuntime,
 } from '../navigation/voxelWalkRuntime';
+import type { NavKitControlsMode } from '../navigation/navKitContract';
+import { resolveNavKitCameraLook } from '../navigation/navKitPoseInfo';
+import {
+    controlsModeAllowsClick,
+    controlsModeAllowsWasd,
+    integratePlayerWasdMove,
+    isPlayerWasdSampleActive,
+    PLAYER_WASD_LOOKAHEAD_METERS,
+    PlayerWasdKeyTracker,
+    type PlayerWasdSample,
+} from '../navigation/playerWasdControls';
+import {
+    travelFacingYawFromAgent,
+    yawTowardPoint,
+} from '../navigation/playerTravelFacing';
+import {
+    PLAYER_MARKER_HALF_HEIGHT_M,
+    playerMarkerWedgeBuffers,
+} from '../navigation/playerMarkerGeometry';
+import type { NavMeshEditorRebakeResult, NavMeshEditorStatus } from '../navigation/navmeshEditor';
+import { NavMeshEditorBabylon } from './navMeshEditorBabylon';
 import type { CollisionVoxelVolume } from '../wasm/bridge';
 
-const AGENT_BOX_SIZE = 0.5;
-const AGENT_HALF_HEIGHT = AGENT_BOX_SIZE * 0.5;
+const AGENT_HALF_HEIGHT = PLAYER_MARKER_HALF_HEIGHT_M;
 const VOXEL_WALK_CLICK_RAY_MAX = 200;
 import type { GaussianSplattingStream } from '@babylonjs/loaders/SPLAT/gaussianSplattingStream';
 
@@ -438,6 +460,188 @@ export class Viewer {
         fly.rotation.x = view.eulerDegrees.x * degToRad;
         fly.rotation.y = view.eulerDegrees.y * degToRad;
         fly.rotation.z = view.eulerDegrees.z * degToRad;
+        syncFreeCameraTargetFromRotation(fly);
+        this.syncFlyKeysForControlsMode();
+    }
+
+    /**
+     * Apply NavKit camera pose (oriented eye + look-at or euler °) into the demo camera.
+     * Prefers explicit `target`; otherwise derives look from oriented Y-up euler.
+     */
+    public applyCameraPoseNavKit(view: {
+        readonly position: { readonly x: number; readonly y: number; readonly z: number };
+        readonly eulerDegrees?: {
+            readonly x: number;
+            readonly y: number;
+            readonly z: number;
+        };
+        readonly target?: {
+            readonly x: number;
+            readonly y: number;
+            readonly z: number;
+        };
+    }): void {
+        const look = resolveNavKitCameraLook({
+            eulerDegrees: view.eulerDegrees,
+            position: view.position,
+            target: view.target,
+        });
+        const preserved = {
+            position: new Vector3(look.position.x, look.position.y, look.position.z),
+            target: new Vector3(look.target.x, look.target.y, look.target.z),
+        };
+
+        this._orbitShiftDispose?.();
+        this._orbitShiftDispose = null;
+        this.camera.detachControl();
+        this.camera.dispose();
+        this._isFlyCamera = false;
+        this.camera = createOrbitCameraFromView(this.scene, 'camera', preserved);
+        const canvas = this.engine.getRenderingCanvas();
+        if (canvas) {
+            this._orbitShiftDispose = configureOrbitCamera(
+                this.camera as ArcRotateCamera,
+                canvas
+            );
+        }
+        this.scene.activeCamera = this.camera;
+    }
+
+    /** Active player input mode (click / WASDQE / both). */
+    public getControlsMode(): NavKitControlsMode {
+        return this._controlsMode;
+    }
+
+    /**
+     * Gate click-to-move vs player WASDQE. When WASD is on, prefer orbit and
+     * clear FreeCamera key bindings so agent keys win — unless
+     * `syncCameraForWasd` is false.
+     */
+    public setControlsMode(
+        mode: NavKitControlsMode,
+        options?: { readonly syncCameraForWasd?: boolean }
+    ): void {
+        this._controlsMode = mode;
+        const syncCameraForWasd = options?.syncCameraForWasd !== false;
+        if (controlsModeAllowsWasd(mode)) {
+            this._wasdKeys.attach();
+            if (syncCameraForWasd && this._isFlyCamera) {
+                this.setCameraMode('orbit', { preserveView: true });
+                console.log(
+                    '[INFO] Controls WASDQE: switched camera to orbit so W/A/S/D/Q/E drive the player.'
+                );
+            }
+            this.syncFlyKeysForControlsMode();
+        } else {
+            this._wasdKeys.detach();
+        }
+    }
+
+    /** Camera pose in world space for NavKit meta capture (pos + target + euler). */
+    public getCameraPoseNavKit(): {
+        position: { x: number; y: number; z: number };
+        target: { x: number; y: number; z: number };
+        eulerDegrees: { x: number; y: number; z: number };
+    } | null {
+        const cam = this.camera;
+        if (!cam) {
+            return null;
+        }
+        const radToDeg = 180 / Math.PI;
+        if (cam instanceof FreeCamera) {
+            syncFreeCameraTargetFromRotation(cam);
+            const t = cam.getTarget();
+            return {
+                position: { x: cam.position.x, y: cam.position.y, z: cam.position.z },
+                target: { x: t.x, y: t.y, z: t.z },
+                eulerDegrees: {
+                    x: cam.rotation.x * radToDeg,
+                    y: cam.rotation.y * radToDeg,
+                    z: cam.rotation.z * radToDeg,
+                },
+            };
+        }
+        if (cam instanceof ArcRotateCamera) {
+            const t = cam.getTarget();
+            const look = t.subtract(cam.position);
+            return {
+                position: { x: cam.position.x, y: cam.position.y, z: cam.position.z },
+                target: { x: t.x, y: t.y, z: t.z },
+                eulerDegrees: freeCameraEulerDegreesFromLookDirection(look),
+            };
+        }
+        return {
+            position: { x: cam.position.x, y: cam.position.y, z: cam.position.z },
+            target: { x: cam.position.x, y: cam.position.y, z: cam.position.z + 1 },
+            eulerDegrees: { x: 0, y: 0, z: 0 },
+        };
+    }
+
+    /** Player feet + yaw in oriented/nav space for NavKit meta capture. */
+    public getPlayerPoseNavKit(): {
+        position: { x: number; y: number; z: number };
+        eulerDegrees: { x: number; y: number; z: number };
+    } | null {
+        if (!this.userAgent) {
+            return null;
+        }
+        const p = this.userAgent.position();
+        return {
+            position: { x: p.x, y: p.y, z: p.z },
+            eulerDegrees: {
+                x: 0,
+                y: (this._playerYawRadians * 180) / Math.PI,
+                z: 0,
+            },
+        };
+    }
+
+    /**
+     * Snap / teleport Recast player (oriented/nav space) and set facing yaw (degrees).
+     */
+    public teleportPlayerTo(options: {
+        readonly position: { x: number; y: number; z: number };
+        readonly yawDegrees?: number;
+    }): void {
+        if (!this.userAgent) {
+            return;
+        }
+        const oriented = new Vector3(
+            options.position.x,
+            options.position.y,
+            options.position.z
+        );
+        const snapped = this.resolveValidatedOrientedSpawn(oriented);
+        this.userAgent.teleport(snapped);
+        // Clear residual pathing so travel-facing does not overwrite NavKit yaw.
+        this.userAgent.resetMoveTarget();
+        this._pendingClickFaceYaw = null;
+        this._pendingClickMoveTarget = null;
+        this._playerYawRadians =
+            ((options.yawDegrees ?? 0) * Math.PI) / 180;
+        this._suppressTravelFacingUntilInput = true;
+        if (this.userMesh) {
+            this.syncPlayerMeshYaw();
+            this.syncAgentMesh(this.userMesh, this.userAgent);
+        }
+    }
+
+    private syncFlyKeysForControlsMode(): void {
+        if (!(this.camera instanceof FreeCamera)) {
+            return;
+        }
+        if (controlsModeAllowsWasd(this._controlsMode)) {
+            this.camera.keysUp = [];
+            this.camera.keysDown = [];
+            this.camera.keysLeft = [];
+            this.camera.keysRight = [];
+            this.camera.keysUpward = [];
+            this.camera.keysDownward = [];
+            if (!this._clearedFlyKeysForWasd) {
+                this._clearedFlyKeysForWasd = true;
+                console.log('[INFO] Cleared FreeCamera WASD keys for player Controls.');
+            }
+        }
     }
 
     /**
@@ -916,8 +1120,32 @@ export class Viewer {
     private navMeshMaterial: StandardMaterial | null = null;
     private navMeshVisualOffset: Vector3 = Vector3.Zero();
     private navMeshSpawnPoint: Vector3 | null = null;
+    /** Oriented-space Recast debug mesh (editor source of truth). */
+    private _orientedNavPositions: Float32Array | null = null;
+    private _orientedNavIndices: Uint32Array | null = null;
+    private _navMeshData: Uint8Array | null = null;
+    private _navMeshEditor: NavMeshEditorBabylon | null = null;
+    private readonly _editedNavMeshRebakeListeners = new Set<
+        (
+            result: NavMeshEditorRebakeResult
+        ) => void | Promise<void>
+    >();
+    private _navMeshOverlayLiftY = 0.05;
     private pointerObserver: any = null;
     private crowdUpdateObserver: any = null;
+    private _controlsMode: NavKitControlsMode = 'both';
+    private readonly _wasdKeys = new PlayerWasdKeyTracker();
+    private _playerYawRadians = 0;
+    /**
+     * After teleport / NavKit restore, skip path/velocity travel-facing until
+     * the user clicks or uses WASD so saved yaw is not overwritten.
+     */
+    private _suppressTravelFacingUntilInput = false;
+    /** Swift click-face goal; pathing waits until this arrives. */
+    private _pendingClickFaceYaw: number | null = null;
+    /** Move target held until click-face completes (oriented/nav space). */
+    private _pendingClickMoveTarget: Vector3 | null = null;
+    private _clearedFlyKeysForWasd = false;
     private selectionMesh: Mesh | null = null;
     private gizmoManager: GizmoManager | null = null;
     private groundFieldOverlayMeshes: Mesh[] = [];
@@ -1498,6 +1726,196 @@ export class Viewer {
         }
     }
 
+    /** Latest Detour binary (updated after editor rebake). */
+    public getNavMeshData(): Uint8Array | null {
+        return this._navMeshData;
+    }
+
+    public setNavMeshData(data: Uint8Array | null): void {
+        this._navMeshData = data ? new Uint8Array(data) : null;
+    }
+
+    public getOrientedNavMeshBuffers(): {
+        positions: Float32Array;
+        indices: Uint32Array;
+    } | null {
+        if (!this._orientedNavPositions || !this._orientedNavIndices) {
+            return null;
+        }
+        return {
+            positions: this._orientedNavPositions,
+            indices: this._orientedNavIndices,
+        };
+    }
+
+    public isNavMeshEditorEnabled(): boolean {
+        return this._navMeshEditor?.session.enabled === true;
+    }
+
+    public getNavMeshEditorStatus(): NavMeshEditorStatus | null {
+        return this._navMeshEditor?.session.status() ?? null;
+    }
+
+    public onNavMeshEditorStatus(
+        listener: (status: NavMeshEditorStatus) => void
+    ): () => void {
+        this.ensureNavMeshEditor();
+        return this._navMeshEditor!.onStatus(listener);
+    }
+
+    /**
+     * Fired after an editor rebake updates Detour + overlay buffers.
+     * Hosts should refresh session navMeshData / NavKit artifact bundles here.
+     */
+    public onEditedNavMeshRebake(
+        listener: (
+            result: NavMeshEditorRebakeResult
+        ) => void | Promise<void>
+    ): () => void {
+        this._editedNavMeshRebakeListeners.add(listener);
+        return () => {
+            this._editedNavMeshRebakeListeners.delete(listener);
+        };
+    }
+
+    public async applyNavMeshEditorToLive(): Promise<boolean> {
+        this.ensureNavMeshEditor();
+        return this._navMeshEditor!.session.applyToLiveNavMesh();
+    }
+
+    public setNavMeshEditorEnabled(enabled: boolean): void {
+        this.ensureNavMeshEditor();
+        this._navMeshEditor!.setEnabled(enabled);
+        if (enabled) {
+            this._pendingClickFaceYaw = null;
+            this._pendingClickMoveTarget = null;
+            if (this.userAgent) {
+                this.userAgent.resetMoveTarget();
+            }
+        }
+    }
+
+    public setNavMeshEditorMode(mode: 'vertex' | 'circle' | 'global'): void {
+        this.ensureNavMeshEditor();
+        this._navMeshEditor!.session.setMode(mode);
+    }
+
+    public navMeshEditorGlobalY(steps: number): void {
+        this.ensureNavMeshEditor();
+        this._navMeshEditor!.session.globalY(steps);
+    }
+
+    public navMeshEditorFillHole(): boolean {
+        this.ensureNavMeshEditor();
+        return this._navMeshEditor!.session.fillHolesUnderBrush() > 0;
+    }
+
+    public async navMeshEditorDeleteVertices(): Promise<boolean> {
+        this.ensureNavMeshEditor();
+        return this._navMeshEditor!.session.deleteSelectedVerticesAndApply();
+    }
+
+    private ensureNavMeshEditor(): void {
+        if (this._navMeshEditor) {
+            return;
+        }
+        this._navMeshEditor = new NavMeshEditorBabylon({
+            scene: this.scene,
+            getOrientedNavMeshBuffers: () => this.getOrientedNavMeshBuffers(),
+            refreshNavMeshOverlayFromOriented: (positions, indices, options) => {
+                void this.refreshNavMeshOverlayFromOriented(
+                    positions,
+                    indices,
+                    options
+                );
+            },
+            applyEditedNavMeshRebake: (result) => this.applyEditedNavMeshRebake(result),
+            orientedPointToWorld: (p) =>
+                this.orientedNavPointToWorld(new Vector3(p.x, p.y, p.z)),
+            worldPointToOriented: (p) => {
+                const o = this.worldNavPointToOriented(p);
+                return { x: o.x, y: o.y, z: o.z };
+            },
+        });
+    }
+
+    public async refreshNavMeshOverlayFromOriented(
+        positions: Float32Array,
+        indices: Uint32Array,
+        options?: { readonly topologyChanged?: boolean }
+    ): Promise<void> {
+        this._orientedNavPositions = new Float32Array(positions);
+        this._orientedNavIndices = new Uint32Array(indices);
+        const topologyChanged = options?.topologyChanged !== false;
+        const canUpdateInPlace =
+            !topologyChanged &&
+            this.navMeshDebugMesh &&
+            !this.navMeshDebugMesh.isDisposed() &&
+            this.navMeshDebugMesh.getTotalVertices() ===
+                Math.floor(positions.length / 3);
+        if (canUpdateInPlace && this.navMeshDebugMesh) {
+            const worldPositions = this.transformOrientedPositionsToWorld(positions);
+            this.navMeshDebugMesh.updateVerticesData(
+                VertexBuffer.PositionKind,
+                worldPositions,
+                false,
+                false
+            );
+            this.navMeshDebugMesh.refreshBoundingInfo();
+            return;
+        }
+        const lift = this._navMeshOverlayLiftY;
+        const offsetY = this.navMeshVisualOffset.y - lift;
+        await this.displayNavMesh(positions, indices, offsetY, null, lift);
+    }
+
+    public async applyEditedNavMeshRebake(
+        result: NavMeshEditorRebakeResult
+    ): Promise<void> {
+        const pose = this.capturePlayerPose();
+        this._navMeshData = new Uint8Array(result.navMeshData);
+        this._orientedNavPositions = new Float32Array(result.debugPositions);
+        this._orientedNavIndices = new Uint32Array(result.debugIndices);
+        const lift = this._navMeshOverlayLiftY;
+        const offsetY = this.navMeshVisualOffset.y - lift;
+        await this.displayNavMesh(
+            result.debugPositions,
+            result.debugIndices,
+            offsetY,
+            null,
+            lift
+        );
+        await this.initCrowd(result.navMeshData, pose?.position ?? null);
+        if (pose) {
+            this.teleportPlayerTo({
+                position: pose.position,
+                yawDegrees: pose.yawDegrees,
+            });
+        }
+        // Session buffers already updated by applyToLiveNavMesh / runRebake.
+        for (const listener of this._editedNavMeshRebakeListeners) {
+            try {
+                await listener(result);
+            } catch (err) {
+                console.warn('[WARN] onEditedNavMeshRebake listener failed:', err);
+            }
+        }
+    }
+
+    private capturePlayerPose(): {
+        position: Vector3;
+        yawDegrees: number;
+    } | null {
+        if (!this.userAgent) {
+            return null;
+        }
+        const p = this.userAgent.position();
+        return {
+            position: new Vector3(p.x, p.y, p.z),
+            yawDegrees: (this._playerYawRadians * 180) / Math.PI,
+        };
+    }
+
     private applyAlphaOpacity(material: StandardMaterial, alpha: number): void {
         material.alpha = alpha;
         material.transparencyMode = alpha < 1 ? Material.MATERIAL_ALPHABLEND : Material.MATERIAL_OPAQUE;
@@ -1665,6 +2083,10 @@ export class Viewer {
     ): Promise<Vector3 | null> {
         this.clearNavMeshOverlay();
 
+        this._orientedNavPositions = new Float32Array(positions);
+        this._orientedNavIndices = new Uint32Array(indices);
+        this._navMeshOverlayLiftY = overlayLiftY;
+
         const orientedSpawn = this.resolveOrientedNavSpawn(positions, indices, seedOriented);
         this.navMeshSpawnPoint = orientedSpawn;
         const worldPositions = this.transformOrientedPositionsToWorld(positions);
@@ -1793,6 +2215,7 @@ export class Viewer {
         await initRecast();
 
         this.destroyCrowdSimulation();
+        this._navMeshData = new Uint8Array(navMeshData);
 
         const { navMesh } = importNavMesh(navMeshData);
         this.recastNavMesh = navMesh;
@@ -1822,10 +2245,11 @@ export class Viewer {
             maxSpeed: 5.0,
         });
 
-        this.userMesh = Mesh.CreateBox("user_agent", 0.5, this.scene);
+        this.userMesh = this.createPlayerMarkerMesh('user_agent');
         const userMat = new StandardMaterial("user_mat", this.scene);
         userMat.diffuseColor = new Color3(0, 0, 1);
         this.userMesh.material = userMat;
+        this.syncPlayerMeshYaw();
         this.attachMarkerLabel(this.userMesh, "PLAYER", new Color3(0.1, 0.5, 1.0));
         this.syncAgentMesh(this.userMesh, this.userAgent);
         const spawnWorld = this.orientedNavPointToWorld(orientedSpawn);
@@ -1834,10 +2258,15 @@ export class Viewer {
             `(oriented ${orientedSpawn.x.toFixed(3)}, ${orientedSpawn.y.toFixed(3)}, ${orientedSpawn.z.toFixed(3)}).`
         );
 
-        // HEAD click-to-move: pick the green navmesh overlay, undo visual Y lift,
-        // map world→oriented when stream visual is decoupled (identity on Vuetify PLY).
+        // Click-to-move: pick green navmesh overlay (gated by Controls mode).
         this.pointerObserver = this.scene.onPointerObservable.add((pointerInfo) => {
             if (pointerInfo.type !== PointerEventTypes.POINTERTAP || !this.userAgent) {
+                return;
+            }
+            if (this.isNavMeshEditorEnabled()) {
+                return;
+            }
+            if (!controlsModeAllowsClick(this._controlsMode)) {
                 return;
             }
 
@@ -1852,25 +2281,81 @@ export class Viewer {
 
             const picked = pickResult.pickedPoint.subtract(this.navMeshVisualOffset);
             const target = this.worldNavPointToOriented(picked);
-            this.userAgent.requestMoveTarget(target);
+            // Face toward target in place first; start pathing only after arrive.
+            this.userAgent.resetMoveTarget();
+            const pos = this.userAgent.position();
+            const clickYaw = yawTowardPoint(pos, {
+                x: target.x,
+                y: target.y,
+                z: target.z,
+            });
+            if (clickYaw === null) {
+                this._pendingClickFaceYaw = null;
+                this._pendingClickMoveTarget = null;
+                this.userAgent.requestMoveTarget(target);
+            } else {
+                this._pendingClickFaceYaw = clickYaw;
+                this._pendingClickMoveTarget = target.clone();
+            }
+            this._suppressTravelFacingUntilInput = false;
             console.log(`[Viewer] User move target: ${target.toString()}`);
         });
 
-        // Update loop for crowd
+        this._wasdKeys.attach();
+        this.setControlsMode(this._controlsMode);
+
+        // Update loop for crowd + WASDQE + click travel facing
         this.crowdUpdateObserver = this.scene.onBeforeRenderObservable.add(() => {
             if (this.crowd) {
                 if (this.navSessionRuntime?.shouldSkipCrowdUpdate()) {
                     return;
                 }
                 const delta = this.engine.getDeltaTime() / 1000;
+                const wasdSample = this._wasdKeys.sample();
+                const wasdActive = isPlayerWasdSampleActive(wasdSample);
+                this.tickPlayerWasd(delta, wasdSample);
                 this.crowd.update(delta);
 
-                // Sync user mesh
                 if (this.userMesh && this.userAgent) {
+                    if (wasdActive) {
+                        this._pendingClickFaceYaw = null;
+                        this._pendingClickMoveTarget = null;
+                        this._suppressTravelFacingUntilInput = false;
+                    } else if (
+                        !this._suppressTravelFacingUntilInput &&
+                        controlsModeAllowsClick(this._controlsMode)
+                    ) {
+                        const velocity = this.userAgent.velocity();
+                        const position = this.userAgent.position();
+                        let nextTarget: { x: number; y: number; z: number } | null =
+                            null;
+                        try {
+                            nextTarget = this.userAgent.nextTargetInPath();
+                        } catch {
+                            nextTarget = null;
+                        }
+                        const facing = travelFacingYawFromAgent({
+                            velocity,
+                            position,
+                            nextTarget,
+                            currentYaw: this._playerYawRadians,
+                            dt: delta,
+                            clickFaceYaw: this._pendingClickFaceYaw,
+                        });
+                        this._playerYawRadians = facing.yawRadians;
+                        if (facing.clearClickFace) {
+                            this._pendingClickFaceYaw = null;
+                            const pending = this._pendingClickMoveTarget;
+                            this._pendingClickMoveTarget = null;
+                            if (pending) {
+                                this.userAgent.requestMoveTarget(pending);
+                            }
+                        }
+                    }
                     this.syncAgentMesh(this.userMesh, this.userAgent);
+                    this.syncPlayerMeshYaw();
                 }
 
-                // Sync NPC meshes
                 for (let i = 0; i < this.npcMeshes.length; i++) {
                     const agent = this.npcAgents[i];
                     if (agent) {
@@ -1880,7 +2365,37 @@ export class Viewer {
             }
         });
 
-        console.log('[SUCCESS] Crowd simulation initialized. Click the green navmesh to move the blue player agent.');
+        console.log(
+            '[SUCCESS] Crowd simulation initialized. Use Controls (click / WASDQE / both) to move the player.'
+        );
+    }
+
+    private tickPlayerWasd(delta: number, sample: PlayerWasdSample): void {
+        if (!this.userAgent || !controlsModeAllowsWasd(this._controlsMode)) {
+            return;
+        }
+        if (!isPlayerWasdSampleActive(sample)) {
+            return;
+        }
+        const moved = integratePlayerWasdMove({
+            dt: delta,
+            sample,
+            yawRadians: this._playerYawRadians,
+        });
+        this._playerYawRadians = moved.yawRadians;
+        const len = Math.hypot(moved.moveX, moved.moveZ);
+        if (len < 1e-6) {
+            return;
+        }
+        const pos = this.userAgent.position();
+        const scale = PLAYER_WASD_LOOKAHEAD_METERS / len;
+        const target = new Vector3(
+            pos.x + moved.moveX * scale,
+            pos.y,
+            pos.z + moved.moveZ * scale
+        );
+        const snapped = this.resolveValidatedOrientedSpawn(target);
+        this.userAgent.requestMoveTarget(snapped);
     }
 
     /**
@@ -1933,10 +2448,11 @@ export class Viewer {
         this.navMeshVisualOffset = Vector3.Zero();
         this.displaySeedMarkerWorld(feet);
 
-        this.userMesh = Mesh.CreateBox('user_agent', AGENT_BOX_SIZE, this.scene);
+        this.userMesh = this.createPlayerMarkerMesh('user_agent');
         const userMat = new StandardMaterial('user_mat', this.scene);
         userMat.diffuseColor = new Color3(0, 0, 1);
         this.userMesh.material = userMat;
+        this.syncPlayerMeshYaw();
         this.userMesh.position.set(feet[0], feet[1] + AGENT_HALF_HEIGHT, feet[2]);
         this.attachMarkerLabel(this.userMesh, 'PLAYER', new Color3(0.1, 0.5, 1.0));
 
@@ -2235,6 +2751,20 @@ export class Viewer {
         return null;
     }
 
+    /** Blue player solid: triangular wedge, tip = forward (+Z at yaw 0). */
+    private createPlayerMarkerMesh(name: string): Mesh {
+        const mesh = new Mesh(name, this.scene);
+        const { positions, indices } = playerMarkerWedgeBuffers();
+        const normals = new Float32Array(positions.length);
+        VertexData.ComputeNormals(positions, indices, normals);
+        const vertexData = new VertexData();
+        vertexData.positions = Array.from(positions);
+        vertexData.indices = Array.from(indices);
+        vertexData.normals = Array.from(normals);
+        vertexData.applyToMesh(mesh);
+        return mesh;
+    }
+
     private syncAgentMesh(mesh: AbstractMesh, agent: CrowdAgent): void {
         const pos = agent.position();
         const oriented = new Vector3(pos.x, pos.y, pos.z);
@@ -2244,6 +2774,17 @@ export class Viewer {
             world.y + this.navMeshVisualOffset.y + AGENT_HALF_HEIGHT,
             world.z + this.navMeshVisualOffset.z
         );
+    }
+
+    /**
+     * Apply oriented-space yaw to the player mesh (tip +Z at yaw 0).
+     * `rotation.y = +yaw` matches WASD / NavKit `playerEulerDeg.y` (no sign flip).
+     */
+    private syncPlayerMeshYaw(): void {
+        if (!this.userMesh) {
+            return;
+        }
+        this.userMesh.rotation.y = this._playerYawRadians;
     }
 
     private cleanupCrowdObservers(): void {
@@ -2264,6 +2805,7 @@ export class Viewer {
 
     private destroyCrowdSimulation(): void {
         this.cleanupCrowdObservers();
+        this._wasdKeys.detach();
 
         if (this.crowd) {
             this.crowd.destroy();
@@ -2298,6 +2840,13 @@ export class Viewer {
     private resetDerivedSceneState(): void {
         this.stopNavSessionRuntime();
         this.destroyCrowdSimulation();
+        if (this._navMeshEditor) {
+            this._navMeshEditor.dispose();
+            this._navMeshEditor = null;
+        }
+        this._orientedNavPositions = null;
+        this._orientedNavIndices = null;
+        this._navMeshData = null;
 
         if (this.seedMarker) {
             this.seedMarker.dispose();

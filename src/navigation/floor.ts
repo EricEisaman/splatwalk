@@ -104,13 +104,12 @@ export const DEFAULT_MAX_NAV_CELLS = 1_000_000;
  *
  * Follows the standard Recast guideline that `cs` belongs in
  * `[agentRadius / 3, agentRadius / 2]`, and within that window picks the FINEST
- * cell size whose grid (`width/cs * depth/cs`) still fits under `maxCells`. This
- * keeps coverage of a large scene complete (the grid is bounded by a cell budget
- * instead of a fixed small `cs` that either truncates the area or explodes the
- * voxel count) while never going finer/coarser than the agent radius warrants.
+ * cell size whose grid (`width/cs * depth/cs`) still fits under `maxCells`.
+ * Allows `cs > agentRadius / 2` only when the cell budget requires it (unpinned
+ * huge scenes). Seed-centered ~100 m outdoor pins stay in the guideline band.
  *
  * `agentRadiusM` is the agent radius in metres; with the gaming-standard 0.5 m
- * agent this yields `cs` in `[0.167, 0.25]`.
+ * agent the guideline band is `cs` in `[0.167, 0.25]`.
  */
 export function autoNavCellSize(
   widthM: number,
@@ -124,6 +123,9 @@ export function autoNavCellSize(
   const area = Math.max(0, widthM) * Math.max(0, depthM);
   // cs such that (width/cs) * (depth/cs) <= maxCells  =>  cs >= sqrt(area / maxCells)
   const budgetCs = maxCells > 0 && area > 0 ? Math.sqrt(area / maxCells) : finest;
+  if (budgetCs > coarsest) {
+    return budgetCs;
+  }
   return Math.min(coarsest, Math.max(finest, budgetCs));
 }
 

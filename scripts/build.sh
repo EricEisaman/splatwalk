@@ -87,10 +87,15 @@ echo "==========================================================="
 CORE_DIR="node_modules/@splatwalk/core"
 if [ -d "$CORE_DIR" ]; then
   cp -f "pkg/wasm_splatwalk/wasm_splatwalk.js" "$CORE_DIR/wasm_splatwalk.js"
-  cp -f "pkg/wasm_splatwalk/wasm_splatwalk.d.ts" "$CORE_DIR/wasm_splatwalk.d.ts"
   cp -f "pkg/wasm_splatwalk/wasm_splatwalk_bg.wasm" "$CORE_DIR/wasm_splatwalk_bg.wasm"
   if [ -f "pkg/wasm_splatwalk/wasm_splatwalk_bg.wasm.d.ts" ]; then
     cp -f "pkg/wasm_splatwalk/wasm_splatwalk_bg.wasm.d.ts" "$CORE_DIR/wasm_splatwalk_bg.wasm.d.ts"
+  fi
+  # Prefer hand-authored API typings (serde result shapes) over wasm-bindgen stubs.
+  if [ -f "package/wasm_splatwalk.d.ts" ]; then
+    cp -f "package/wasm_splatwalk.d.ts" "$CORE_DIR/wasm_splatwalk.d.ts"
+  else
+    cp -f "pkg/wasm_splatwalk/wasm_splatwalk.d.ts" "$CORE_DIR/wasm_splatwalk.d.ts"
   fi
   echo "✓ Synced pkg/wasm_splatwalk → $CORE_DIR (floor.js left as published package)"
 else

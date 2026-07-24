@@ -26,8 +26,8 @@ Then open the demo route:
 
 - http://localhost:5173/react
 
-Use **Download FastNav kit** for `splatwalk-fastnav-r3f.zip` (`INTEGRATE.md` +
-source glue; pin `@splatwalk/core@0.6.4`). The WebGPU/WebGL control is shown for
+Use **Download FastNav Component Pack** for `splatwalk-fastnav-r3f.zip` (`INTEGRATE.md` +
+source glue; pin `@splatwalk/core@0.6.10`). The WebGPU/WebGL control is shown for
 parity with Babylon demos; WebGPU is disabled because this path uses Three.js
 WebGL (`gaussian-splats-3d`).
 

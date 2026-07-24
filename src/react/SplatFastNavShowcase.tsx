@@ -8,12 +8,15 @@ import Button from '@mui/material/Button';
 import Chip from '@mui/material/Chip';
 import CircularProgress from '@mui/material/CircularProgress';
 import Container from '@mui/material/Container';
+import FormControl from '@mui/material/FormControl';
 import FormControlLabel from '@mui/material/FormControlLabel';
 import Grid from '@mui/material/Grid';
 import IconButton from '@mui/material/IconButton';
+import InputLabel from '@mui/material/InputLabel';
 import Menu from '@mui/material/Menu';
 import MenuItem from '@mui/material/MenuItem';
 import Paper from '@mui/material/Paper';
+import Select from '@mui/material/Select';
 import Slider from '@mui/material/Slider';
 import Snackbar from '@mui/material/Snackbar';
 import Stack from '@mui/material/Stack';
@@ -26,6 +29,7 @@ import ArrowDropDownIcon from '@mui/icons-material/ArrowDropDown';
 import AutorenewIcon from '@mui/icons-material/Autorenew';
 import CheckCircleIcon from '@mui/icons-material/CheckCircle';
 import CloudUploadIcon from '@mui/icons-material/CloudUpload';
+import ContentCopyIcon from '@mui/icons-material/ContentCopy';
 import DownloadIcon from '@mui/icons-material/Download';
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
 import FolderOpenIcon from '@mui/icons-material/FolderOpen';
@@ -33,15 +37,27 @@ import FullscreenIcon from '@mui/icons-material/Fullscreen';
 import FullscreenExitIcon from '@mui/icons-material/FullscreenExit';
 import LayersIcon from '@mui/icons-material/Layers';
 import LayersClearIcon from '@mui/icons-material/LayersClear';
+import PersonIcon from '@mui/icons-material/Person';
 import PersonPinCircleIcon from '@mui/icons-material/PersonPinCircle';
+import PhotoCameraIcon from '@mui/icons-material/PhotoCamera';
 import RadioButtonUncheckedIcon from '@mui/icons-material/RadioButtonUnchecked';
 import RefreshIcon from '@mui/icons-material/Refresh';
 import ViewInArIcon from '@mui/icons-material/ViewInAr';
 
+import {
+  ACTIVE_NAVIGATION_MODE_OPTIONS,
+  liveNavBackendLabel,
+  type ActiveNavigationMode,
+} from '@/navigation/activeNavigation';
+import type { NavKitControlsMode } from '@/navigation/navKitContract';
+import {
+  DEMO_NAV_FLOOR_SLIDER_FIELDS,
+  DEMO_NAV_RECAST_SLIDER_FIELDS,
+  type DemoNavSettings,
+} from '@/navigation/navSettings';
 import { SceneCanvas } from '@/react/SceneCanvas';
 import { DEFAULT_EXAMPLE_SCENES } from '@/react/exampleScenes';
 import { useSplatFastNavR3F, type LogTag, type SogExportMode } from '@/react/useSplatFastNavR3F';
-import type { DemoNavSettings } from '@/navigation/navSettings';
 import { downloadIntegrationKit } from '@/utils/downloadIntegrationKit';
 import {
   clampSliceSettingsForScene,
@@ -50,34 +66,6 @@ import {
 } from '@/wasm/sogTypes';
 
 type NavSettingKey = keyof DemoNavSettings;
-
-interface NavSliderSpec {
-  readonly key: Exclude<NavSettingKey, 'pruneFloaters'>;
-  readonly label: string;
-  readonly min: number;
-  readonly max: number;
-  readonly step: number;
-  readonly color?: 'primary' | 'secondary' | 'success' | 'warning';
-}
-
-const FLOOR_SLIDERS: readonly NavSliderSpec[] = [
-  { key: 'sameLevelBelow', label: 'Band below (m)', min: 0.25, max: 4, step: 0.05 },
-  { key: 'sameLevelAbove', label: 'Band above (m)', min: 0.3, max: 4, step: 0.05 },
-  { key: 'holeFillRadius', label: 'Hole fill (cells)', min: 0, max: 8, step: 1 },
-  { key: 'sdfCellSize', label: 'SDF cell (m)', min: 0.1, max: 0.4, step: 0.01, color: 'secondary' },
-  { key: 'sdfDensityThreshold', label: 'Density thresh', min: 0.01, max: 0.12, step: 0.005, color: 'secondary' },
-  { key: 'maxLocalHeightVariance', label: 'Height variance', min: 0.08, max: 0.6, step: 0.02, color: 'secondary' },
-];
-
-const RECAST_SLIDERS: readonly NavSliderSpec[] = [
-  { key: 'walkableSlopeAngle', label: 'Max slope (°)', min: 30, max: 70, step: 1, color: 'success' },
-  { key: 'walkableRadius', label: 'Agent radius (m)', min: 0.15, max: 0.6, step: 0.05, color: 'success' },
-  { key: 'walkableClimb', label: 'Max climb (m)', min: 0.25, max: 1, step: 0.05, color: 'success' },
-  { key: 'minRegionArea', label: 'Min region', min: 0, max: 24, step: 1, color: 'success' },
-  { key: 'maxIslandSeedDistance', label: 'Island↔seed max (m)', min: 6, max: 200, step: 2, color: 'warning' },
-  { key: 'cellBandBelow', label: 'Cell band − (m)', min: 0.5, max: 4, step: 0.1 },
-  { key: 'cellBandAbove', label: 'Cell band + (m)', min: 0.45, max: 4, step: 0.1 },
-];
 
 const tagColor: Record<LogTag, 'info' | 'warning' | 'error' | 'success' | 'secondary'> = {
   info: 'info',
@@ -106,22 +94,43 @@ export function SplatFastNavShowcase(): JSX.Element {
     loadAndProcess,
     loadExample,
     exportNavmesh,
+    downloadNavKit,
     downloadNavArtifacts,
     uploadNavArtifacts,
     hasNavArtifactBundle,
+    hasNavKit,
     navArtifactUploadHint,
+    navKitUploadHint,
     cameraSelectOffsets,
     setCameraSelectOffsets,
     resetCameraSelectOffsets,
+    cameraInfo,
+    cameraInfoCopyText,
+    copyCameraPose,
+    setCameraInfoPanelOpen,
+    playerInfo,
+    playerInfoCopyText,
+    copyPlayerPose,
+    setPlayerInfoPanelOpen,
     applySelectRegionFromCamera,
     generateCollisionBoundary,
     exportCollisionMesh,
     setCollisionBoundaryVisible,
+    hasCollisionBoundary,
     setNavMeshVisible,
+    setNavMeshEditorEnabled,
+    setNavMeshEditorMode,
+    navMeshEditorGlobalY,
+    navMeshEditorFillHole,
+    navMeshEditorDeleteVertices,
+    applyNavMeshEditorToLive,
+    onNavMeshEditorStatus,
     goToPlayer,
+    topDownViewApplied,
     exportSog,
     applyEnvironmentScale,
-    setPendingEnvironmentScale,
+    applyScaleMultiplier,
+    sessionEnvironmentScale,
     navSettings,
     setNavSettings,
     resetNavSettings,
@@ -132,6 +141,17 @@ export function SplatFastNavShowcase(): JSX.Element {
     selectionRegionVisible,
     setSelectionRegionVisible,
     rerunFastNav,
+    navGenerationMode,
+    setNavGenerationMode,
+    collisionSceneType,
+    setCollisionSceneType,
+    activeNavigationMode,
+    setActiveNavigationMode,
+    activeNavigationModeDisabledReason,
+    controlsMode,
+    setControlsMode,
+    controlsWasdLegend,
+    liveBackend,
     reset,
   } = nav;
 
@@ -141,6 +161,120 @@ export function SplatFastNavShowcase(): JSX.Element {
   const [isDragging, setIsDragging] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [exampleAnchor, setExampleAnchor] = useState<null | HTMLElement>(null);
+  const [navMeshEditorEnabled, setNavMeshEditorEnabledState] = useState(false);
+  const [navMeshEditorMode, setNavMeshEditorModeState] = useState<
+    'vertex' | 'circle' | 'global'
+  >('circle');
+  const [navMeshEditorStatusText, setNavMeshEditorStatusText] = useState('Off');
+  const [navMeshEditorHoleReady, setNavMeshEditorHoleReady] = useState(false);
+  const [navMeshEditorDeleteReady, setNavMeshEditorDeleteReady] = useState(false);
+  const [navMeshEditorPendingApply, setNavMeshEditorPendingApply] = useState(false);
+  const [navMeshEditorApplying, setNavMeshEditorApplying] = useState(false);
+  const [cameraInfoExpanded, setCameraInfoExpanded] = useState(false);
+  const [playerInfoExpanded, setPlayerInfoExpanded] = useState(false);
+  const [cameraInfoCopied, setCameraInfoCopied] = useState(false);
+  const [playerInfoCopied, setPlayerInfoCopied] = useState(false);
+
+  const cameraPositionLabel = useMemo(() => {
+    const p = cameraInfo.position;
+    return `${p.x.toFixed(3)}, ${p.y.toFixed(3)}, ${p.z.toFixed(3)}`;
+  }, [cameraInfo.position]);
+
+  const cameraEulerLabel = useMemo(() => {
+    const e = cameraInfo.eulerDegrees;
+    return `X ${e.x.toFixed(1)}° · Y ${e.y.toFixed(1)}° · Z ${e.z.toFixed(1)}°`;
+  }, [cameraInfo.eulerDegrees]);
+
+  const playerPositionLabel = useMemo(() => {
+    if (!playerInfo.available) {
+      return '—';
+    }
+    const p = playerInfo.position;
+    return `${p.x.toFixed(3)}, ${p.y.toFixed(3)}, ${p.z.toFixed(3)}`;
+  }, [playerInfo]);
+
+  const playerYawLabel = useMemo(() => {
+    if (!playerInfo.available) {
+      return '—';
+    }
+    return `${playerInfo.eulerDegrees.y.toFixed(1)}°`;
+  }, [playerInfo]);
+
+  useEffect(() => {
+    setCameraInfoPanelOpen(cameraInfoExpanded);
+  }, [cameraInfoExpanded, setCameraInfoPanelOpen]);
+
+  useEffect(() => {
+    setPlayerInfoPanelOpen(playerInfoExpanded);
+  }, [playerInfoExpanded, setPlayerInfoPanelOpen]);
+
+  useEffect(() => {
+    return () => {
+      setCameraInfoPanelOpen(false);
+      setPlayerInfoPanelOpen(false);
+    };
+  }, [setCameraInfoPanelOpen, setPlayerInfoPanelOpen]);
+
+  const onCopyCameraPose = useCallback(async (): Promise<void> => {
+    const ok = await copyCameraPose();
+    if (!ok) {
+      return;
+    }
+    setCameraInfoCopied(true);
+    window.setTimeout(() => setCameraInfoCopied(false), 1600);
+  }, [copyCameraPose]);
+
+  const onCopyPlayerPose = useCallback(async (): Promise<void> => {
+    const ok = await copyPlayerPose();
+    if (!ok) {
+      return;
+    }
+    setPlayerInfoCopied(true);
+    window.setTimeout(() => setPlayerInfoCopied(false), 1600);
+  }, [copyPlayerPose]);
+
+  useEffect(() => {
+    return onNavMeshEditorStatus((st) => {
+      if (!st.enabled) {
+        setNavMeshEditorStatusText('Off');
+        setNavMeshEditorHoleReady(false);
+        setNavMeshEditorDeleteReady(false);
+        setNavMeshEditorPendingApply(false);
+        setNavMeshEditorApplying(false);
+        return;
+      }
+      setNavMeshEditorModeState(st.mode);
+      const parts = [
+        st.mode,
+        st.brushFollow ? 'follow' : 'pinned',
+        `${st.selectedCount} sel`,
+        `r=${st.brushRadius.toFixed(2)}`,
+      ];
+      if (st.holeDetected) {
+        parts.push('hole');
+      }
+      if (st.hasPendingLiveApply) {
+        parts.push('pending apply');
+      }
+      if (st.rebaking) {
+        parts.push('applying…');
+      }
+      if (st.message) {
+        parts.push(st.message);
+      }
+      setNavMeshEditorStatusText(parts.join(' · '));
+      setNavMeshEditorHoleReady(
+        st.mode === 'circle' && st.holeDetected && !st.rebaking
+      );
+      setNavMeshEditorDeleteReady(
+        (st.mode === 'vertex' || st.mode === 'circle') &&
+          st.selectedCount > 0 &&
+          !st.rebaking
+      );
+      setNavMeshEditorPendingApply(st.hasPendingLiveApply);
+      setNavMeshEditorApplying(st.rebaking);
+    });
+  }, [onNavMeshEditorStatus]);
 
   const updateNavSetting = useCallback(
     (key: Exclude<NavSettingKey, 'pruneFloaters'>, value: number): void => {
@@ -214,9 +348,9 @@ export function SplatFastNavShowcase(): JSX.Element {
       { label: 'Load splat', active: status === 'loading', done: loadDone },
       { label: pruneLabel, active: pruneActive, done: pruneDone || navDone },
       { label: 'FAST NAV', active: navActive, done: navDone },
-      { label: 'Top-down view', active: false, done: navDone },
+      { label: 'Top-down view', active: false, done: topDownViewApplied },
     ];
-  }, [status, phase, progressText, pruneFloaters]);
+  }, [status, phase, progressText, pruneFloaters, topDownViewApplied]);
 
   const sogStatusText = useMemo(() => {
     if (sogSummary) return sogSummary;
@@ -238,18 +372,26 @@ export function SplatFastNavShowcase(): JSX.Element {
   const pickFile = useCallback(
     (file: File | null | undefined): void => {
       if (!file) return;
-      setPendingEnvironmentScale(Number(environmentScale));
+      const factor = Number(environmentScale);
+      if (Number.isFinite(factor) && factor > 0) {
+        applyScaleMultiplier(factor);
+        setEnvironmentScale(1);
+      }
       void loadAndProcess(file);
     },
-    [environmentScale, loadAndProcess, setPendingEnvironmentScale]
+    [applyScaleMultiplier, environmentScale, loadAndProcess]
   );
 
   const onLoadExample = useCallback(
-    (url: string, title: string): void => {
-      setPendingEnvironmentScale(Number(environmentScale));
-      void loadExample(url, title);
+    (url: string, title: string, collisionSceneType: 'indoor' | 'outdoor' = 'indoor'): void => {
+      const factor = Number(environmentScale);
+      if (Number.isFinite(factor) && factor > 0) {
+        applyScaleMultiplier(factor);
+        setEnvironmentScale(1);
+      }
+      void loadExample(url, title, collisionSceneType);
     },
-    [environmentScale, loadExample, setPendingEnvironmentScale]
+    [applyScaleMultiplier, environmentScale, loadExample]
   );
 
   const onReset = useCallback((): void => {
@@ -347,31 +489,39 @@ export function SplatFastNavShowcase(): JSX.Element {
 
   const runRerunFastNav = useCallback(async (): Promise<void> => {
     if (rerunApplying || isBusy) return;
+    const factor = Number(environmentScale);
+    if (!Number.isFinite(factor) || factor <= 0) {
+      setScaleSummary('Scale multiplier must be a positive number.');
+      return;
+    }
     setRerunApplying(true);
     try {
-      await rerunFastNav();
+      const sessionScale = await rerunFastNav({ scaleMultiplier: factor });
+      setEnvironmentScale(1);
+      setScaleSummary(`Session scale: ${sessionScale}.`);
     } catch {
       // Error surfaced via snackbar / errorMessage.
     } finally {
       setRerunApplying(false);
     }
-  }, [isBusy, rerunApplying, rerunFastNav]);
+  }, [environmentScale, isBusy, rerunApplying, rerunFastNav]);
 
   const runApplyEnvironmentScale = useCallback(async (): Promise<void> => {
     if (scaleApplying || isBusy) return;
-    const scale = Number(environmentScale);
-    if (!Number.isFinite(scale) || scale <= 0) {
-      setScaleSummary('Scale Environment must be a positive number.');
+    const factor = Number(environmentScale);
+    if (!Number.isFinite(factor) || factor <= 0) {
+      setScaleSummary('Scale multiplier must be a positive number.');
       return;
     }
     setScaleApplying(true);
     setScaleSummary(null);
     try {
-      await applyEnvironmentScale(scale);
+      const sessionScale = await applyEnvironmentScale(factor);
+      setEnvironmentScale(1);
       setScaleSummary(
         status === 'done'
-          ? `Environment scale applied: ${scale}.`
-          : `Environment scale set to ${scale} — applies on next Fast Nav.`
+          ? `Session scale: ${sessionScale}.`
+          : `Session scale: ${sessionScale} — applies on next Fast Nav.`
       );
     } catch (error) {
       setScaleSummary(`Scale failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -409,9 +559,12 @@ export function SplatFastNavShowcase(): JSX.Element {
             Gaussian Splat <Box component="span" sx={{ color: 'primary.main' }}>FAST NAV</Box>
           </Typography>
           <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-            Drop a <strong>.ply</strong> or <strong>.spz</strong> 3D Gaussian Splat. It renders in React Three
-            Fiber, auto-runs the FAST NAV pipeline (floor field &rarr; navmesh &rarr; crowd &rarr; NPC), then frames the
-            player top-down. Click the green navmesh to move the player.
+            Drop a <strong>.ply</strong>, <strong>.spz</strong>, <strong>.splat</strong>, or a{' '}
+            <strong>navkit.zip</strong> (model + baked nav). Splats render in React Three Fiber and
+            auto-run Fast Nav (default <strong>floor field</strong>; or{' '}
+            <strong>voxel collision</strong> / <strong>SDF Marching Cubes</strong> under Navmesh settings)
+            → navmesh → crowd → NPC, then frame the player top-down. NavKit restore keeps the saved
+            camera pose (no forced top-down). Click the green navmesh to move.
           </Typography>
 
           <Stack direction="row" flexWrap="wrap" useFlexGap spacing={2} alignItems="center" sx={{ mb: 1 }}>
@@ -422,7 +575,17 @@ export function SplatFastNavShowcase(): JSX.Element {
               disabled={isBusy}
               onClick={() => downloadIntegrationKit('r3f')}
             >
-              Download FastNav kit
+              Download FastNav Component Pack
+            </Button>
+            <Button
+              variant="contained"
+              color="primary"
+              startIcon={<DownloadIcon />}
+              disabled={!hasNavKit || isBusy}
+              title={navKitUploadHint}
+              onClick={() => downloadNavKit()}
+            >
+              Download NavKit
             </Button>
             <ToggleButtonGroup
               exclusive
@@ -546,7 +709,11 @@ export function SplatFastNavShowcase(): JSX.Element {
                           key={scene.url}
                           onClick={() => {
                             setExampleAnchor(null);
-                            void onLoadExample(scene.url, scene.title);
+                            void onLoadExample(
+                              scene.url,
+                              scene.title,
+                              scene.collisionSceneType
+                            );
                           }}
                         >
                           {scene.title}
@@ -608,10 +775,221 @@ export function SplatFastNavShowcase(): JSX.Element {
             </AccordionSummary>
             <AccordionDetails>
               <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 2 }}>
-                Set Scale Environment before loading a splat to bake it into the first Fast Nav run,
-                or Apply / Recompute after Fast Nav to rebuild at the new scale. Orbit: hold{' '}
-                <strong>SHIFT</strong> for 10× pan / drive (wheel).
+                Scale Environment is a multiplier on the current session scale (starts at 1).
+                After Apply / Recompute it resets to 1; the absolute session scale is shown below.
+                Orbit: hold <strong>SHIFT</strong> for 10× pan / drive (wheel).
               </Typography>
+
+              <FormControl fullWidth size="small" sx={{ mb: 2 }} disabled={isBusy}>
+                <InputLabel id="nav-gen-mode-label">Nav generation technique</InputLabel>
+                <Select
+                  labelId="nav-gen-mode-label"
+                  label="Nav generation technique"
+                  value={navGenerationMode}
+                  onChange={(e) =>
+                    setNavGenerationMode(
+                      e.target.value as 'floor_field' | 'voxel_collision' | 'sdf_marching_cubes'
+                    )
+                  }
+                >
+                  <MenuItem value="floor_field">Floor field</MenuItem>
+                  <MenuItem value="voxel_collision">Voxel collision</MenuItem>
+                  <MenuItem value="sdf_marching_cubes">SDF Marching Cubes</MenuItem>
+                </Select>
+              </FormControl>
+              <FormControl
+                fullWidth
+                size="small"
+                sx={{ mb: 1 }}
+                disabled={isBusy || navGenerationMode === 'floor_field'}
+              >
+                <InputLabel id="collision-scene-type-label">Scene type</InputLabel>
+                <Select
+                  labelId="collision-scene-type-label"
+                  label="Scene type"
+                  value={collisionSceneType}
+                  onChange={(e) =>
+                    setCollisionSceneType(e.target.value as 'indoor' | 'outdoor')
+                  }
+                >
+                  <MenuItem value="indoor">Indoor (sealed rooms, stairs)</MenuItem>
+                  <MenuItem value="outdoor">Outdoor (floor fill)</MenuItem>
+                </Select>
+              </FormControl>
+              {navGenerationMode !== 'floor_field' && (
+                <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 2 }}>
+                  Indoor seals rooms; outdoor keeps open sky / floor fill. Example scenes seed this;
+                  change it before load or Recompute (applies matching DemoNavSettings bands).
+                </Typography>
+              )}
+              <Box sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 1, mb: 1 }}>
+                <Typography variant="subtitle2">Active navigation mode</Typography>
+                <Chip
+                  size="small"
+                  color="secondary"
+                  variant="outlined"
+                  label={`Live: ${liveNavBackendLabel(liveBackend)}`}
+                />
+              </Box>
+              <ToggleButtonGroup
+                exclusive
+                size="small"
+                color="secondary"
+                value={activeNavigationMode}
+                disabled={isBusy}
+                sx={{ mb: 1, flexWrap: 'wrap' }}
+                onChange={(_, value: ActiveNavigationMode | null) => {
+                  if (value) {
+                    setActiveNavigationMode(value);
+                  }
+                }}
+              >
+                {ACTIVE_NAVIGATION_MODE_OPTIONS.map((option) => {
+                  const disabledReason = activeNavigationModeDisabledReason(option.value);
+                  const floorLocked =
+                    navGenerationMode === 'floor_field' && option.value !== 'recast';
+                  return (
+                    <ToggleButton
+                      key={option.value}
+                      value={option.value}
+                      disabled={floorLocked || isBusy}
+                      title={disabledReason ?? option.subtitle}
+                    >
+                      {option.title}
+                    </ToggleButton>
+                  );
+                })}
+              </ToggleButtonGroup>
+              <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 2 }}>
+                {
+                  ACTIVE_NAVIGATION_MODE_OPTIONS.find((o) => o.value === activeNavigationMode)
+                    ?.subtitle
+                }{' '}
+                R3F live backend stays Recast crowd; Voxel/dual set pack emit intent for Recompute.
+              </Typography>
+              <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                Controls
+              </Typography>
+              <ToggleButtonGroup
+                exclusive
+                size="small"
+                color="secondary"
+                value={controlsMode}
+                disabled={!hasNavMesh}
+                sx={{ mb: 1, flexWrap: 'wrap' }}
+                onChange={(_, value: NavKitControlsMode | null) => {
+                  if (value) {
+                    setControlsMode(value);
+                  }
+                }}
+              >
+                <ToggleButton value="click_to_move">Click to move</ToggleButton>
+                <ToggleButton value="wasdqe">WASDQE</ToggleButton>
+                <ToggleButton value="both">Both</ToggleButton>
+              </ToggleButtonGroup>
+              {(controlsMode === 'wasdqe' || controlsMode === 'both') && (
+                <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 2 }}>
+                  {controlsWasdLegend}
+                </Typography>
+              )}
+
+              <Accordion
+                expanded={cameraInfoExpanded}
+                onChange={(_, expanded) => setCameraInfoExpanded(expanded)}
+                sx={{ mb: 1 }}
+              >
+                <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+                  <Stack direction="row" spacing={1} alignItems="center">
+                    <PhotoCameraIcon fontSize="small" color="primary" />
+                    <Typography>Camera Information</Typography>
+                  </Stack>
+                </AccordionSummary>
+                <AccordionDetails>
+                  <Typography variant="caption" color="text.secondary" display="block" sx={{ mb: 1.5 }}>
+                    Live camera pose (oriented-local; matches Download NavKit). Values refresh only
+                    while open. Download NavKit writes camPos / camTarget / camEulerDeg into
+                    meta-nav.json at click time.
+                  </Typography>
+                  <Typography variant="body2" fontFamily="monospace" sx={{ mb: 1 }}>
+                    Position: {cameraPositionLabel}
+                  </Typography>
+                  <Typography variant="body2" fontFamily="monospace" sx={{ mb: 1.5 }}>
+                    Orientation (euler °): {cameraEulerLabel}
+                  </Typography>
+                  <Button
+                    size="small"
+                    variant="outlined"
+                    startIcon={<ContentCopyIcon />}
+                    onClick={() => void onCopyCameraPose()}
+                  >
+                    {cameraInfoCopied ? 'Copied' : 'Copy pose'}
+                  </Button>
+                  <Typography
+                    variant="caption"
+                    color="text.secondary"
+                    display="block"
+                    fontFamily="monospace"
+                    sx={{ mt: 1, wordBreak: 'break-word' }}
+                  >
+                    {cameraInfoCopyText}
+                  </Typography>
+                </AccordionDetails>
+              </Accordion>
+
+              <Accordion
+                expanded={playerInfoExpanded}
+                onChange={(_, expanded) => setPlayerInfoExpanded(expanded)}
+                sx={{ mb: 2 }}
+              >
+                <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+                  <Stack direction="row" spacing={1} alignItems="center">
+                    <PersonIcon fontSize="small" color="primary" />
+                    <Typography>Player Information</Typography>
+                  </Stack>
+                </AccordionSummary>
+                <AccordionDetails>
+                  <Typography variant="caption" color="text.secondary" display="block" sx={{ mb: 1.5 }}>
+                    Live player pose. Values refresh only while open. Download NavKit writes
+                    playerPos / playerEulerDeg at click time.
+                  </Typography>
+                  <Typography variant="body2" fontFamily="monospace" sx={{ mb: 1 }}>
+                    Position: {playerPositionLabel}
+                  </Typography>
+                  <Typography variant="body2" fontFamily="monospace" sx={{ mb: 1.5 }}>
+                    Yaw °: {playerYawLabel}
+                  </Typography>
+                  <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+                    <Button
+                      size="small"
+                      variant="outlined"
+                      startIcon={<ContentCopyIcon />}
+                      disabled={!playerInfo.available}
+                      onClick={() => void onCopyPlayerPose()}
+                    >
+                      {playerInfoCopied ? 'Copied' : 'Copy pose'}
+                    </Button>
+                    <Button
+                      size="small"
+                      variant="outlined"
+                      color="secondary"
+                      startIcon={<PersonPinCircleIcon />}
+                      disabled={isBusy || !hasNavMesh}
+                      onClick={goToPlayer}
+                    >
+                      Go to Player
+                    </Button>
+                  </Stack>
+                  <Typography
+                    variant="caption"
+                    color="text.secondary"
+                    display="block"
+                    fontFamily="monospace"
+                    sx={{ mt: 1, wordBreak: 'break-word' }}
+                  >
+                    {playerInfoCopyText}
+                  </Typography>
+                </AccordionDetails>
+              </Accordion>
 
               <Box sx={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 1.5, mb: 2 }}>
                 <Button
@@ -623,7 +1001,7 @@ export function SplatFastNavShowcase(): JSX.Element {
                   {rerunApplying ? 'Recomputing…' : 'Recompute'}
                 </Button>
                 <Typography variant="caption" color="text.secondary">
-                  Re-runs Fast Nav with current prune, selection region, and scale.
+                  Re-runs the selected technique with current prune, selection region, and scale.
                 </Typography>
               </Box>
 
@@ -716,7 +1094,7 @@ export function SplatFastNavShowcase(): JSX.Element {
                 Floor coverage
               </Typography>
               <Grid container spacing={2} sx={{ mb: 2 }}>
-                {FLOOR_SLIDERS.map((spec) => (
+                {DEMO_NAV_FLOOR_SLIDER_FIELDS.map((spec) => (
                   <Grid key={spec.key} item xs={12} sm={6} md={4}>
                     <Typography variant="caption" color="text.secondary">
                       {spec.label}: {navSettings[spec.key]}
@@ -740,7 +1118,7 @@ export function SplatFastNavShowcase(): JSX.Element {
                 Recast agent
               </Typography>
               <Grid container spacing={2} sx={{ mb: 2 }}>
-                {RECAST_SLIDERS.map((spec) => (
+                {DEMO_NAV_RECAST_SLIDER_FIELDS.map((spec) => (
                   <Grid key={spec.key} item xs={12} sm={6} md={4}>
                     <Typography variant="caption" color="text.secondary">
                       {spec.label}: {navSettings[spec.key]}
@@ -818,16 +1196,173 @@ export function SplatFastNavShowcase(): JSX.Element {
                     }
                     label={navMeshVisible ? 'Shown' : 'Hidden'}
                   />
-                  <Button
+                </Paper>
+              )}
+
+              {hasNavMesh && (
+                <Paper variant="outlined" sx={{ p: 1.5, mb: 2 }}>
+                  <Typography variant="body2" fontWeight={600} gutterBottom>
+                    NavMesh Editor
+                  </Typography>
+                  <Typography variant="caption" color="text.secondary" display="block" sx={{ mb: 1.5 }}>
+                    Modes: 1 Vertex · 2 Circle · 3 Global Y (0.1 m). Circle: click pin ·
+                    click/+Shift ±0.1 m · 2 resume · T gizmo · F fill · X delete. Then Apply when needed.
+                  </Typography>
+                  <FormControlLabel
+                    control={
+                      <Switch
+                        color="secondary"
+                        checked={navMeshEditorEnabled}
+                        disabled={isBusy}
+                        onChange={(_, checked) => {
+                          setNavMeshEditorEnabledState(checked);
+                          setNavMeshEditorEnabled(checked);
+                        }}
+                      />
+                    }
+                    label={navMeshEditorEnabled ? 'Editor on' : 'Editor off'}
+                  />
+                  <FormControl
                     size="small"
-                    variant="outlined"
-                    color="secondary"
-                    startIcon={<PersonPinCircleIcon />}
-                    disabled={isBusy}
-                    onClick={goToPlayer}
+                    sx={{ minWidth: 140, my: 1, display: 'block' }}
+                    disabled={isBusy || !navMeshEditorEnabled}
                   >
-                    Go to Player
-                  </Button>
+                    <InputLabel>Mode</InputLabel>
+                    <Select
+                      label="Mode"
+                      value={navMeshEditorMode}
+                      onChange={(e) => {
+                        const mode = e.target.value as 'vertex' | 'circle' | 'global';
+                        setNavMeshEditorModeState(mode);
+                        setNavMeshEditorMode(mode);
+                      }}
+                    >
+                      <MenuItem value="vertex">1 Vertex</MenuItem>
+                      <MenuItem value="circle">2 Circle</MenuItem>
+                      <MenuItem value="global">3 Global Y</MenuItem>
+                    </Select>
+                  </FormControl>
+                  {navMeshEditorMode === 'global' && (
+                    <>
+                      <Typography variant="caption" color="text.secondary" display="block" sx={{ mb: 0.5 }}>
+                        Keys: ↑ / ↓ (0.1 m)
+                      </Typography>
+                      <Stack direction="row" spacing={1} sx={{ mb: 1 }}>
+                        <Button size="small" variant="outlined" disabled={!navMeshEditorEnabled} onClick={() => navMeshEditorGlobalY(1)}>
+                          Up 0.1
+                        </Button>
+                        <Button size="small" variant="outlined" disabled={!navMeshEditorEnabled} onClick={() => navMeshEditorGlobalY(-1)}>
+                          Down 0.1
+                        </Button>
+                      </Stack>
+                    </>
+                  )}
+                  {navMeshEditorMode === 'circle' && (
+                    <>
+                      <Typography variant="caption" color="text.secondary" display="block" sx={{ mb: 1 }}>
+                        Pin circle, grow until pink, then press F
+                      </Typography>
+                      <Button
+                        size="small"
+                        color="secondary"
+                        variant="contained"
+                        disabled={!navMeshEditorHoleReady}
+                        sx={{ mb: 1, mr: 1 }}
+                        onClick={() => navMeshEditorFillHole()}
+                      >
+                        {navMeshEditorHoleReady
+                          ? 'Fill gap (F)'
+                          : 'Fill gap (waiting for pink / F)'}
+                      </Button>
+                    </>
+                  )}
+                  {(navMeshEditorMode === 'vertex' || navMeshEditorMode === 'circle') && (
+                    <Button
+                      size="small"
+                      color="error"
+                      variant="contained"
+                      disabled={!navMeshEditorDeleteReady || navMeshEditorApplying}
+                      sx={{ mb: 1 }}
+                      onClick={() => {
+                        void navMeshEditorDeleteVertices();
+                      }}
+                    >
+                      {navMeshEditorApplying
+                        ? 'Deleting…'
+                        : navMeshEditorDeleteReady
+                          ? 'Delete (X)'
+                          : 'Delete (select verts / X)'}
+                    </Button>
+                  )}
+                  {navMeshEditorPendingApply && (
+                    <>
+                      <Typography variant="caption" color="text.secondary" display="block" sx={{ mb: 1 }}>
+                        Updates pathfinding and downloadable nav artifacts
+                      </Typography>
+                      <Button
+                        size="small"
+                        variant="contained"
+                        disabled={navMeshEditorApplying}
+                        sx={{ mb: 1 }}
+                        onClick={() => {
+                          void applyNavMeshEditorToLive();
+                        }}
+                      >
+                        {navMeshEditorApplying
+                          ? 'Applying…'
+                          : 'Apply to Live Navmesh'}
+                      </Button>
+                    </>
+                  )}
+                  <Typography variant="caption" color="text.secondary">
+                    {navMeshEditorStatusText}
+                  </Typography>
+                </Paper>
+              )}
+
+              {hasCollisionBoundary && (
+                <Paper
+                  variant="outlined"
+                  sx={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    flexWrap: 'wrap',
+                    gap: 2,
+                    p: 1.5,
+                    mb: 2,
+                    background: (theme) =>
+                      `linear-gradient(120deg, ${theme.palette.info.main}14, ${theme.palette.background.paper} 42%)`,
+                  }}
+                >
+                  <ViewInArIcon color={collisionBoundaryVisible ? 'info' : 'disabled'} />
+                  <Box sx={{ flexGrow: 1, minWidth: 180 }}>
+                    <Typography variant="body2" fontWeight={600}>
+                      {navGenerationMode === 'sdf_marching_cubes'
+                        ? 'MC shell (cyan)'
+                        : 'Collision boundary'}
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      {collisionBoundaryVisible
+                        ? navGenerationMode === 'sdf_marching_cubes'
+                          ? 'Cyan interior MC shell visible'
+                          : 'Cyan collision boundary visible'
+                        : 'Hidden — toggle on to show the cyan overlay'}
+                    </Typography>
+                  </Box>
+                  <FormControlLabel
+                    control={
+                      <Switch
+                        color="info"
+                        checked={collisionBoundaryVisible}
+                        disabled={isBusy}
+                        onChange={(_, checked) => {
+                          setCollisionBoundaryVisibleState(checked);
+                          setCollisionBoundaryVisible(checked);
+                        }}
+                      />
+                    }
+                    label={collisionBoundaryVisible ? 'Shown' : 'Hidden'}
+                  />
                 </Paper>
               )}
 
@@ -838,7 +1373,7 @@ export function SplatFastNavShowcase(): JSX.Element {
                 <TextField
                   type="number"
                   size="small"
-                  label="Scale Environment"
+                  label="Scale multiplier"
                   value={environmentScale}
                   disabled={isBusy || scaleApplying}
                   inputProps={{ min: 0.01, step: 0.1 }}
@@ -854,11 +1389,10 @@ export function SplatFastNavShowcase(): JSX.Element {
                 >
                   {scaleApplying ? 'Applying…' : 'Apply'}
                 </Button>
-                {scaleSummary && (
-                  <Typography variant="caption" color="text.secondary">
-                    {scaleSummary}
-                  </Typography>
-                )}
+                <Typography variant="caption" color="text.secondary">
+                  Session scale: {sessionEnvironmentScale}
+                  {scaleSummary ? ` · ${scaleSummary}` : ''}
+                </Typography>
               </Box>
             </AccordionDetails>
           </Accordion>
@@ -879,10 +1413,18 @@ export function SplatFastNavShowcase(): JSX.Element {
                   </Button>
                   <Button
                     startIcon={<DownloadIcon />}
+                    disabled={!hasNavKit || isBusy}
+                    title={navKitUploadHint}
+                    onClick={() => downloadNavKit()}
+                  >
+                    Download NavKit
+                  </Button>
+                  <Button
+                    startIcon={<DownloadIcon />}
                     disabled={!hasNavArtifactBundle || isBusy}
                     onClick={() => downloadNavArtifacts()}
                   >
-                    Download nav artifacts
+                    Download nav artifacts (legacy)
                   </Button>
                   <Box
                     sx={{
@@ -897,7 +1439,7 @@ export function SplatFastNavShowcase(): JSX.Element {
                       disabled={!hasLoadedSplat || isBusy}
                       tabIndex={-1}
                     >
-                      Upload nav artifacts
+                      Upload nav artifacts (legacy)
                     </Button>
                     {hasLoadedSplat && !isBusy ? (
                       <input
@@ -925,6 +1467,9 @@ export function SplatFastNavShowcase(): JSX.Element {
                     ) : null}
                   </Box>
                 </Box>
+                <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1 }}>
+                  {navKitUploadHint}
+                </Typography>
                 <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 2 }}>
                   {navArtifactUploadHint}
                 </Typography>
@@ -995,7 +1540,13 @@ export function SplatFastNavShowcase(): JSX.Element {
                       setCollisionBoundaryVisible(visible);
                     }}
                   >
-                    {collisionBoundaryVisible ? 'Hide collision boundary' : 'Show collision boundary'}
+                    {collisionBoundaryVisible
+                      ? navGenerationMode === 'sdf_marching_cubes'
+                        ? 'Hide MC shell (cyan)'
+                        : 'Hide collision boundary'
+                      : navGenerationMode === 'sdf_marching_cubes'
+                        ? 'Show MC shell (cyan)'
+                        : 'Show collision boundary'}
                   </Button>
                   <Button
                     variant="outlined"
@@ -1112,7 +1663,13 @@ export function SplatFastNavShowcase(): JSX.Element {
         </Grid>
       </Grid>
 
-      <input ref={fileInputRef} type="file" accept=".ply,.spz" style={{ display: 'none' }} onChange={onFileChange} />
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept=".ply,.spz,.splat,.zip,application/zip"
+        style={{ display: 'none' }}
+        onChange={onFileChange}
+      />
 
       <Snackbar
         open={errorMessage !== null}

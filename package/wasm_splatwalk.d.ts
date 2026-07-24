@@ -157,6 +157,16 @@ export interface ReconstructionDiagnostics {
   collision_mesh_mode: string;
   collision_external_fill_leaked: boolean;
   collision_failure_reason?: string;
+  /** SDF truncation band (voxels) for `smooth` mesh mode; 0 when unused. */
+  collision_sdf_band_voxels?: number;
+  /** Marching Cubes iso level for `smooth` mesh mode. */
+  collision_mc_iso_level?: number;
+  /** Laplacian iterations after Marching Cubes for `smooth` mesh mode. */
+  collision_mc_smooth_iterations?: number;
+  /** `"interior"` | `"open"` when SDF-MC downward floor project ran. */
+  collision_floor_project_mode?: string;
+  /** Applied `floor_project_flatten_m` for SDF-MC Recast floor (0 when unused). */
+  collision_floor_project_flatten_m?: number;
   floor_plane?: FloorPlane;
 }
 
@@ -180,7 +190,18 @@ export interface MeshSettings {
   collision_fill_size?: number;
   collision_carve_height?: number;
   collision_carve_radius?: number;
-  collision_mesh_mode?: 'faces' | 'smooth';
+  collision_mesh_mode?: 'faces' | 'obstacle_shell' | 'smooth' | 'walkable_floors';
+  /** Truncation half-width (voxels) for SDF when `collision_mesh_mode: "smooth"` (default 3). */
+  sdf_band_voxels?: number;
+  /** Marching Cubes iso level for `smooth` (default 0). */
+  mc_iso_level?: number;
+  /** Laplacian smooth iterations after Marching Cubes (default 1, max 8). */
+  mc_smooth_iterations?: number;
+  /**
+   * Metres of undulation to flatten on the SDF-MC → Recast floor heightfield only
+   * (never the MC shell). Default `0.08`; `0` disables. Clamped to `[0, 0.5]`.
+   */
+  floor_project_flatten_m?: number;
   min_alpha?: number;
   max_scale?: number;
   normal_align?: number;
@@ -195,8 +216,24 @@ export interface MeshSettings {
   hole_fill_radius?: number;
   agent_radius_erode?: number;
   component_mode?: 'largest' | 'nearest_region_center' | 'all';
-  region_min?: number[];
-  region_max?: number[];
+  /**
+   * Optional AABB minimum corner `[x,y,z]` in `splatwalk_oriented` space
+   * (post-`flip_y`, post-`rotation`, same metres as `environment_scale`).
+   * When both `region_min` and `region_max` are set, WASM culls out-of-box
+   * splats **before floater prune** and before floor/collision compute — pass
+   * these into {@link fast_nav} (and every other entry point) to pin the
+   * consideration volume. Both must be set together.
+   */
+  region_min?: [number, number, number] | number[];
+  /**
+   * Optional AABB maximum corner `[x,y,z]` paired with {@link region_min}.
+   */
+  region_max?: [number, number, number] | number[];
+  /**
+   * Optional camera / viewpoint `[x,y,z]` in `splatwalk_oriented` space.
+   * Empty-pin + immense cloud → WASM uses a reasonable AABB around this point.
+   */
+  camera_position?: [number, number, number] | number[];
   /** Statistical outlier removal ("prune floaters"). Default `true`. */
   prune_floaters?: boolean;
   /** Neighbours sampled per splat for outlier removal (default 16). */
@@ -298,6 +335,8 @@ export interface NavmeshBasisResult extends ResultContract {
 
 export interface CollisionVoxelBoundaryResult extends ResultContract {
   mesh: MeshBuffers;
+  /** Full SDF-MC shell for overlay; Recast uses {@link mesh} (projected floor). */
+  collider_mesh?: MeshBuffers;
   /** GLB bytes of the collision mesh, present only when `emit_glb` was set. */
   glb?: Uint8Array;
   /** Dense solid + nav_region, present only when `emit_volume` was set. */
@@ -360,6 +399,67 @@ export interface RoomFloorFailure {
   /** Number of connected floor components considered. */
   component_count: number;
   /** Number of recovery steps attempted. */
+  steps: number;
+}
+
+/** Algorithms accepted by the star {@link fast_nav} export (capability `fast_nav`). */
+export type FastNavAlgo = 'floor_field' | 'voxel_collision' | 'sdf_marching_cubes';
+
+/**
+ * Settings for {@link fast_nav} (MeshSettings fields plus algo / emit flags).
+ * Pin work with `region_min` / `region_max` (`[x,y,z]` each) so every algo
+ * culls to that AABB before prune/compute.
+ */
+export interface FastNavSettings extends MeshSettings {
+  /** Compute path (default `floor_field`). */
+  algo?: FastNavAlgo;
+  /** Minimum accepted floor area (m^2) for `floor_field` recovery. Default 4.0. */
+  min_room_floor_area?: number;
+  /** When true, also emit GLB bytes in `glb`. Default false. */
+  emit_glb?: boolean;
+  /** When true (voxel/SDF algos), also emit packed volume bitmasks. Default false. */
+  emit_volume?: boolean;
+  /** Optional `floor_field` recovery ladder; WASM default when omitted. */
+  recovery?: RoomFloorRecoveryStep[];
+}
+
+/**
+ * Unified success shape from {@link fast_nav}. Floor-only stats are zeroed for
+ * collision algos; `volume` is present only when `emit_volume` was set.
+ */
+export interface FastNavResult extends ResultContract {
+  algo: FastNavAlgo | string;
+  mesh: MeshBuffers;
+  /** Full SDF-MC shell for overlay when present; Recast uses {@link mesh}. */
+  collider_mesh?: MeshBuffers;
+  glb?: Uint8Array;
+  volume?: CollisionVoxelVolume;
+  space: CoordinateSpace;
+  basis: FieldBasis;
+  floor_plane: FloorPlane;
+  selected_area: number;
+  component_count: number;
+  selected_cell_count: number;
+  accepted_cell_count: number;
+  obstacle_cell_count: number;
+  rejected_cell_count: number;
+  fallback_used: boolean;
+  step_label: string;
+  diagnostics: ReconstructionDiagnostics;
+}
+
+/**
+ * Structured failure rejected/thrown by {@link fast_nav}. Branch on `reason`
+ * (`invalid_algo` / `unsupported_capability` / `empty_mesh` / floor codes / …).
+ */
+export interface FastNavFailure {
+  api_version: 2;
+  algo: string;
+  reason: string;
+  message: string;
+  attempted?: string[];
+  selected_area: number;
+  component_count: number;
   steps: number;
 }
 
@@ -468,10 +568,32 @@ export function build_walkable_ground_field(data: Uint8Array, settings: MeshSett
  * preset is applied as a base layer automatically (your settings and the
  * per-step recovery patch override it).
  *
+ * Prefer {@link fast_nav} with `algo: "floor_field"` for the product FastNav
+ * surface; this export remains for specialized / legacy callers.
+ *
  * On failure it throws/rejects with a structured {@link RoomFloorFailure} object
  * (not a string): branch on `err.reason` for control flow and telemetry.
  */
 export function build_room_floor_mesh(data: Uint8Array, settings: RoomFloorSettings): RoomFloorMeshResult;
+
+/**
+ * Star FastNav export (capability `fast_nav`): splat bytes → Recast-ready mesh
+ * for `algo: "floor_field" | "voxel_collision" | "sdf_marching_cubes"`
+ * (default `floor_field`). Hosts run Recast/crowd on the returned mesh.
+ *
+ * - `floor_field` — same pipeline as {@link build_room_floor_mesh} (preset + recovery)
+ * - `voxel_collision` — {@link build_collision_voxel_boundary} (non-smooth mesh mode; default `faces`)
+ * - `sdf_marching_cubes` — smooth MC + downward floor project: `mesh` is Recast floor,
+ *   `collider_mesh` is the MC shell (capabilities `sdf_marching_cubes`, `sdf_mc_floor_project`)
+ *
+ * Pass optional `region_min` / `region_max` (`[x,y,z]` each, `splatwalk_oriented`
+ * space) to pin the consideration volume. Out-of-box splats are culled before
+ * floater prune and before algo compute (progress stage `region_cull`).
+ *
+ * On failure throws/rejects a structured {@link FastNavFailure}
+ * (`invalid_region` when the AABB is malformed).
+ */
+export function fast_nav(data: Uint8Array, settings?: FastNavSettings | MeshSettings): FastNavResult;
 
 /**
  * Serialize positions + indices into a minimal binary glTF (GLB) without

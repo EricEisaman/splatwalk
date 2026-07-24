@@ -12,6 +12,7 @@ import {
   finishFastNav,
   generateNavmeshInWorker,
   VOXEL_COLLIDER_RECAST_ATTEMPTS,
+  type FastNavAlgo,
   type FastNavPhase,
   type FastNavPhaseListener,
   type FastNavLogger,
@@ -27,6 +28,10 @@ import {
   shouldBakeRecastForActiveMode,
   type ActiveNavigationMode,
 } from '@/navigation/activeNavigation';
+import {
+  SDF_MC_MISSING_COLLIDER_ERROR,
+  requireSdfMcColliderMesh,
+} from '@/navigation/sdfMcColliderOverlay';
 import type { VoxelCollisionNavSettings, VoxelLocomotionMode } from '@/navigation/voxelNavSettings';
 import {
   volumeToConnectedWalkableMesh,
@@ -66,6 +71,14 @@ export interface RunNavFromVoxelColliderOptions {
   /** Optional settings snapshot stored in `nav_session.json`. */
   readonly voxelSettingsSnapshot?: Record<string, unknown>;
   readonly viewer: Viewer;
+  /**
+   * Geometry fed to Recast when baking.
+   * - `voxel_volume` (default) — connected walkable spans from the carve volume
+   * - `collision_mesh` — WASM-emitted collision mesh (e.g. SDF Marching Cubes `smooth`)
+   */
+  readonly recastGeometrySource?: 'voxel_volume' | 'collision_mesh';
+  /** Override Recast worker `sourceLabel` (must pass worker allowlist). */
+  readonly recastSourceLabel?: string;
 }
 
 /** Result of voxel collision nav, including downloadable artifacts. */
@@ -83,7 +96,9 @@ const WASM_PROGRESS_LABELS: Record<string, string> = {
   collision_cluster: 'Filter-cluster splats (coarse)',
   collision_fill: 'Applying collision fill',
   collision_grid: 'Sizing collision grid',
+  collision_marching_cubes: 'Marching Cubes isosurface',
   collision_mesh: 'Building collision surface mesh',
+  collision_sdf: 'Building truncated SDF from volume',
   collision_voxelize: 'Voxelizing splats into grid',
   parse: 'Parsing PLY',
   prune: 'Pruning floaters',
@@ -131,7 +146,7 @@ const logCollisionPreflight = (
       `[INFO] Collision WASM seed: ${settings.collision_seed.map((v) => v.toFixed(3)).join(', ')}`
     );
   }
-  log('[WAIT] build_collision_voxel_boundary: parse → prune → voxelize → fill → carve → mesh…');
+  log('[WAIT] fast_nav (collision): parse → prune → voxelize → fill → carve → mesh…');
 };
 
 const mergeRecastAttempts = (
@@ -209,6 +224,14 @@ const logCollisionArtifact = (
   log(
     `[INFO] Collision boundary: ${boundary.mesh.vertex_count} vertices, ${boundary.mesh.face_count} faces.`
   );
+  const collider = boundary.collider_mesh;
+  if (collider) {
+    log(
+      `[INFO] Collision collider_mesh: ${collider.vertex_count} vertices, ${collider.face_count} faces.`
+    );
+  } else {
+    log('[INFO] Collision collider_mesh: (none)');
+  }
   log(`[INFO] Collision diagnostics: ${collisionBoundaryDiagnosticsSummary(boundary.diagnostics)}`);
   const kept = boundary.diagnostics.collision_cluster_kept_voxels ?? 0;
   const discarded = boundary.diagnostics.collision_cluster_discarded_voxels ?? 0;
@@ -231,6 +254,18 @@ const logCollisionArtifact = (
         'Carve will use the unfilled grid.'
     );
   }
+};
+
+const isSdfMcColliderShellMissing = (
+  boundary: CollisionBoundaryArtifact['result']
+): boolean => {
+  const collider = boundary.collider_mesh;
+  return (
+    !collider ||
+    collider.vertex_count <= 0 ||
+    collider.face_count <= 0 ||
+    collider.indices.length < 3
+  );
 };
 
 /** Resolve a walkable collision seed from the pinned region or auto floor suggestion. */
@@ -447,6 +482,14 @@ export async function runNavFromVoxelCollider(
     const isEmptyGeometry = (): boolean =>
       geometry.positions.length === 0 || geometry.indices.length === 0;
 
+    const isSdfMcPath = (): boolean =>
+      collisionSettings.collision_mesh_mode === 'smooth' ||
+      options.recastSourceLabel === 'generated_sdf_mc_floor_project' ||
+      options.recastSourceLabel === 'generated_sdf_mc_collider';
+
+    const needsSdfMcShellRecovery = (): boolean =>
+      isSdfMcPath() && isSdfMcColliderShellMissing(boundary);
+
     const hadPinnedRegion = Boolean(
       collisionSettings.region_min && collisionSettings.region_max
     );
@@ -462,6 +505,9 @@ export async function runNavFromVoxelCollider(
     const collisionRecoveryLabels =
       sceneType === 'outdoor' ? outdoorRecoveryLabels : indoorRecoveryLabels;
     const shouldRetryCollision = (): boolean => {
+      if (needsSdfMcShellRecovery()) {
+        return true;
+      }
       if (!isEmptyGeometry()) {
         return false;
       }
@@ -475,11 +521,19 @@ export async function runNavFromVoxelCollider(
       if (!shouldRetryCollision()) {
         break;
       }
-      const reason = boundary.diagnostics.collision_external_fill_leaked
-        ? 'exterior fill leaked'
-        : 'collision seed blocked';
+      const reason = needsSdfMcShellRecovery()
+        ? 'SDF-MC interior shell missing'
+        : boundary.diagnostics.collision_external_fill_leaked
+          ? 'exterior fill leaked'
+          : 'collision seed blocked';
       log(`[WARN] ${reason} — retrying with ${label}.`);
       collisionSettings = await buildCollisionRecoverySettings(collisionSettings, label, options);
+      if (isSdfMcPath()) {
+        collisionSettings = {
+          ...collisionSettings,
+          collision_mesh_mode: 'smooth',
+        };
+      }
       artifact = await runCollisionPass(collisionSettings, label);
       boundary = artifact.result;
       geometry = {
@@ -488,15 +542,18 @@ export async function runNavFromVoxelCollider(
       };
     }
 
-    if (isEmptyGeometry() && hadPinnedRegion) {
+    if ((isEmptyGeometry() || needsSdfMcShellRecovery()) && hadPinnedRegion) {
       log(
         '[WARN] Collider still empty with pinned selection region — retrying without region clip as a fallback.'
       );
-      collisionSettings = {
-        ...collisionSettings,
-        region_min: undefined,
-        region_max: undefined,
-      };
+      const { region_min: _dropMin, region_max: _dropMax, ...unpinned } = collisionSettings;
+      collisionSettings = unpinned;
+      if (isSdfMcPath()) {
+        collisionSettings = {
+          ...collisionSettings,
+          collision_mesh_mode: 'smooth',
+        };
+      }
       artifact = await runCollisionPass(collisionSettings, 'without region clip');
       boundary = artifact.result;
       geometry = {
@@ -508,6 +565,9 @@ export async function runNavFromVoxelCollider(
     if (isEmptyGeometry()) {
       throw new Error(formatEmptyColliderError(boundary.diagnostics, hadPinnedRegion));
     }
+    if (needsSdfMcShellRecovery()) {
+      throw new Error(SDF_MC_MISSING_COLLIDER_ERROR);
+    }
 
     const volume = normalizeCollisionVolume(boundary.volume);
     if (!volume) {
@@ -517,10 +577,25 @@ export async function runNavFromVoxelCollider(
     }
 
     if (options.showColliderOverlay !== false) {
-      options.viewer.displayColliderMesh(boundary.mesh.vertices, boundary.mesh.indices, 0.35);
+      const isSmooth =
+        boundary.diagnostics.collision_mesh_mode === 'smooth' ||
+        options.recastSourceLabel === 'generated_sdf_mc_floor_project' ||
+        options.recastSourceLabel === 'generated_sdf_mc_collider';
+      const overlay = isSmooth
+        ? requireSdfMcColliderMesh({
+            colliderMesh: boundary.collider_mesh,
+            recastMesh: boundary.mesh,
+          })
+        : boundary.mesh;
+      options.viewer.displayColliderMesh(
+        new Float32Array(overlay.vertices),
+        new Uint32Array(overlay.indices),
+        0.35
+      );
       options.viewer.setColliderVisible(options.colliderVisible ?? true);
       log(
-        `[INFO] Cyan collider overlay shown (${boundary.mesh.vertex_count} verts). ` +
+        `[INFO] Cyan collider overlay shown (${overlay.vertex_count} verts` +
+          `${isSmooth ? ', interior MC shell' : ''}). ` +
           `Volume ${volume.dims[0]}x${volume.dims[1]}x${volume.dims[2]} @ ${volume.voxel_size.toFixed(3)}m.`
       );
     }
@@ -535,14 +610,11 @@ export async function runNavFromVoxelCollider(
       (options.locomotionMode === 'recast_crowd' ? 'recast' : 'voxel_mesh');
     const liveBackend = initialLiveBackendForActiveMode(activeMode);
     const bakeRecast = shouldBakeRecastForActiveMode(activeMode);
-    const navSeed = boundary.diagnostics.collision_seed_used ?? null;
-    if (!navSeed || navSeed.length < 3) {
-      throw new Error('Collision seed missing — cannot spawn player.');
-    }
+    /** Carve seed from WASM — used for volume walk / artifacts only, not Recast spawn. */
+    const collisionSeed = boundary.diagnostics.collision_seed_used ?? null;
 
     // Alignment guard (volume vs splat) before locomotion.
     options.viewer.assertVolumeAlignedWithSplat(new VoxelWalkRuntime({ volume }));
-    assertSeedInsideSplat(options.viewer, navSeed, log);
 
     const regionBounds = options.viewer.getWasmRegionBounds();
     const extent = new VoxelWalkRuntime({ volume }).navExtentDiagnostics();
@@ -580,17 +652,40 @@ export async function runNavFromVoxelCollider(
     } | null = null;
 
     if (bakeRecast) {
-      if (boundary.diagnostics.collision_seed_used) {
-        options.viewer.displaySeedMarker(boundary.diagnostics.collision_seed_used);
-      }
-      log('[INFO] Baking Recast from voxel volume spans (`generated_voxel_volume`)…');
-      const connected = volumeToConnectedWalkableMesh(volume, 0.75);
-      geometry = {
-        positions: new Float32Array(connected.positions),
-        indices: new Uint32Array(connected.indices),
-      };
-      if (geometry.indices.length < 3) {
-        throw new Error('Voxel volume produced no walkable floor spans for Recast.');
+      const useCollisionMesh = options.recastGeometrySource === 'collision_mesh';
+      const projectMode = boundary.diagnostics.collision_floor_project_mode;
+      const recastSourceLabel =
+        options.recastSourceLabel ??
+        (useCollisionMesh
+          ? projectMode
+            ? 'generated_sdf_mc_floor_project'
+            : 'generated_sdf_mc_collider'
+          : 'generated_voxel_volume');
+      if (useCollisionMesh) {
+        log(
+          `[INFO] Baking Recast from WASM mesh (\`${recastSourceLabel}\`, ` +
+            `mode=${boundary.diagnostics.collision_mesh_mode}` +
+            `${projectMode ? `, floor_project=${projectMode}` : ''})…`
+        );
+        geometry = {
+          positions: new Float32Array(boundary.mesh.vertices),
+          indices: new Uint32Array(boundary.mesh.indices),
+        };
+        if (geometry.indices.length < 3) {
+          throw new Error(
+            'WASM Recast mesh is empty — cannot bake Recast. Check SDF Marching Cubes / floor project.'
+          );
+        }
+      } else {
+        log('[INFO] Baking Recast from voxel volume spans (`generated_voxel_volume`)…');
+        const connected = volumeToConnectedWalkableMesh(volume, 0.75);
+        geometry = {
+          positions: new Float32Array(connected.positions),
+          indices: new Uint32Array(connected.indices),
+        };
+        if (geometry.indices.length < 3) {
+          throw new Error('Voxel volume produced no walkable floor spans for Recast.');
+        }
       }
 
       const colliderBounds = boundsFromPositions(geometry.positions);
@@ -599,7 +694,8 @@ export async function runNavFromVoxelCollider(
         const height = colliderBounds.max[1]! - colliderBounds.min[1]!;
         const depth = colliderBounds.max[2]! - colliderBounds.min[2]!;
         log(
-          `[INFO] Voxel-span mesh for Recast: ${width.toFixed(2)}x${height.toFixed(2)}x${depth.toFixed(2)}m ` +
+          `[INFO] ${useCollisionMesh ? 'Collision' : 'Voxel-span'} mesh for Recast: ` +
+            `${width.toFixed(2)}x${height.toFixed(2)}x${depth.toFixed(2)}m ` +
             `(${geometry.indices.length / 3} tris).`
         );
       }
@@ -634,7 +730,7 @@ export async function runNavFromVoxelCollider(
           result = await generateNavmeshInWorker(
             geometry,
             attempt.params,
-            'generated_voxel_volume',
+            recastSourceLabel,
             splatBounds,
             colliderBounds
           );
@@ -673,17 +769,37 @@ export async function runNavFromVoxelCollider(
     let playerSpawn: Vector3 | null = null;
     let keptCameraSelectView = false;
     let navMeshData = new Uint8Array(0);
+    /** Player spawn hint — must come from Recast (or walkable) mesh, not WASM carve seed. */
+    let spawnSeed: number[] | null = null;
 
     if (liveBackend === 'recast_crowd') {
       if (!recastArtifact) {
         throw new Error('Recast live backend requires a successful Recast bake.');
       }
+      spawnSeed = spawnSeedFromRecastMesh({
+        indices: recastArtifact.debugIndices,
+        positions: recastArtifact.debugPositions,
+      });
+      if (!spawnSeed) {
+        throw new Error('Recast navmesh has no triangles — cannot place player spawn.');
+      }
+      options.viewer.displaySeedMarker(spawnSeed);
+      log(
+        `[INFO] Spawn seed from Recast mesh: ${spawnSeed.map((v) => v.toFixed(3)).join(', ')}` +
+          (collisionSeed
+            ? ` (carve seed diagnostic-only: ${collisionSeed.map((v) => v.toFixed(3)).join(', ')})`
+            : '')
+      );
       const finished = await finishFastNav(
         options.viewer,
         recastArtifact,
         log,
         'Voxel collision nav',
-        navSeed
+        spawnSeed,
+        options.collisionSettings.collision_mesh_mode === 'smooth'
+          ? 'sdf_marching_cubes'
+          : 'voxel_collision',
+        volume
       );
       playerSpawn = finished.playerSpawn;
       keptCameraSelectView = finished.keptCameraSelectView;
@@ -698,8 +814,24 @@ export async function runNavFromVoxelCollider(
           '[INFO] Walkable floor mesh: no nav floor cells — emitting solid tops for full volume.'
         );
       }
-      await options.viewer.displayNavMesh(debugMesh.positions, debugMesh.indices, 0, navSeed, 0);
-      playerSpawn = options.viewer.initVoxelWalk(volume, navSeed);
+      spawnSeed =
+        (recastArtifact
+          ? spawnSeedFromRecastMesh({
+              indices: recastArtifact.debugIndices,
+              positions: recastArtifact.debugPositions,
+            })
+          : null) ??
+        spawnSeedFromRecastMesh({
+          indices: debugMesh.indices,
+          positions: debugMesh.positions,
+        }) ??
+        (collisionSeed ? [...collisionSeed] : null);
+      if (!spawnSeed) {
+        throw new Error('No spawn seed from Recast/volume mesh — cannot start voxel walk.');
+      }
+      options.viewer.displaySeedMarker(spawnSeed);
+      await options.viewer.displayNavMesh(debugMesh.positions, debugMesh.indices, 0, spawnSeed, 0);
+      playerSpawn = options.viewer.initVoxelWalk(volume, spawnSeed);
       options.viewer.setPreferredNavSpawnPoints(
         [playerSpawn.x, playerSpawn.y, playerSpawn.z],
         null
@@ -732,16 +864,32 @@ export async function runNavFromVoxelCollider(
         : null,
       regionMax: regionBounds?.max ?? null,
       regionMin: regionBounds?.min ?? null,
-      seed: navSeed,
+      seed: spawnSeed,
       volume,
       voxelSettings: options.voxelSettingsSnapshot,
     });
+    const algo: FastNavAlgo =
+      options.recastSourceLabel === 'generated_sdf_mc_collider' ||
+      options.recastSourceLabel === 'generated_sdf_mc_floor_project' ||
+      options.collisionSettings.collision_mesh_mode === 'smooth'
+        ? 'sdf_marching_cubes'
+        : 'voxel_collision';
+    const debugPositions =
+      recastArtifact?.debugPositions ??
+      new Float32Array(0);
+    const debugIndices =
+      recastArtifact?.debugIndices ??
+      new Uint32Array(0);
     return {
+      algo,
       artifactBundle,
       carveReachTip,
+      debugIndices,
+      debugPositions,
       keptCameraSelectView,
       navMeshData,
       playerSpawn,
+      volume,
     };
   } finally {
     splatwalk.onProgress = previousProgress;
@@ -754,38 +902,44 @@ export const formatVoxelNavSettingsLog = (settings: VoxelCollisionNavSettings): 
   `scene=${settings.collisionSceneType} voxel=${settings.collisionVoxelSize}m ` +
   `opacity=${settings.collisionOpacityThreshold} fill=${settings.collisionFillSize}m ` +
   `carve=${settings.collisionCarveHeight}/${settings.collisionCarveRadius}m ` +
-  `locomotion=${settings.locomotionMode}`;
+  `locomotion=${settings.locomotionMode} ` +
+  `sdfBand=${settings.sdfBandVoxels} mcIso=${settings.mcIsoLevel} mcSmooth=${settings.mcSmoothIterations}`;
 
-const assertSeedInsideSplat = (
-  viewer: Viewer,
-  seedOriented: readonly number[],
-  log: FastNavLogger
-): void => {
-  const seedWorld = viewer.orientedNavPointToWorld(
-    new Vector3(seedOriented[0]!, seedOriented[1]!, seedOriented[2]!)
-  );
-  const splat = viewer.getSplatBoundsForDiagnostics();
-  if (!splat) {
-    return;
+/**
+ * Mean triangle centroid on a Recast (or walkable) mesh — spawn seed after bake.
+ */
+const spawnSeedFromRecastMesh = (params: {
+  readonly indices: ArrayLike<number>;
+  readonly positions: ArrayLike<number>;
+}): number[] | null => {
+  const { indices, positions } = params;
+  if (indices.length < 3 || positions.length < 9) {
+    return null;
   }
-  const pad = 1.0;
-  const inside =
-    seedWorld.x >= splat.min.x - pad &&
-    seedWorld.x <= splat.max.x + pad &&
-    seedWorld.y >= splat.min.y - pad &&
-    seedWorld.y <= splat.max.y + pad &&
-    seedWorld.z >= splat.min.z - pad &&
-    seedWorld.z <= splat.max.z + pad;
-  if (!inside) {
-    throw new Error(
-      `Collision seed world (${seedWorld.x.toFixed(2)}, ${seedWorld.y.toFixed(2)}, ${seedWorld.z.toFixed(2)}) ` +
-        `is outside splat bounds — refusing void spawn. ` +
-        `splat Y [${splat.min.y.toFixed(2)}, ${splat.max.y.toFixed(2)}]. Check flip_y / rotation.`
-    );
+  let sx = 0;
+  let sy = 0;
+  let sz = 0;
+  let count = 0;
+  for (let i = 0; i + 2 < indices.length; i += 3) {
+    const i0 = Number(indices[i]) * 3;
+    const i1 = Number(indices[i + 1]) * 3;
+    const i2 = Number(indices[i + 2]) * 3;
+    if (
+      i0 + 2 >= positions.length ||
+      i1 + 2 >= positions.length ||
+      i2 + 2 >= positions.length
+    ) {
+      continue;
+    }
+    sx += (Number(positions[i0]) + Number(positions[i1]) + Number(positions[i2])) / 3;
+    sy += (Number(positions[i0 + 1]) + Number(positions[i1 + 1]) + Number(positions[i2 + 1])) / 3;
+    sz += (Number(positions[i0 + 2]) + Number(positions[i1 + 2]) + Number(positions[i2 + 2])) / 3;
+    count += 1;
   }
-  log(
-    `[INFO] Seed world (${seedWorld.x.toFixed(2)}, ${seedWorld.y.toFixed(2)}, ${seedWorld.z.toFixed(2)}) inside splat.`
-  );
+  if (count === 0) {
+    return null;
+  }
+  return [sx / count, sy / count, sz / count];
 };
 
 /** Coerce WASM/serde volume payloads into typed {@link CollisionVoxelVolume}. */

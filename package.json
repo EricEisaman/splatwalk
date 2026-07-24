@@ -1,6 +1,6 @@
 {
-  "name": "sigma-wasm",
-  "version": "0.6.4",
+  "name": "splatwalk",
+  "version": "0.6.10",
   "type": "module",
   "scripts": {
     "dev": "npm run build:kits && vite",
@@ -9,14 +9,18 @@
     "build:wasm": "./scripts/build.sh",
     "build:package": "./scripts/build-package.sh",
     "build:package:pro": "./scripts/build-package-pro.sh",
-    "build:docker": "docker build -t sigma-wasm .",
+    "build:docker": "docker build -t splatwalk .",
     "preview": "vite preview",
     "start": "vite preview --host --port 3000",
     "lint": "eslint src --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
     "lint:fix": "eslint src --ext ts,tsx --fix",
     "type-check": "vue-tsc --noEmit && tsc -p tsconfig.react.json --noEmit",
     "check": "npm run type-check && npm run lint",
-    "check:handedness": "node examples/handedness-check.mjs"
+    "check:handedness": "node examples/handedness-check.mjs",
+    "check:nav-cache": "node scripts/check-fast-nav-cache-signature.mjs",
+    "check:session-scale": "node scripts/check-session-scale-multiplier.mjs",
+    "check:active-live": "node scripts/check-active-live-hotswap.mjs",
+    "check:navkit": "node scripts/check-navkit-contract.mjs"
   },
   "dependencies": {
     "@babylonjs/core": "^9.18.0",
@@ -33,7 +37,7 @@
     "@mui/material": "^6.5.0",
     "@react-three/drei": "^9.122.0",
     "@react-three/fiber": "^8.18.0",
-    "@splatwalk/core": "^0.6.4",
+    "@splatwalk/core": "^0.6.10",
     "@xenova/transformers": "^2.17.2",
     "fflate": "^0.8.3",
     "onnxruntime-web": "^1.26.0",

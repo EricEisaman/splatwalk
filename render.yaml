@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: sigma-wasm
+    name: splatwalk
     env: docker
     plan: free
     region: oregon

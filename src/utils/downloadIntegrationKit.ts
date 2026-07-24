@@ -1,6 +1,9 @@
 /**
- * Trigger download of a prebuilt FastNav / Storage integration kit from
- * `/integration-kits/`. Kits are produced by `npm run build:kits`.
+ * Trigger download of a prebuilt FastNav / Storage Component Pack from
+ * `/integration-kits/`. Packs are produced by `npm run build:kits`.
+ *
+ * Distinct from NavKit (`navkit-*.zip`): Component Packs are integrator
+ * docs + peer-deps snippets; NavKit packs embed model + baked nav.
  */
 
 export type IntegrationKitId =
@@ -29,8 +32,8 @@ const KIT_FILES: Record<IntegrationKitId, { readonly filename: string; readonly 
 };
 
 /**
- * Start a browser download for the named integration kit.
- * @param kitId - Kit identifier matching `scripts/build-integration-kits.mjs`
+ * Start a browser download for the named Component Pack.
+ * @param kitId - Pack identifier matching `scripts/build-integration-kits.mjs`
  */
 export const downloadIntegrationKit = (kitId: IntegrationKitId): void => {
   const kit = KIT_FILES[kitId];

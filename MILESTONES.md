@@ -63,9 +63,15 @@ production:
 - Frame the streamed-SOG scene for room-scale viewing; validate performance with
   on-demand chunk streaming inside an XR frame loop.
 
+## Shipped — SDF Marching Cubes collision / nav
+
+- `collision_mesh_mode: "smooth"` — truncated 3D SDF (separable EDT) + Marching
+  Cubes in `wasm-splatwalk` (capability `sdf_marching_cubes`).
+- Demo nav technique `sdf_marching_cubes` (Storage Adapter, Fast Nav, workbench,
+  playground) feeds the WASM mesh to Recast.
+
 ## Later / nice-to-have
 
 - GPU-assisted shN palette clustering (the CPU k-means is the slowest stage on
   very large scenes).
-- `smooth` collision-mesh mode (marching cubes / coplanar merge).
 - Optional in-Rust `.zip` assembly if integrators want a single-call bundle.

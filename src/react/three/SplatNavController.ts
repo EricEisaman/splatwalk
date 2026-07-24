@@ -9,11 +9,35 @@ import {
   type CrowdAgent,
 } from 'recast-navigation';
 
+import type { NavKitControlsMode } from '@/navigation/navKitContract';
+import { resolveNavKitCameraLook } from '@/navigation/navKitPoseInfo';
+import {
+  controlsModeAllowsClick,
+  controlsModeAllowsWasd,
+  integratePlayerWasdMove,
+  isPlayerWasdSampleActive,
+  PLAYER_WASD_LOOKAHEAD_METERS,
+  PlayerWasdKeyTracker,
+  type PlayerWasdSample,
+} from '@/navigation/playerWasdControls';
+import {
+  travelFacingYawFromAgent,
+  yawTowardPoint,
+} from '@/navigation/playerTravelFacing';
+import {
+  PLAYER_MARKER_HALF_HEIGHT_M,
+  playerMarkerWedgeBuffers,
+} from '@/navigation/playerMarkerGeometry';
+import type {
+  NavMeshEditorRebakeResult,
+  NavMeshEditorStatus,
+} from '@/navigation/navmeshEditor';
 import {
   ensureRegionSelectionVolume,
   MIN_REGION_HEIGHT_METERS,
   regionSelectionSize,
 } from '@/navigation/regionSelection';
+import { NavMeshEditorThree } from '@/react/three/navMeshEditorThree';
 
 /** Minimal OrbitControls surface used by the controller (drei's controls). */
 export interface OrbitControlsLike {
@@ -71,6 +95,18 @@ export class SplatNavController {
   private collisionBoundaryMesh: THREE.Mesh | null = null;
   private floorMesh: THREE.Mesh | null = null;
   private navMeshOverlay: THREE.Mesh | null = null;
+  private readonly _editedNavMeshRebakeListeners = new Set<
+    (result: NavMeshEditorRebakeResult) => void | Promise<void>
+  >();
+  private _orientedNavPositions: Float32Array | null = null;
+  private _orientedNavIndices: Uint32Array | null = null;
+  private _navMeshData: Uint8Array | null = null;
+  private _navMeshEditor: NavMeshEditorThree | null = null;
+  /** Status listeners registered before the Three scene is attached. */
+  private readonly _navMeshEditorStatusListeners = new Set<
+    (status: NavMeshEditorStatus) => void
+  >();
+  private _navMeshEditorStatusFanoutUnsub: (() => void) | null = null;
   private selectionMesh: THREE.Mesh | null = null;
   /** Move gizmo — always on with {@link scaleControls} (Babylon GizmoManager parity). */
   private translateControls: TransformControls | null = null;
@@ -96,6 +132,18 @@ export class SplatNavController {
   private navMeshOverlayShown = true;
   /** Absolute uniform environment scale (default 1). Does not scale player/NPC markers. */
   private _environmentScale = 1;
+  private _controlsMode: NavKitControlsMode = 'both';
+  private readonly _wasdKeys = new PlayerWasdKeyTracker();
+  private _playerYawRadians = 0;
+  /**
+   * After teleport / NavKit restore, skip path/velocity travel-facing until
+   * the user clicks or uses WASD so saved yaw is not overwritten.
+   */
+  private _suppressTravelFacingUntilInput = false;
+  /** Swift click-face goal; pathing waits until this arrives. */
+  private _pendingClickFaceYaw: number | null = null;
+  /** Move target held until click-face completes (nav/local space). */
+  private _pendingClickMoveTarget: [number, number, number] | null = null;
   private onPointerDown = (e: PointerEvent): void => {
     this.pointerDown = { x: e.clientX, y: e.clientY };
   };
@@ -220,6 +268,34 @@ export class SplatNavController {
     return { x: p.x, y: p.y, z: p.z };
   }
 
+  /**
+   * Camera pose in splatwalk-oriented / world-local space (undoes `world.scale.z = -1`).
+   * Yaw follows look direction on local XZ: yaw 0 looks +Z (`atan2(fx, fz)`).
+   * Pitch is oriented Y-up (`-asin(fy)`).
+   */
+  public getCameraPoseOriented(): {
+    position: { x: number; y: number; z: number };
+    pitchRadians: number;
+    yawRadians: number;
+  } | null {
+    if (!this.handles || !this.world) {
+      return null;
+    }
+    this.world.updateWorldMatrix(true, false);
+    const worldPos = this.handles.camera.getWorldPosition(new THREE.Vector3());
+    const localPos = this.world.worldToLocal(worldPos.clone());
+    const worldDir = this.handles.camera.getWorldDirection(new THREE.Vector3());
+    const invWorld = new THREE.Matrix4().copy(this.world.matrixWorld).invert();
+    const localDir = worldDir.clone().transformDirection(invWorld).normalize();
+    const yawRadians = Math.atan2(localDir.x, localDir.z);
+    const pitchRadians = -Math.asin(Math.max(-1, Math.min(1, localDir.y)));
+    return {
+      position: { x: localPos.x, y: localPos.y, z: localPos.z },
+      pitchRadians,
+      yawRadians,
+    };
+  }
+
   public getSceneBounds(): { min: number[]; max: number[] } | null {
     return this.sceneBounds
       ? { min: [...this.sceneBounds.min], max: [...this.sceneBounds.max] }
@@ -237,6 +313,10 @@ export class SplatNavController {
       handles.gl.domElement.removeEventListener('pointerdown', this.onPointerDown);
       handles.gl.domElement.removeEventListener('pointerup', this.onPointerUp);
     }
+    this._navMeshEditorStatusFanoutUnsub?.();
+    this._navMeshEditorStatusFanoutUnsub = null;
+    this._navMeshEditor?.dispose();
+    this._navMeshEditor = null;
     this.disableRegionSelection();
     this.destroyCrowd();
     const world = this.world;
@@ -270,9 +350,52 @@ export class SplatNavController {
   /** Per-frame tick driven by R3F's `useFrame`. */
   public update(dt: number): void {
     if (this.crowd) {
-      this.crowd.update(Math.min(dt, 0.1));
+      const step = Math.min(dt, 0.1);
+      const wasdSample = this._wasdKeys.sample();
+      const wasdActive = isPlayerWasdSampleActive(wasdSample);
+      this.tickPlayerWasd(step, wasdSample);
+      this.crowd.update(step);
       if (this.playerAgent && this.playerMesh) {
+        if (wasdActive) {
+          this._pendingClickFaceYaw = null;
+          this._pendingClickMoveTarget = null;
+          this._suppressTravelFacingUntilInput = false;
+        } else if (
+          !this._suppressTravelFacingUntilInput &&
+          controlsModeAllowsClick(this._controlsMode)
+        ) {
+          const velocity = this.playerAgent.velocity();
+          const position = this.playerAgent.position();
+          let nextTarget: { x: number; y: number; z: number } | null = null;
+          try {
+            nextTarget = this.playerAgent.nextTargetInPath();
+          } catch {
+            nextTarget = null;
+          }
+          const facing = travelFacingYawFromAgent({
+            velocity,
+            position,
+            nextTarget,
+            currentYaw: this._playerYawRadians,
+            dt: step,
+            clickFaceYaw: this._pendingClickFaceYaw,
+          });
+          this._playerYawRadians = facing.yawRadians;
+          if (facing.clearClickFace) {
+            this._pendingClickFaceYaw = null;
+            const pending = this._pendingClickMoveTarget;
+            this._pendingClickMoveTarget = null;
+            if (pending) {
+              this.playerAgent.requestMoveTarget({
+                x: pending[0],
+                y: pending[1],
+                z: pending[2],
+              });
+            }
+          }
+        }
         this.syncMesh(this.playerMesh, this.playerAgent);
+        this.syncPlayerMeshYaw();
         if (this.playerLabel) this.updateLabel(this.playerLabel, this.playerMesh);
       }
       for (let i = 0; i < this.npcAgents.length; i++) {
@@ -282,6 +405,92 @@ export class SplatNavController {
         const label = this.npcLabels[i];
         if (label && mesh) this.updateLabel(label, mesh);
       }
+    }
+  }
+
+  public getControlsMode(): NavKitControlsMode {
+    return this._controlsMode;
+  }
+
+  public setControlsMode(mode: NavKitControlsMode): void {
+    this._controlsMode = mode;
+    if (controlsModeAllowsWasd(mode)) {
+      this._wasdKeys.attach();
+    } else {
+      this._wasdKeys.detach();
+    }
+  }
+
+  public getPlayerPoseNavKit(): {
+    position: { x: number; y: number; z: number };
+    eulerDegrees: { x: number; y: number; z: number };
+  } | null {
+    if (!this.playerAgent) {
+      return null;
+    }
+    const p = this.playerAgent.position();
+    return {
+      position: { x: p.x, y: p.y, z: p.z },
+      eulerDegrees: {
+        x: 0,
+        y: (this._playerYawRadians * 180) / Math.PI,
+        z: 0,
+      },
+    };
+  }
+
+  public getCameraPoseNavKit(): {
+    position: { x: number; y: number; z: number };
+    target: { x: number; y: number; z: number };
+    eulerDegrees: { x: number; y: number; z: number };
+  } | null {
+    const pose = this.getCameraPoseOriented();
+    if (!pose || !this.handles || !this.world) {
+      return null;
+    }
+    const radToDeg = 180 / Math.PI;
+    const eulerDegrees = {
+      x: pose.pitchRadians * radToDeg,
+      y: pose.yawRadians * radToDeg,
+      z: 0,
+    };
+    let target = resolveNavKitCameraLook({
+      eulerDegrees,
+      position: pose.position,
+    }).target;
+    if (this.handles.controls) {
+      this.world.updateWorldMatrix(true, false);
+      const localTarget = this.world.worldToLocal(this.handles.controls.target.clone());
+      target = { x: localTarget.x, y: localTarget.y, z: localTarget.z };
+    }
+    return {
+      position: pose.position,
+      target,
+      eulerDegrees,
+    };
+  }
+
+  public teleportPlayerTo(options: {
+    readonly position: [number, number, number] | { x: number; y: number; z: number };
+    readonly yawDegrees?: number;
+  }): void {
+    if (!this.playerAgent) {
+      return;
+    }
+    const raw = Array.isArray(options.position)
+      ? options.position
+      : [options.position.x, options.position.y, options.position.z];
+    const snapped = this.snapToNavMesh([raw[0]!, raw[1]!, raw[2]!]) ?? raw;
+    this.playerAgent.teleport({ x: snapped[0]!, y: snapped[1]!, z: snapped[2]! });
+    // Clear residual pathing so travel-facing does not overwrite NavKit yaw.
+    this.playerAgent.resetMoveTarget();
+    this._pendingClickFaceYaw = null;
+    this._pendingClickMoveTarget = null;
+    this._playerYawRadians = ((options.yawDegrees ?? 0) * Math.PI) / 180;
+    this._suppressTravelFacingUntilInput = true;
+    if (this.playerMesh) {
+      this.syncMesh(this.playerMesh, this.playerAgent);
+      this.syncPlayerMeshYaw();
     }
   }
 
@@ -309,8 +518,12 @@ export class SplatNavController {
 
   /** Render a splat from raw bytes (PLY). Replaces any previously loaded splat. */
   public async loadSplat(bytes: Uint8Array): Promise<void> {
-    if (!this.handles || !this.world) throw new Error('Controller not attached to a scene.');
-    await this.disposeSplat();
+    if (!this.handles || !this.world) {
+      throw new Error('Controller not attached to a scene.');
+    }
+    // Never await prior dispose() — DropInViewer can hang on in-flight sort/download
+    // promises and block NavKit restore forever. Fire-and-forget like detach().
+    void this.disposeSplat();
 
     const group = new THREE.Group();
     // Y-flip the raw splat (matches Babylon's loader). Under the Z-mirrored
@@ -328,16 +541,35 @@ export class SplatNavController {
     group.add(viewer);
     this.splatViewer = viewer;
 
-    const blob = new Blob([bytes.slice().buffer as ArrayBuffer], { type: 'application/octet-stream' });
+    // Tight copy — avoid ArrayBuffer views that may be larger than the PLY payload.
+    const plyCopy = bytes.slice();
+    const blob = new Blob([plyCopy], { type: 'application/octet-stream' });
     const url = URL.createObjectURL(blob);
+    const LOAD_SPLAT_TIMEOUT_MS = 45_000;
     try {
-      await viewer.addSplatScene(url, {
-        format: GaussianSplats3D.SceneFormat.Ply,
-        showLoadingUI: false,
-        progressiveLoad: false,
-      });
+      console.log(
+        `[WAIT] DropInViewer.addSplatScene (${(plyCopy.byteLength / (1024 * 1024)).toFixed(2)} MB)…`
+      );
+      await Promise.race([
+        viewer.addSplatScene(url, {
+          format: GaussianSplats3D.SceneFormat.Ply,
+          showLoadingUI: false,
+          progressiveLoad: false,
+        }),
+        new Promise<never>((_resolve, reject) => {
+          window.setTimeout(() => {
+            reject(
+              new Error(
+                `Splat load timed out after ${LOAD_SPLAT_TIMEOUT_MS / 1000}s ` +
+                  `(DropInViewer.addSplatScene). Try WebGL or reload.`
+              )
+            );
+          }, LOAD_SPLAT_TIMEOUT_MS);
+        }),
+      ]);
+      console.log('[INFO] Splat scene added to DropInViewer.');
     } finally {
-      setTimeout(() => URL.revokeObjectURL(url), 15_000);
+      window.setTimeout(() => URL.revokeObjectURL(url), 15_000);
     }
   }
 
@@ -380,11 +612,39 @@ export class SplatNavController {
     this.world.add(this.collisionBoundaryMesh);
   }
 
+  /** Remove the cyan collision / MC shell overlay. */
+  public clearCollisionBoundary(): void {
+    if (!this.world || !this.collisionBoundaryMesh) {
+      return;
+    }
+    this.world.remove(this.collisionBoundaryMesh);
+    this.disposeMesh(this.collisionBoundaryMesh);
+    this.collisionBoundaryMesh = null;
+  }
+
   /** Toggle the collision voxel boundary overlay. */
   public setCollisionBoundaryVisible(visible: boolean): void {
     if (this.collisionBoundaryMesh) {
       this.collisionBoundaryMesh.visible = visible;
     }
+  }
+
+  /**
+   * Clear nav overlays + yellow region (call on every new splat load).
+   * Pass `{ keepRegion: true }` on Fast Nav recompute so a user-moved pin survives.
+   */
+  public clearNavSessionOverlays(options?: { readonly keepRegion?: boolean }): void {
+    this.clearCollisionBoundary();
+    if (!options?.keepRegion) {
+      this.disableRegionSelection();
+    }
+    this.clearFloorMesh();
+    if (this.world && this.navMeshOverlay) {
+      this.world.remove(this.navMeshOverlay);
+      this.disposeMesh(this.navMeshOverlay);
+      this.navMeshOverlay = null;
+    }
+    this.destroyCrowd();
   }
 
   /** Toggle the green walkable navmesh overlay (click-to-move still works when hidden). */
@@ -484,9 +744,191 @@ export class SplatNavController {
     };
   }
 
+  public getNavMeshData(): Uint8Array | null {
+    return this._navMeshData;
+  }
+
+  public getOrientedNavMeshBuffers(): {
+    positions: Float32Array;
+    indices: Uint32Array;
+  } | null {
+    if (!this._orientedNavPositions || !this._orientedNavIndices) {
+      return null;
+    }
+    return {
+      positions: this._orientedNavPositions,
+      indices: this._orientedNavIndices,
+    };
+  }
+
+  public isNavMeshEditorEnabled(): boolean {
+    return this._navMeshEditor?.session.enabled === true;
+  }
+
+  public getNavMeshEditorStatus(): NavMeshEditorStatus | null {
+    return this._navMeshEditor?.session.status() ?? null;
+  }
+
+  public onNavMeshEditorStatus(
+    listener: (status: NavMeshEditorStatus) => void
+  ): () => void {
+    this._navMeshEditorStatusListeners.add(listener);
+    // Safe before Canvas attach — editor is created lazily on first enable/ensure.
+    if (this._navMeshEditor && !this._navMeshEditorStatusFanoutUnsub) {
+      this.wireNavMeshEditorStatusFanout();
+    }
+    return () => {
+      this._navMeshEditorStatusListeners.delete(listener);
+    };
+  }
+
+  /**
+   * Fired after an editor rebake updates Detour + overlay buffers.
+   * Hosts should refresh session navMeshData / NavKit artifact bundles here.
+   */
+  public onEditedNavMeshRebake(
+    listener: (result: NavMeshEditorRebakeResult) => void | Promise<void>
+  ): () => void {
+    this._editedNavMeshRebakeListeners.add(listener);
+    return () => {
+      this._editedNavMeshRebakeListeners.delete(listener);
+    };
+  }
+
+  public async applyNavMeshEditorToLive(): Promise<boolean> {
+    this.ensureNavMeshEditor();
+    return this._navMeshEditor!.session.applyToLiveNavMesh();
+  }
+
+  public setNavMeshEditorEnabled(enabled: boolean): void {
+    this.ensureNavMeshEditor();
+    this._navMeshEditor!.setEnabled(enabled);
+    if (enabled) {
+      this._pendingClickFaceYaw = null;
+      this._pendingClickMoveTarget = null;
+      this.playerAgent?.resetMoveTarget();
+    }
+  }
+
+  public setNavMeshEditorMode(mode: 'vertex' | 'circle' | 'global'): void {
+    this.ensureNavMeshEditor();
+    this._navMeshEditor!.session.setMode(mode);
+  }
+
+  public navMeshEditorGlobalY(steps: number): void {
+    this.ensureNavMeshEditor();
+    this._navMeshEditor!.session.globalY(steps);
+  }
+
+  public navMeshEditorFillHole(): boolean {
+    this.ensureNavMeshEditor();
+    return this._navMeshEditor!.session.fillHolesUnderBrush() > 0;
+  }
+
+  public async navMeshEditorDeleteVertices(): Promise<boolean> {
+    this.ensureNavMeshEditor();
+    return this._navMeshEditor!.session.deleteSelectedVerticesAndApply();
+  }
+
+  private wireNavMeshEditorStatusFanout(): void {
+    if (!this._navMeshEditor || this._navMeshEditorStatusFanoutUnsub) {
+      return;
+    }
+    this._navMeshEditorStatusFanoutUnsub = this._navMeshEditor.onStatus((status) => {
+      for (const listener of this._navMeshEditorStatusListeners) {
+        listener(status);
+      }
+    });
+  }
+
+  private ensureNavMeshEditor(): void {
+    if (this._navMeshEditor) {
+      return;
+    }
+    if (!this.handles) {
+      throw new Error('NavMesh editor requires an attached Three.js scene.');
+    }
+    this._navMeshEditor = new NavMeshEditorThree({
+      scene: this.handles.scene,
+      camera: this.handles.camera,
+      domElement: this.handles.gl.domElement,
+      getOrientedNavMeshBuffers: () => this.getOrientedNavMeshBuffers(),
+      refreshNavMeshOverlayFromOriented: (positions, indices, options) => {
+        this.refreshNavMeshOverlayFromOriented(positions, indices, options);
+      },
+      applyEditedNavMeshRebake: async (result) => {
+        await this.applyEditedNavMeshRebake(result);
+      },
+    });
+    this.wireNavMeshEditorStatusFanout();
+  }
+
+  public async applyEditedNavMeshRebake(
+    result: NavMeshEditorRebakeResult
+  ): Promise<void> {
+    const pose = this.playerAgent
+      ? {
+          position: this.playerAgent.position(),
+          yawDegrees: (this._playerYawRadians * 180) / Math.PI,
+        }
+      : null;
+    this._navMeshData = new Uint8Array(result.navMeshData);
+    this.showNavMesh(result.debugPositions, result.debugIndices);
+    const spawn: [number, number, number] | null = pose
+      ? [pose.position.x, pose.position.y, pose.position.z]
+      : null;
+    await this.initCrowd(result.navMeshData, spawn);
+    if (pose) {
+      this.teleportPlayerTo({
+        position: [pose.position.x, pose.position.y, pose.position.z],
+        yawDegrees: pose.yawDegrees,
+      });
+    }
+    // Session buffers already updated by applyToLiveNavMesh / runRebake.
+    for (const listener of this._editedNavMeshRebakeListeners) {
+      try {
+        await listener(result);
+      } catch (err) {
+        console.warn('[WARN] onEditedNavMeshRebake listener failed:', err);
+      }
+    }
+  }
+
+  /**
+   * Update green overlay from oriented editor buffers.
+   * Positions-only edits reuse the existing mesh; topology changes rebuild.
+   */
+  public refreshNavMeshOverlayFromOriented(
+    positions: Float32Array,
+    indices: Uint32Array,
+    options?: { readonly topologyChanged?: boolean }
+  ): void {
+    const topologyChanged = options?.topologyChanged !== false;
+    if (
+      !topologyChanged &&
+      this.navMeshOverlay &&
+      this._orientedNavPositions &&
+      this._orientedNavPositions.length === positions.length
+    ) {
+      this._orientedNavPositions = new Float32Array(positions);
+      this._orientedNavIndices = new Uint32Array(indices);
+      const attr = this.navMeshOverlay.geometry.getAttribute('position');
+      if (attr && attr.count === Math.floor(positions.length / 3)) {
+        const arr = attr.array as Float32Array;
+        arr.set(positions);
+        attr.needsUpdate = true;
+        this.navMeshOverlay.geometry.computeBoundingSphere();
+        return;
+      }
+    }
+    this.showNavMesh(positions, indices);
+  }
+
   /** Show the walkable navmesh overlay (green) and use it as the click target. */
   public showNavMesh(positions: Float32Array, indices: Uint32Array): void {
     if (!this.world) return;
+    this._orientedNavPositions = new Float32Array(positions);
+    this._orientedNavIndices = new Uint32Array(indices);
     this.clearFloorMesh();
     if (this.navMeshOverlay) {
       this.world.remove(this.navMeshOverlay);
@@ -510,6 +952,7 @@ export class SplatNavController {
 
   /** Initialize the recast crowd and spawn the (blue) player agent. */
   public async initCrowd(navMeshData: Uint8Array, spawn: [number, number, number] | null): Promise<void> {
+    this._navMeshData = new Uint8Array(navMeshData);
     if (!this.handles) return;
     await initRecast();
     this.destroyCrowd();
@@ -531,13 +974,16 @@ export class SplatNavController {
     );
 
     const playerMesh = new THREE.Mesh(
-      new THREE.BoxGeometry(0.5, 0.5, 0.5),
+      SplatNavController.createPlayerMarkerGeometry(),
       new THREE.MeshStandardMaterial({ color: 0x1144ff, emissive: 0x0a1c4d })
     );
-    playerMesh.userData.yOffset = 0.25; // lift the 0.5m box so it rests ON the navmesh
+    // Lift so the centered wedge rests ON the navmesh (feet at agent Y).
+    playerMesh.userData.yOffset = PLAYER_MARKER_HALF_HEIGHT_M;
     this.playerMesh = playerMesh;
     this.world?.add(playerMesh);
     this.syncMesh(playerMesh, this.playerAgent);
+    this.syncPlayerMeshYaw();
+    this.setControlsMode(this._controlsMode);
 
     // PLAYER billboard label, matching the Babylon demos (blue "PLAYER" text).
     const label = SplatNavController.makeLabelSprite('PLAYER', '#1a80ff');
@@ -575,34 +1021,63 @@ export class SplatNavController {
   }
 
   /**
-   * Apply a FreeCamera-style view (degrees) after Fast Nav when `cameraSelect` is
-   * set — R3F OrbitControls approximate of Babylon {@link Viewer.applyCameraSelectView}.
+   * Apply oriented camera-select view (degrees) after Fast Nav when `cameraSelect`
+   * is set — R3F OrbitControls approximate of Babylon {@link Viewer.applyCameraSelectView}.
+   * Position/euler are oriented-local (same space as {@link getCameraPoseOriented}).
    */
   public applyCameraSelectView(view: {
     readonly position: { readonly x: number; readonly y: number; readonly z: number };
     readonly eulerDegrees: { readonly x: number; readonly y: number; readonly z: number };
   }): void {
-    if (!this.handles) {
+    this.applyCameraPoseNavKit(view);
+  }
+
+  /**
+   * Apply NavKit camera pose (oriented-local position + target or euler °).
+   * Converts through `world.localToWorld` so capture/apply match Z-mirror space.
+   */
+  public applyCameraPoseNavKit(view: {
+    readonly position: { readonly x: number; readonly y: number; readonly z: number };
+    readonly eulerDegrees?: {
+      readonly x: number;
+      readonly y: number;
+      readonly z: number;
+    };
+    readonly target?: {
+      readonly x: number;
+      readonly y: number;
+      readonly z: number;
+    };
+  }): void {
+    if (!this.handles || !this.world) {
       return;
     }
-    const degToRad = Math.PI / 180;
-    const pitch = view.eulerDegrees.x * degToRad;
-    const yaw = view.eulerDegrees.y * degToRad;
-    const lookDist = 10;
-    // Babylon LH: yaw 0 looks +Z. Aim OrbitControls target along that forward.
-    const fx = Math.sin(yaw) * Math.cos(pitch);
-    const fy = -Math.sin(pitch);
-    const fz = Math.cos(yaw) * Math.cos(pitch);
-    const { x, y, z } = view.position;
-    this.handles.camera.position.set(x, y, z);
-    const tx = x + fx * lookDist;
-    const ty = y + fy * lookDist;
-    const tz = z + fz * lookDist;
+    this.world.updateWorldMatrix(true, false);
+    const look = resolveNavKitCameraLook({
+      eulerDegrees: view.eulerDegrees,
+      position: view.position,
+      target: view.target,
+    });
+    const localPos = new THREE.Vector3(look.position.x, look.position.y, look.position.z);
+    const localTarget = new THREE.Vector3(look.target.x, look.target.y, look.target.z);
+    const worldPos = this.world.localToWorld(localPos.clone());
+    const worldTarget = this.world.localToWorld(localTarget.clone());
+    this.handles.camera.position.copy(worldPos);
+    this.handles.camera.up.set(0, 1, 0);
+    this.handles.camera.near = 0.05;
+    this.handles.camera.far = Math.max(
+      1000,
+      worldPos.distanceTo(worldTarget) * 20
+    );
+    this.handles.camera.updateProjectionMatrix();
     if (this.handles.controls) {
-      this.handles.controls.target.set(tx, ty, tz);
+      if (this.handles.controls.enabled !== undefined) {
+        this.handles.controls.enabled = true;
+      }
+      this.handles.controls.target.copy(worldTarget);
       this.handles.controls.update();
     } else {
-      this.handles.camera.lookAt(tx, ty, tz);
+      this.handles.camera.lookAt(worldTarget);
     }
   }
 
@@ -674,6 +1149,8 @@ export class SplatNavController {
 
   private handleTap(e: PointerEvent): void {
     if (!this.handles || !this.navMeshOverlay || !this.playerAgent) return;
+    if (this.isNavMeshEditorEnabled()) return;
+    if (!controlsModeAllowsClick(this._controlsMode)) return;
     const rect = this.handles.gl.domElement.getBoundingClientRect();
     const ndc = new THREE.Vector2(
       ((e.clientX - rect.left) / rect.width) * 2 - 1,
@@ -687,7 +1164,59 @@ export class SplatNavController {
     this.navMeshOverlay.updateWorldMatrix(true, false);
     const local = this.navMeshOverlay.worldToLocal(hit.point.clone());
     const snapped = this.snapToNavMesh([local.x, local.y, local.z]) ?? [local.x, local.y, local.z];
-    this.playerAgent.requestMoveTarget({ x: snapped[0], y: snapped[1], z: snapped[2] });
+    // Face toward target in place first; start pathing only after arrive.
+    this.playerAgent.resetMoveTarget();
+    const pos = this.playerAgent.position();
+    const clickYaw = yawTowardPoint(pos, {
+      x: snapped[0],
+      y: snapped[1],
+      z: snapped[2],
+    });
+    if (clickYaw === null) {
+      this._pendingClickFaceYaw = null;
+      this._pendingClickMoveTarget = null;
+      this.playerAgent.requestMoveTarget({
+        x: snapped[0],
+        y: snapped[1],
+        z: snapped[2],
+      });
+    } else {
+      this._pendingClickFaceYaw = clickYaw;
+      this._pendingClickMoveTarget = [snapped[0], snapped[1], snapped[2]];
+    }
+    this._suppressTravelFacingUntilInput = false;
+  }
+
+  private tickPlayerWasd(delta: number, sample: PlayerWasdSample): void {
+    if (!this.playerAgent || !controlsModeAllowsWasd(this._controlsMode)) {
+      return;
+    }
+    if (!isPlayerWasdSampleActive(sample)) {
+      return;
+    }
+    const moved = integratePlayerWasdMove({
+      dt: delta,
+      sample,
+      yawRadians: this._playerYawRadians,
+    });
+    this._playerYawRadians = moved.yawRadians;
+    const len = Math.hypot(moved.moveX, moved.moveZ);
+    if (len < 1e-6) {
+      return;
+    }
+    const pos = this.playerAgent.position();
+    const scale = PLAYER_WASD_LOOKAHEAD_METERS / len;
+    const target: [number, number, number] = [
+      pos.x + moved.moveX * scale,
+      pos.y,
+      pos.z + moved.moveZ * scale,
+    ];
+    const snapped = this.snapToNavMesh(target) ?? target;
+    this.playerAgent.requestMoveTarget({
+      x: snapped[0],
+      y: snapped[1],
+      z: snapped[2],
+    });
   }
 
   private clearFloorMesh(): void {
@@ -728,10 +1257,32 @@ export class SplatNavController {
     return point;
   }
 
+  /** Triangular wedge; tip along +Z (forward at yaw 0). */
+  private static createPlayerMarkerGeometry(): THREE.BufferGeometry {
+    const { positions, indices } = playerMarkerWedgeBuffers();
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setIndex(new THREE.BufferAttribute(indices, 1));
+    geometry.computeVertexNormals();
+    return geometry;
+  }
+
   private syncMesh(mesh: THREE.Mesh, agent: CrowdAgent): void {
     const p = agent.position();
     const yOffset = (mesh.userData.yOffset as number | undefined) ?? 0;
     mesh.position.set(p.x, p.y + yOffset, p.z);
+  }
+
+  /**
+   * Apply oriented-space yaw to the player mesh (tip +Z at yaw 0).
+   * Parent `world.scale.z = -1` aligns positions with Babylon LH; do not negate
+   * Y rotation — `rotation.y = +yaw` keeps tip parallel to WASD / NavKit meta.
+   */
+  private syncPlayerMeshYaw(): void {
+    if (!this.playerMesh) {
+      return;
+    }
+    this.playerMesh.rotation.y = this._playerYawRadians;
   }
 
   /**
@@ -804,6 +1355,11 @@ export class SplatNavController {
   }
 
   private destroyCrowd(): void {
+    if (this._navMeshEditor) {
+      this._navMeshEditor.dispose();
+      this._navMeshEditor = null;
+    }
+    this._wasdKeys.detach();
     if (this.world) {
       if (this.playerMesh) {
         this.world.remove(this.playerMesh);
@@ -839,17 +1395,20 @@ export class SplatNavController {
   }
 
   private async disposeSplat(): Promise<void> {
-    if (this.splatViewer) {
-      try {
-        await this.splatViewer.dispose();
-      } catch {
-        // best effort
-      }
-      this.splatViewer = null;
-    }
-    if (this.splatGroup && this.world) {
-      this.world.remove(this.splatGroup);
-    }
+    const viewer = this.splatViewer;
+    const group = this.splatGroup;
+    this.splatViewer = null;
     this.splatGroup = null;
+    if (group && this.world) {
+      this.world.remove(group);
+    }
+    if (!viewer) {
+      return;
+    }
+    try {
+      await viewer.dispose();
+    } catch {
+      // best effort — never block a subsequent loadSplat on dispose failures
+    }
   }
 }

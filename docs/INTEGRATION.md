@@ -65,7 +65,7 @@ import {
 if (splatwalk_api_version() !== 2) throw new Error('Unsupported SplatWalk binary');
 
 const caps = splatwalk_capabilities();        // e.g. ['room_floor_mesh', 'recast_config', ...]
-const version = splatwalk_version();          // tracks the crate version, e.g. '0.6.4'
+const version = splatwalk_version();          // tracks the crate version, e.g. '0.6.10'
 
 if (!caps.includes('room_floor_mesh')) {
   // Fall back to the multi-step field path instead of the one-call entry point.
@@ -75,11 +75,78 @@ if (!caps.includes('collision_voxel_boundary')) {
 }
 ```
 
-## 3. One-call room floor
+## 3. Choose a FastNav algo (sweet spots)
 
-`build_room_floor_mesh` is the binary-side equivalent of the FAST NAV floor path.
-It bakes the canonical FAST NAV preset automatically (your settings override it),
-runs an internal recovery ladder, and can emit a GLB directly.
+Prefer the star WASM export `fast_nav(bytes, { algo, ... })` (capability `fast_nav`).
+Browser hosts call `runFastNav({ algo })`, which is a thin wrapper around the same
+compute. Default `algo` is `floor_field`.
+
+| `algo` | Sweet spot | Reach for it when… | Skip it when… |
+| --- | --- | --- | --- |
+| `floor_field` | Flat floors & large outdoor streams | One-click room/plaza walk; bedroom/pad demos; streamed outdoor with a pinned region | You need stairs or stacked levels |
+| `voxel_collision` | Indoor stairs & multi-level carve | Steps/landings, sealed rooms (`collision_scene_type: "indoor"`), voxel-walk locomotion | The scene is a single flat deck (use floor field) |
+| `sdf_marching_cubes` | Smoother stair Recast mesh | Voxel faces fragment Recast on stairs/ramps; you want WASM SDF + Marching Cubes (`smooth`) | You only need volume walk, or floor field already works |
+
+```ts
+import init, {
+  init_splatwalk,
+  fast_nav,
+  splatwalk_capabilities,
+} from '@splatwalk/core';
+
+await init();
+init_splatwalk();
+
+const caps = splatwalk_capabilities();
+if (!caps.includes('fast_nav')) {
+  throw new Error('Upgrade @splatwalk/core — fast_nav missing');
+}
+
+// Optional but recommended: pin a consideration AABB (splatwalk_oriented).
+// Out-of-box splats are culled before prune + before every algo.
+const region = {
+  region_min: [-10, -1, -10] as [number, number, number],
+  region_max: [10, 5, 10] as [number, number, number],
+};
+
+// Default: flat floor / outdoor stream
+const floor = fast_nav(splatBytes, {
+  mode: 2,
+  flip_y: true,
+  algo: 'floor_field',
+  ...region,
+});
+
+// Stairs / multi-level (region required on large / streamed scenes)
+const voxel = fast_nav(splatBytes, {
+  mode: 2,
+  flip_y: true,
+  algo: 'voxel_collision',
+  collision_scene_type: 'indoor',
+  emit_volume: true,
+  ...region,
+});
+
+// Smoother Recast basis on stairs (needs capability sdf_marching_cubes)
+if (caps.includes('sdf_marching_cubes')) {
+  const smooth = fast_nav(splatBytes, {
+    mode: 2,
+    flip_y: true,
+    algo: 'sdf_marching_cubes',
+    sdf_band_voxels: 3,
+    emit_volume: true,
+  });
+}
+```
+
+Full chooser notes (avoid/prefer, host locomotion) live in
+[`docs/wasm-api.md`](wasm-api.md#algo-sweet-spots).
+
+## 4. One-call room floor (legacy / specialized)
+
+`build_room_floor_mesh` is the floor-only primitive behind `fast_nav` /
+`algo: "floor_field"`. Prefer `fast_nav` for new integrations. It still bakes the
+canonical FAST NAV preset, runs an internal recovery ladder, and can emit a GLB.
 
 ```ts
 import init, { init_splatwalk, build_room_floor_mesh, mesh_to_glb } from '@splatwalk/core';
@@ -91,7 +158,7 @@ const splatBytes: Uint8Array = /* your .ply (or .spz converted via spz_to_ply) *
 
 const floor = build_room_floor_mesh(splatBytes, {
   mode: 2,
-  flip_y: true,            // match your renderer (see section 4)
+  flip_y: true,            // match your renderer (see coordinate / flip_y section)
   rotation: [0, 0, 0],     // user orientation in radians, applied in WASM
   emit_glb: true,          // optional: also return GLB bytes
 });
@@ -104,9 +171,11 @@ If you need the lower-level field (per-cell states for your own meshing), use
 `build_walkable_ground_field` instead and merge `fast_nav_preset()` into your
 settings as the base layer.
 
-## 4. Collision voxel boundary mode
+## 5. Collision voxel boundary mode
 
-Collision export is a second runtime mode, not the default FAST NAV navmesh mode:
+Collision export is a second runtime mode, not the default FAST NAV navmesh mode.
+For nav with stairs, prefer `fast_nav({ algo: 'voxel_collision' | 'sdf_marching_cubes' })`
+above; use this primitive when you only need a `.collision.glb` / physics overlay:
 
 ```ts
 import {
@@ -128,11 +197,11 @@ const collisionGlb =
   collision.glb ?? mesh_to_glb(collision.mesh.vertices, collision.mesh.indices);
 ```
 
-Use this path for a collision/physics overlay or `.collision.glb` export. It follows the PlayCanvas-inspired voxel occupancy/fill/carve pipeline and emits exact voxel-boundary faces today. `collision_mesh_mode: 'smooth'` is reserved and rejected until smoothing is implemented. For walking/crowd simulation, keep using the FAST NAV floor-field path; do not feed the collision mesh into the one-button room navigation workflow unless you are intentionally running an advanced/manual collider bake.
+Use this path for a collision/physics overlay or `.collision.glb` export. It follows the PlayCanvas-inspired voxel occupancy/fill/carve pipeline. `collision_mesh_mode: 'faces'` emits exact voxel-boundary faces; `collision_mesh_mode: 'smooth'` runs a truncated 3D SDF + Marching Cubes isosurface entirely in WASM (capability `sdf_marching_cubes`) and is a good Recast input for stairs. Feature-detect with `splatwalk_capabilities()`. For walking/crowd simulation, prefer `fast_nav` with the [algo sweet spots](wasm-api.md#algo-sweet-spots) above.
 
-## 5. The coordinate / `flip_y` contract (read this first)
+## 6. The coordinate / `flip_y` contract (read this first)
 
-> For the condensed, cross-engine summary of this section and sections 10-11, see
+> For the condensed, cross-engine summary of this section and sections 11-12, see
 > the one-page [Canonical GS Alignment Recipe](coordinate-alignment.md).
 
 The single most common integration bug is a navmesh mirrored or offset from the
@@ -160,7 +229,7 @@ const result = build_room_floor_mesh(splatBytes, {
 // result.space.space === 'engine_output'
 ```
 
-## 6. Feeding Recast without the voxel-truncation bug
+## 7. Feeding Recast without the voxel-truncation bug
 
 Recast stores agent dimensions as **integer voxel counts**, so passing sub-metre
 metre values silently truncates them to `0` (a slab or a fragmented navmesh).
@@ -184,7 +253,7 @@ const cfg = recast_config({
 See [Recast parameter units (metres vs voxels)](wasm-api.md#recast-parameter-units-metres-vs-voxels)
 for the exact conversion.
 
-## 7. Progress reporting
+## 8. Progress reporting
 
 Register an opt-in callback invoked as `(stage, fraction)` at documented stage
 boundaries - no need to intercept the global console. The
@@ -202,7 +271,7 @@ set_progress_callback((stage, fraction) => {
 set_progress_callback(undefined);   // clear when done
 ```
 
-## 8. Handling failures
+## 9. Handling failures
 
 `build_room_floor_mesh` throws a structured `RoomFloorFailure` object (not a
 string) when no recovery step yields a usable floor. Branch on the stable
@@ -227,7 +296,7 @@ try {
 }
 ```
 
-## 9. Framework-agnostic floor module
+## 10. Framework-agnostic floor module
 
 The `@splatwalk/core/floor` subpath ships the FAST NAV floor logic with no
 Babylon or bundler dependency. Inject the binary's field builder so the module
@@ -260,7 +329,7 @@ builds a Recast navmesh, and runs a click-to-move crowd, see the
 `src/react/`). It uses the same engine-agnostic floor module and
 `recast-navigation` crowd on a three.js scene.
 
-## 10. Babylon.js integration
+## 11. Babylon.js integration
 
 Babylon.js is the reference renderer for the SplatWalk showcase. The complete,
 working integration is `src/scene/Viewer.ts` (UI in `src/vuetify/`, route
@@ -341,9 +410,14 @@ so the player stays framed in rooms of any height.
 **Camera select (view + offsets).** Hosts can pin the select-region AABB from a
 FreeCamera-style view and restore that view after Fast Nav (skip `focusOnPlayer`
 when `keptCameraSelectView` is true). Wire format stays WASM `region_min` /
-`region_max`; `api_version` remains **2**. CDN pin `@splatwalk/core@0.6.4`.
-Demos also support **Download / Upload nav artifacts** (zip or multi-select of `nav_session.json` + volume trio or `recast.navmesh.bin`). The Storage Adapter **Region and prune** panel can rebuild this AABB from the live
-fly camera (**Apply select region from camera**) with editable L/R/forward/behind/below/above offsets.
+`region_max`; `api_version` remains **2**. CDN pin `@splatwalk/core@0.6.10`.
+Demos support **NavKit** (`navkit-<slug>.zip`: `meta-nav.json` + original model + `nav/`
+artifacts including `walkable_floors.glb` for click-to-move) for download and
+drop-to-restore — see [`navkit.md`](navkit.md). Workbench restore is **NavKit only**
+(legacy nav-artifacts upload removed there). Vuetify / R3F may still accept legacy
+**nav-artifacts** zips when a splat is already loaded. The Storage Adapter **Region and prune**
+panel can rebuild this AABB from the live fly camera (**Apply select region from camera**)
+with editable L/R/forward/behind/below/above offsets.
 
 ```ts
 await runFastNav({
@@ -382,7 +456,7 @@ unchanged from the rest of this guide:
 
 ```ts
 // Babylon Playground (TypeScript). Full file: public/playground/babylon-fast-nav.ts
-const sw: any = await import('https://cdn.jsdelivr.net/npm/@splatwalk/core@0.6.4/wasm_splatwalk.js');
+const sw: any = await import('https://cdn.jsdelivr.net/npm/@splatwalk/core@0.6.10/wasm_splatwalk.js');
 await sw.default();        // wasm-bindgen --target web init (fetches the .wasm from the same CDN dir)
 sw.init_splatwalk();       // register the PLY/SPZ parsers (once)
 
@@ -418,7 +492,7 @@ const agentIndex = crowd.addAgent(nav.getClosestPoint(center), agentParams, agen
   (`playground.json` V2). Host owns WebGL/WebGPU — see
   [`public/playground/PLAYGROUND_README.md`](../public/playground/PLAYGROUND_README.md).
   Stack-specific zip kits (Vuetify / R3F / Storage / workbench) live under
-  `/integration-kits/` (built with `npm run build:kits`, pin `@splatwalk/core@0.6.4`).
+  `/integration-kits/` (built with `npm run build:kits`, pin `@splatwalk/core@0.6.10`).
   The file is a Babylon Playground **V2 snippet** (`{ payload, name, description,
   tags }` → V2 manifest), so it loads straight into the Playground for editing. An
   **Open Playground ↗** button opens the published snippet
@@ -433,7 +507,7 @@ const agentIndex = crowd.addAgent(nav.getClosestPoint(center), agentParams, agen
   `access-control-allow-origin: *`. `.spz` examples are gunzipped in-browser
   (`DecompressionStream('gzip')`) before `spz_to_ply`.
 
-## 11. React Three Fiber (three.js) integration
+## 12. React Three Fiber (three.js) integration
 
 A first-class three.js / React reference ships in-repo: route `/react`, source
 under `src/react/` (engine logic in `src/react/three/SplatNavController.ts`),
@@ -492,7 +566,7 @@ target the player, and use a vertical FOV of `~0.8 rad (45.84°)` to match
 Babylon's `ArcRotateCamera`. Use a ceiling `margin` of ~`0.65 m` so the camera
 keeps headroom below the ceiling instead of hugging it.
 
-## 12. Integrator ask status
+## 13. Integrator ask status
 
 The community integration wishlist gathered against the pre-release core is fully
 addressed as of v0.3.0:

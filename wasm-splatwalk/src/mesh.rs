@@ -9,7 +9,7 @@ use nalgebra::{Point3, UnitQuaternion, Vector3};
 use poisson_reconstruction::{PoissonReconstruction, Real};
 use rand::Rng;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ReconstructedMesh {
     pub vertices: Vec<f32>,
     pub indices: Vec<u32>,
@@ -60,6 +60,8 @@ struct FieldBuild {
 
 struct CollisionBuild {
     mesh: ReconstructedMesh,
+    /// Full MC shell when smooth mode projects a floor into `mesh`.
+    collider_mesh: Option<ReconstructedMesh>,
     basis: FieldBasis,
     plane: FloorPlane,
     diagnostics: ReconstructionDiagnostics,
@@ -280,35 +282,39 @@ pub fn build_collision_voxel_boundary(
     let context = build_context(points, settings);
     let mut diagnostics = context.diagnostics.clone();
     let collision = build_collision_mesh(&context, settings, &mut diagnostics, emit_volume);
-    let (mesh, basis, plane, diagnostics, volume) = if let Some(collision) = collision {
-        (
-            collision.mesh,
-            collision.basis,
-            collision.plane,
-            collision.diagnostics,
-            collision.volume,
-        )
-    } else {
-        (
-            ReconstructedMesh {
-                vertices: vec![],
-                indices: vec![],
-            },
-            default_field_basis(),
-            FloorPlane {
-                normal: [0.0, 1.0, 0.0],
-                d: 0.0,
-            },
-            diagnostics,
-            None,
-        )
-    };
+    let (mesh, collider_mesh, basis, plane, diagnostics, volume) =
+        if let Some(collision) = collision {
+            (
+                collision.mesh,
+                collision.collider_mesh,
+                collision.basis,
+                collision.plane,
+                collision.diagnostics,
+                collision.volume,
+            )
+        } else {
+            (
+                ReconstructedMesh {
+                    vertices: vec![],
+                    indices: vec![],
+                },
+                None,
+                default_field_basis(),
+                FloorPlane {
+                    normal: [0.0, 1.0, 0.0],
+                    d: 0.0,
+                },
+                diagnostics,
+                None,
+            )
+        };
 
     CollisionVoxelBoundaryResult {
         api_version: crate::API_VERSION,
         semver: crate::core_semver(),
         capabilities: crate::capabilities(),
         mesh: MeshBuffers::new(mesh.vertices, mesh.indices),
+        collider_mesh: collider_mesh.map(|m| MeshBuffers::new(m.vertices, m.indices)),
         glb: None,
         volume,
         space: CoordinateSpace::splatwalk_oriented(),
@@ -358,6 +364,194 @@ fn environment_scale(settings: &MeshSettings) -> f64 {
     }
 }
 
+fn region_aabb<'a>(settings: &'a MeshSettings) -> Option<(&'a [f64], &'a [f64])> {
+    match (&settings.region_min, &settings.region_max) {
+        (Some(rmin), Some(rmax)) if rmin.len() == 3 && rmax.len() == 3 => Some((rmin, rmax)),
+        _ => None,
+    }
+}
+
+fn clamp_point_to_aabb(p: [f64; 3], region_min: &[f64], region_max: &[f64]) -> [f64; 3] {
+    [
+        p[0].clamp(region_min[0], region_max[0]),
+        p[1].clamp(region_min[1], region_max[1]),
+        p[2].clamp(region_min[2], region_max[2]),
+    ]
+}
+
+/// When `region_min`/`region_max` are set, force seed + camera into the AABB.
+pub(crate) fn clamp_seed_and_camera_to_region(settings: &mut MeshSettings) {
+    let Some((rmin, rmax)) = region_aabb(settings) else {
+        return;
+    };
+    let rmin = [rmin[0], rmin[1], rmin[2]];
+    let rmax = [rmax[0], rmax[1], rmax[2]];
+    if let Some(seed) = settings.collision_seed.as_mut() {
+        if seed.len() == 3 && seed.iter().all(|v| v.is_finite()) {
+            let clamped = clamp_point_to_aabb([seed[0], seed[1], seed[2]], &rmin, &rmax);
+            seed[0] = clamped[0];
+            seed[1] = clamped[1];
+            seed[2] = clamped[2];
+        }
+    }
+    if let Some(cam) = settings.camera_position.as_mut() {
+        if cam.len() == 3 && cam.iter().all(|v| v.is_finite()) {
+            let clamped = clamp_point_to_aabb([cam[0], cam[1], cam[2]], &rmin, &rmax);
+            cam[0] = clamped[0];
+            cam[1] = clamped[1];
+            cam[2] = clamped[2];
+        }
+    }
+}
+
+fn point_outside_region(coords: [f64; 3], region_min: &[f64], region_max: &[f64]) -> bool {
+    coords[0] < region_min[0]
+        || coords[0] > region_max[0]
+        || coords[1] < region_min[1]
+        || coords[1] > region_max[1]
+        || coords[2] < region_min[2]
+        || coords[2] > region_max[2]
+}
+
+/// Above this many input splats, an empty pin must not fall back to the full cloud.
+pub(crate) const EMPTY_REGION_FULL_CLOUD_MAX_SPLATS: usize = 500_000;
+
+/// Axis-aligned fallback box around a viewpoint (mirrors host camera-select
+/// defaults: ~10 m sides, 15 m forward bias averaged into ±12 m XZ, −5/+15 Y).
+const EMPTY_REGION_CAMERA_HALF_XZ_M: f64 = 12.0;
+const EMPTY_REGION_CAMERA_BELOW_M: f64 = 5.0;
+const EMPTY_REGION_CAMERA_ABOVE_M: f64 = 15.0;
+
+/// Resolve a viewpoint for empty-region fallback: `camera_position`, then
+/// `collision_seed`, then oriented AABB center.
+fn empty_region_viewpoint(
+    settings: &MeshSettings,
+    oriented_min: [f64; 3],
+    oriented_max: [f64; 3],
+) -> [f64; 3] {
+    if let Some(cam) = settings.camera_position.as_ref() {
+        if cam.len() == 3 && cam.iter().all(|v| v.is_finite()) {
+            return [cam[0], cam[1], cam[2]];
+        }
+    }
+    if let Some(seed) = settings.collision_seed.as_ref() {
+        if seed.len() == 3 && seed.iter().all(|v| v.is_finite()) {
+            return [seed[0], seed[1], seed[2]];
+        }
+    }
+    [
+        (oriented_min[0] + oriented_max[0]) * 0.5,
+        (oriented_min[1] + oriented_max[1]) * 0.5,
+        (oriented_min[2] + oriented_max[2]) * 0.5,
+    ]
+}
+
+/// Reasonable AABB around a viewpoint for empty-pin / region_too_large recovery.
+pub(crate) fn camera_centered_fallback_region(center: [f64; 3]) -> (Vec<f64>, Vec<f64>) {
+    camera_centered_fallback_region_extent(center, EMPTY_REGION_CAMERA_HALF_XZ_M)
+}
+
+/// Camera-centered AABB with a custom XZ half-extent (metres).
+pub(crate) fn camera_centered_fallback_region_extent(
+    center: [f64; 3],
+    half_xz_m: f64,
+) -> (Vec<f64>, Vec<f64>) {
+    let half = half_xz_m.max(4.0);
+    (
+        vec![
+            center[0] - half,
+            center[1] - EMPTY_REGION_CAMERA_BELOW_M,
+            center[2] - half,
+        ],
+        vec![
+            center[0] + half,
+            center[1] + EMPTY_REGION_CAMERA_ABOVE_M,
+            center[2] + half,
+        ],
+    )
+}
+
+/// Viewpoint for camera-region defaults: `camera_position` → `collision_seed` → fallback.
+pub(crate) fn camera_region_viewpoint(
+    settings: &MeshSettings,
+    diagnostics: Option<&ReconstructionDiagnostics>,
+    fallback: [f64; 3],
+) -> [f64; 3] {
+    if let Some(cam) = settings.camera_position.as_ref() {
+        if cam.len() == 3 && cam.iter().all(|v| v.is_finite()) {
+            return [cam[0], cam[1], cam[2]];
+        }
+    }
+    if let Some(seed) = settings.collision_seed.as_ref() {
+        if seed.len() == 3 && seed.iter().all(|v| v.is_finite()) {
+            return [seed[0], seed[1], seed[2]];
+        }
+    }
+    if let Some(d) = diagnostics {
+        if let (Some(min), Some(max)) = (d.oriented_min, d.oriented_max) {
+            return [
+                (min[0] + max[0]) * 0.5,
+                (min[1] + max[1]) * 0.5,
+                (min[2] + max[2]) * 0.5,
+            ];
+        }
+    }
+    fallback
+}
+
+/// Early region cull in parse-space (after `flip_y`, before floater prune).
+///
+/// Tests each point after the same rotation + `environment_scale` that
+/// {@link build_context} applies, so the AABB matches `region_min`/`region_max`
+/// in `splatwalk_oriented` space. Returns kept points in **input** space (so
+/// downstream `build_context` can re-orient) plus the discarded count.
+///
+/// Used by `parse_splats` / `fast_nav` so prune + voxel/floor work never touch
+/// out-of-box splats.
+pub(crate) fn cull_points_outside_region(
+    points: &[PointNormal],
+    settings: &MeshSettings,
+) -> (Vec<PointNormal>, usize) {
+    let Some((region_min, region_max)) = region_aabb(settings) else {
+        return (points.to_vec(), 0);
+    };
+
+    let env_scale = environment_scale(settings);
+    let rot_matrix = settings.rotation.as_ref().and_then(|rot| {
+        if rot.len() == 3 {
+            let q =
+                UnitQuaternion::from_euler_angles(rot[0] as Real, rot[1] as Real, rot[2] as Real);
+            Some(q.to_rotation_matrix())
+        } else {
+            None
+        }
+    });
+
+    let mut kept = Vec::with_capacity(points.len().min(points.len() / 4 + 1));
+    let mut discarded = 0usize;
+    for p in points {
+        if !p.point.x.is_finite() || !p.point.y.is_finite() || !p.point.z.is_finite() {
+            discarded += 1;
+            continue;
+        }
+        let mut pt = Point3::new(p.point.x as Real, p.point.y as Real, p.point.z as Real);
+        if let Some(ref m) = rot_matrix {
+            pt = m.transform_point(&pt);
+        }
+        let coords = [
+            pt.x as f64 * env_scale,
+            pt.y as f64 * env_scale,
+            pt.z as f64 * env_scale,
+        ];
+        if point_outside_region(coords, region_min, region_max) {
+            discarded += 1;
+            continue;
+        }
+        kept.push(p.clone());
+    }
+    (kept, discarded)
+}
+
 fn build_context(points: &[PointNormal], settings: &MeshSettings) -> ReconstructionContext {
     let min_alpha = settings.min_alpha.unwrap_or(0.05);
     let max_scale = settings.max_scale.unwrap_or(5.0);
@@ -374,15 +568,24 @@ fn build_context(points: &[PointNormal], settings: &MeshSettings) -> Reconstruct
             None
         }
     });
+    let region = region_aabb(settings);
 
     let mut diagnostics = ReconstructionDiagnostics::empty(points.len());
     diagnostics.region_min = settings.region_min.clone();
     diagnostics.region_max = settings.region_max.clone();
 
-    let mut oriented_points = Vec::with_capacity(points.len());
+    // When a region is pinned, only retain in-box oriented points — out-of-box
+    // splats must not inflate memory or downstream scans. Full-scene AABB /
+    // floor percentile still come from every valid oriented sample.
+    let mut oriented_points = Vec::with_capacity(if region.is_some() {
+        points.len().min(points.len() / 4 + 1)
+    } else {
+        points.len()
+    });
     let mut y_values = Vec::with_capacity(points.len());
     let mut min = [f64::MAX; 3];
     let mut max = [f64::MIN; 3];
+    let mut saw_oriented = false;
 
     for p in points {
         if !p.point.x.is_finite() || !p.point.y.is_finite() || !p.point.z.is_finite() {
@@ -419,33 +622,120 @@ fn build_context(points: &[PointNormal], settings: &MeshSettings) -> Reconstruct
             max[axis] = max[axis].max(coords[axis]);
         }
         y_values.push(oriented.point.y);
+        saw_oriented = true;
+
+        if let Some((region_min, region_max)) = region {
+            if point_outside_region(coords, region_min, region_max) {
+                diagnostics.points_region_discarded += 1;
+                // Keep a deferred copy when the pin may be empty so we can
+                // default to all oriented splats without a second full pass.
+                // (Pushed only if oriented_points stays empty — see below.)
+                continue;
+            }
+        }
+
         oriented_points.push(oriented);
     }
 
-    if !oriented_points.is_empty() {
+    if saw_oriented {
         diagnostics.oriented_min = Some(min);
         diagnostics.oriented_max = Some(max);
         diagnostics.floor_y_percentile_02 = Some(percentile(&mut y_values, 0.02));
     }
 
-    let mut filtered_points = Vec::with_capacity(oriented_points.len());
-
-    for p in &oriented_points {
-        if let (Some(region_min), Some(region_max)) = (&settings.region_min, &settings.region_max) {
-            if region_min.len() == 3 && region_max.len() == 3 {
-                if p.point.x < region_min[0]
-                    || p.point.x > region_max[0]
-                    || p.point.y < region_min[1]
-                    || p.point.y > region_max[1]
-                    || p.point.z < region_min[2]
-                    || p.point.z > region_max[2]
-                {
+    // Empty selection region → all splats (small clouds) or camera-centered box
+    // (immense clouds — never materialize the full city-scale set).
+    if region.is_some() && oriented_points.is_empty() && saw_oriented {
+        let total = points.len();
+        if total > EMPTY_REGION_FULL_CLOUD_MAX_SPLATS {
+            let center = empty_region_viewpoint(settings, min, max);
+            let (rmin, rmax) = camera_centered_fallback_region(center);
+            web_sys::console::log_1(
+                &format!(
+                    "Region cull left zero oriented splats ({} total) — using camera-centered region around [{:.2}, {:.2}, {:.2}]",
+                    total, center[0], center[1], center[2]
+                )
+                .into(),
+            );
+            diagnostics.region_min = Some(rmin.clone());
+            diagnostics.region_max = Some(rmax.clone());
+            diagnostics.points_region_discarded = 0;
+            for p in points {
+                if !p.point.x.is_finite() || !p.point.y.is_finite() || !p.point.z.is_finite() {
+                    continue;
+                }
+                let mut pt = Point3::new(p.point.x as Real, p.point.y as Real, p.point.z as Real);
+                let mut norm =
+                    Vector3::new(p.normal.x as Real, p.normal.y as Real, p.normal.z as Real);
+                if let Some(ref m) = rot_matrix {
+                    pt = m.transform_point(&pt);
+                    norm = m.transform_vector(&norm);
+                }
+                let oriented = PointNormal {
+                    point: Point3::new(
+                        pt.x as f64 * env_scale,
+                        pt.y as f64 * env_scale,
+                        pt.z as f64 * env_scale,
+                    ),
+                    normal: Vector3::new(norm.x as f64, norm.y as f64, norm.z as f64),
+                    scale: Vector3::new(
+                        p.scale.x * env_scale,
+                        p.scale.y * env_scale,
+                        p.scale.z * env_scale,
+                    ),
+                    opacity: p.opacity,
+                };
+                let coords = [oriented.point.x, oriented.point.y, oriented.point.z];
+                if point_outside_region(coords, &rmin, &rmax) {
                     diagnostics.points_region_discarded += 1;
                     continue;
                 }
+                oriented_points.push(oriented);
+            }
+        } else {
+            web_sys::console::log_1(
+                &format!(
+                    "Region cull left zero oriented splats ({} total) — defaulting to all splats",
+                    total
+                )
+                .into(),
+            );
+            diagnostics.points_region_discarded = 0;
+            diagnostics.region_min = None;
+            diagnostics.region_max = None;
+            for p in points {
+                if !p.point.x.is_finite() || !p.point.y.is_finite() || !p.point.z.is_finite() {
+                    continue;
+                }
+                let mut pt = Point3::new(p.point.x as Real, p.point.y as Real, p.point.z as Real);
+                let mut norm =
+                    Vector3::new(p.normal.x as Real, p.normal.y as Real, p.normal.z as Real);
+                if let Some(ref m) = rot_matrix {
+                    pt = m.transform_point(&pt);
+                    norm = m.transform_vector(&norm);
+                }
+                oriented_points.push(PointNormal {
+                    point: Point3::new(
+                        pt.x as f64 * env_scale,
+                        pt.y as f64 * env_scale,
+                        pt.z as f64 * env_scale,
+                    ),
+                    normal: Vector3::new(norm.x as f64, norm.y as f64, norm.z as f64),
+                    scale: Vector3::new(
+                        p.scale.x * env_scale,
+                        p.scale.y * env_scale,
+                        p.scale.z * env_scale,
+                    ),
+                    opacity: p.opacity,
+                });
             }
         }
+    }
 
+    let mut filtered_points = Vec::with_capacity(oriented_points.len());
+
+    for p in &oriented_points {
+        // Region already applied above; only opacity/scale remain.
         if p.opacity <= min_alpha
             || p.scale.x >= max_scale_world
             || p.scale.y >= max_scale_world
@@ -494,12 +784,12 @@ fn reconstruct_voxel_navmesh(
 
 fn collision_grid_bounds(
     diagnostics: &ReconstructionDiagnostics,
-    settings: &MeshSettings,
+    _settings: &MeshSettings,
 ) -> Option<(Vector3<f64>, Vector3<f64>)> {
-    // When region is pinned, size the voxel grid to that box (PlayCanvas writeVoxel pads
-    // around the working volume). Using full splat AABB for city-scale materialized
-    // streams forces coarse voxel_size under the dense-grid cap and destroys stairs.
-    if let (Some(rmin), Some(rmax)) = (&settings.region_min, &settings.region_max) {
+    // Prefer diagnostics.region_* (may be the caller pin, or an empty-pin fallback
+    // camera box). When absent (full-cloud fallback), size to oriented AABB.
+    // Using full splat AABB for city-scale streams coarsens voxels under the cap.
+    if let (Some(rmin), Some(rmax)) = (&diagnostics.region_min, &diagnostics.region_max) {
         if rmin.len() == 3 && rmax.len() == 3 {
             return Some((
                 Vector3::new(rmin[0], rmin[1], rmin[2]),
@@ -648,12 +938,15 @@ fn build_collision_mesh(
         voxel_size *= 1.25;
     };
 
-    let region_pinned = settings
-        .region_min
-        .as_ref()
-        .zip(settings.region_max.as_ref())
-        .map(|(min, max)| min.len() == 3 && max.len() == 3)
-        .unwrap_or(false);
+    // Match collision_grid_bounds: empty-pin fallback clears diagnostics.region_*.
+    let region_pinned = diagnostics.region_min.is_some()
+        && diagnostics.region_max.is_some()
+        && settings
+            .region_min
+            .as_ref()
+            .zip(settings.region_max.as_ref())
+            .map(|(min, max)| min.len() == 3 && max.len() == 3)
+            .unwrap_or(false);
 
     crate::emit_progress("collision_grid", Some(1.0));
     web_sys::console::log_1(
@@ -728,17 +1021,13 @@ fn build_collision_mesh(
         return None;
     }
 
-    let seed = collision_seed(settings, diagnostics, &grid);
+    let carve_height = settings.collision_carve_height.unwrap_or(1.6);
+    let carve_radius = settings.collision_carve_radius.unwrap_or(0.2);
+    let mut seed = collision_seed(settings, diagnostics, &grid);
     diagnostics.collision_seed_used = Some([seed.x, seed.y, seed.z]);
-    diagnostics.collision_seed_state = seed_state(
-        &grid,
-        &solid,
-        seed,
-        settings.collision_carve_height.unwrap_or(1.6),
-        settings.collision_carve_radius.unwrap_or(0.2),
-    );
-    // PlayCanvas writeVoxel uses optional pre-voxel `--filter-cluster` on splats, not a
-    // post-voxel solid trim. Post-voxel cluster filtering removed for carve parity.
+    diagnostics.collision_seed_state =
+        seed_state(&grid, &solid, seed, carve_height, carve_radius);
+    // Optional pre-voxel cluster filter on splats; no post-voxel solid trim.
     let cluster_kept = occupied_before;
     let cluster_discarded = 0usize;
     crate::emit_progress("collision_fill", None);
@@ -751,24 +1040,31 @@ fn build_collision_mesh(
         region_pinned,
     );
     crate::emit_progress("collision_carve", None);
-    let nav_region = carve_pc_style(
-        &grid,
-        &solid,
-        seed,
-        settings.collision_carve_height.unwrap_or(1.6),
-        settings.collision_carve_radius.unwrap_or(0.2),
-    );
-    let carved = nav_region.iter().filter(|&&v| v).count();
+    let mut nav_region =
+        carve_pc_style(&grid, &solid, seed, carve_height, carve_radius);
+    let mut carved = nav_region.iter().filter(|&&v| v).count();
+    if carved == 0 {
+        if let Some(free_seed) =
+            find_free_capsule_seed_in_grid(&grid, &solid, seed, carve_height, carve_radius)
+        {
+            web_sys::console::log_1(
+                &format!(
+                    "Seed carve empty — retrying with in-region free cell [{:.3}, {:.3}, {:.3}]",
+                    free_seed.x, free_seed.y, free_seed.z
+                )
+                .into(),
+            );
+            seed = free_seed;
+            diagnostics.collision_seed_used = Some([seed.x, seed.y, seed.z]);
+            nav_region = carve_pc_style(&grid, &solid, seed, carve_height, carve_radius);
+            carved = nav_region.iter().filter(|&&v| v).count();
+        }
+    }
     if carved == 0 {
         diagnostics.collision_failure_reason =
             Some("seed_not_reachable_or_capsule_blocked".to_string());
-        diagnostics.collision_seed_state = seed_state(
-            &grid,
-            &solid,
-            seed,
-            settings.collision_carve_height.unwrap_or(1.6),
-            settings.collision_carve_radius.unwrap_or(0.2),
-        );
+        diagnostics.collision_seed_state =
+            seed_state(&grid, &solid, seed, carve_height, carve_radius);
         write_collision_grid_diagnostics(
             diagnostics,
             &grid,
@@ -788,11 +1084,105 @@ fn build_collision_mesh(
         .as_deref()
         .unwrap_or("walkable_floors")
         .to_string();
-    crate::emit_progress("collision_mesh", None);
+    let sdf_band_voxels = settings
+        .sdf_band_voxels
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(3.0)
+        .clamp(1.0, 16.0);
+    let mc_iso_level = settings
+        .mc_iso_level
+        .filter(|v| v.is_finite())
+        .unwrap_or(0.0);
+    let mc_smooth_iterations = settings.mc_smooth_iterations.unwrap_or(1).min(8);
+    let outdoor_scene = scene_type == "outdoor";
+    let default_floor_flatten = if outdoor_scene {
+        DEFAULT_OUTDOOR_FLOOR_PROJECT_FLATTEN_M
+    } else {
+        DEFAULT_FLOOR_PROJECT_FLATTEN_M
+    };
+    let floor_project_flatten_m = settings
+        .floor_project_flatten_m
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(default_floor_flatten)
+        .clamp(0.0, MAX_FLOOR_PROJECT_FLATTEN_M);
+    let mut collider_mesh: Option<ReconstructedMesh> = None;
+    let mut floor_project_mode = String::new();
+    let mut applied_floor_flatten_m = 0.0;
     let mesh = match mesh_mode.as_str() {
-        "obstacle_shell" | "faces" => mesh_from_obstacle_shell(&grid, &solid, &nav_region),
-        "walkable_floors" => mesh_from_walkable_floors(&grid, &solid, &nav_region),
-        _ => mesh_from_walkable_floors(&grid, &solid, &nav_region),
+        "smooth" => {
+            crate::emit_progress("collision_sdf", None);
+            crate::emit_progress("collision_marching_cubes", None);
+            let mc = crate::sdf_mc::mesh_from_solid_sdf(
+                &solid,
+                grid.dims,
+                [grid.min.x, grid.min.y, grid.min.z],
+                grid.voxel_size,
+                sdf_band_voxels,
+                mc_iso_level,
+                mc_smooth_iterations,
+            );
+            let mc_mesh = ReconstructedMesh {
+                vertices: mc.vertices,
+                indices: mc.indices,
+            };
+            // Overlay shell is a clone taken before project — never mutated by floor project.
+            let mc_for_overlay = mc_mesh.clone();
+            let mc_has_tris = !mc_for_overlay.indices.is_empty();
+            // Outdoor: open sky cast + local solid-top minima (vegetation).
+            // Indoor sealed: cast from carved void so roof is not selected.
+            let interior = !outdoor_scene && carved > 0;
+            floor_project_mode = if outdoor_scene {
+                "outdoor_minima".to_string()
+            } else if interior {
+                "interior".to_string()
+            } else {
+                "open".to_string()
+            };
+            applied_floor_flatten_m = floor_project_flatten_m;
+            crate::emit_progress("collision_floor_project", None);
+            let walk_band = settings
+                .collision_carve_height
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .unwrap_or(1.6)
+                + 0.4;
+            let mut floor = if mc_has_tris {
+                project_mc_floor_mesh(
+                    &mc_mesh,
+                    &grid,
+                    &solid,
+                    &nav_region,
+                    interior,
+                    outdoor_scene,
+                    floor_project_flatten_m,
+                    walk_band,
+                )
+            } else {
+                ReconstructedMesh {
+                    vertices: Vec::new(),
+                    indices: Vec::new(),
+                }
+            };
+            if floor.indices.is_empty() {
+                floor = mesh_from_walkable_floors(&grid, &solid, &nav_region);
+            }
+            debug_assert_eq!(mc_for_overlay.vertices, mc_mesh.vertices);
+            debug_assert_eq!(mc_for_overlay.indices, mc_mesh.indices);
+            // Hosts require collider_mesh for cyan; never omit a non-empty MC shell.
+            collider_mesh = if mc_has_tris {
+                Some(mc_for_overlay)
+            } else {
+                None
+            };
+            floor
+        }
+        "obstacle_shell" | "faces" => {
+            crate::emit_progress("collision_mesh", None);
+            mesh_from_obstacle_shell(&grid, &solid, &nav_region)
+        }
+        _ => {
+            crate::emit_progress("collision_mesh", None);
+            mesh_from_walkable_floors(&grid, &solid, &nav_region)
+        }
     };
     let surface_faces = mesh.indices.len() / 3;
 
@@ -826,13 +1216,37 @@ fn build_collision_mesh(
         settings.collision_carve_radius.unwrap_or(0.2),
     );
     diagnostics.collision_scene_type = scene_type;
-    diagnostics.collision_mesh_mode = mesh_mode;
+    diagnostics.collision_mesh_mode = mesh_mode.clone();
     diagnostics.collision_external_fill_leaked = external_fill_leaked;
-    diagnostics.collision_failure_reason = None;
+    diagnostics.collision_sdf_band_voxels = if mesh_mode == "smooth" {
+        sdf_band_voxels
+    } else {
+        0.0
+    };
+    diagnostics.collision_mc_iso_level = if mesh_mode == "smooth" {
+        mc_iso_level
+    } else {
+        0.0
+    };
+    diagnostics.collision_mc_smooth_iterations = if mesh_mode == "smooth" {
+        mc_smooth_iterations
+    } else {
+        0
+    };
+    diagnostics.collision_floor_project_mode = floor_project_mode;
+    diagnostics.collision_floor_project_flatten_m = applied_floor_flatten_m;
+    diagnostics.collision_failure_reason = if mesh_mode == "smooth" && collider_mesh.is_none() {
+        Some("sdf_mc_empty_mesh".to_string())
+    } else if surface_faces == 0 && mesh_mode == "smooth" {
+        Some("sdf_mc_empty_floor_project".to_string())
+    } else {
+        None
+    };
 
     web_sys::console::log_1(&format!(
-        "Collision carve: grid={}x{}x{}, voxel={:.3}, occupied={}, kept={}, discarded={}, filled={}, carved={}, faces={}",
-        grid.dims[0], grid.dims[1], grid.dims[2], grid.voxel_size, occupied_before, cluster_kept, cluster_discarded, filled, carved, surface_faces
+        "Collision carve: grid={}x{}x{}, voxel={:.3}, occupied={}, kept={}, discarded={}, filled={}, carved={}, faces={}, mode={}, floor_project={}",
+        grid.dims[0], grid.dims[1], grid.dims[2], grid.voxel_size, occupied_before, cluster_kept, cluster_discarded, filled, carved, surface_faces, mesh_mode,
+        diagnostics.collision_floor_project_mode
     ).into());
 
     let basis = FieldBasis {
@@ -854,6 +1268,7 @@ fn build_collision_mesh(
 
     Some(CollisionBuild {
         mesh,
+        collider_mesh,
         basis,
         plane,
         diagnostics: diagnostics.clone(),
@@ -866,23 +1281,49 @@ fn collision_seed(
     diagnostics: &ReconstructionDiagnostics,
     grid: &VoxelGrid,
 ) -> Vector3<f64> {
-    if let Some(seed) = &settings.collision_seed {
+    let mut seed = if let Some(seed) = &settings.collision_seed {
         if seed.len() == 3 && seed.iter().all(|v| v.is_finite()) {
-            return Vector3::new(seed[0], seed[1], seed[2]);
+            Vector3::new(seed[0], seed[1], seed[2])
+        } else {
+            let min = diagnostics
+                .oriented_min
+                .unwrap_or([grid.min.x, grid.min.y, grid.min.z]);
+            let max = diagnostics
+                .oriented_max
+                .unwrap_or([grid.min.x, grid.min.y, grid.min.z]);
+            Vector3::new(
+                (min[0] + max[0]) * 0.5,
+                diagnostics.floor_y_percentile_02.unwrap_or(min[1]) + 1.0,
+                (min[2] + max[2]) * 0.5,
+            )
         }
+    } else {
+        let min = diagnostics
+            .oriented_min
+            .unwrap_or([grid.min.x, grid.min.y, grid.min.z]);
+        let max = diagnostics
+            .oriented_max
+            .unwrap_or([grid.min.x, grid.min.y, grid.min.z]);
+        Vector3::new(
+            (min[0] + max[0]) * 0.5,
+            diagnostics.floor_y_percentile_02.unwrap_or(min[1]) + 1.0,
+            (min[2] + max[2]) * 0.5,
+        )
+    };
+
+    if let Some((rmin, rmax)) = region_aabb(settings) {
+        let c = clamp_point_to_aabb([seed.x, seed.y, seed.z], rmin, rmax);
+        seed = Vector3::new(c[0], c[1], c[2]);
     }
 
-    let min = diagnostics
-        .oriented_min
-        .unwrap_or([grid.min.x, grid.min.y, grid.min.z]);
-    let max = diagnostics
-        .oriented_max
-        .unwrap_or([grid.min.x, grid.min.y, grid.min.z]);
-    Vector3::new(
-        (min[0] + max[0]) * 0.5,
-        diagnostics.floor_y_percentile_02.unwrap_or(min[1]) + 1.0,
-        (min[2] + max[2]) * 0.5,
-    )
+    let eps = grid.voxel_size * 0.01;
+    let max_x = grid.min.x + grid.dims[0] as f64 * grid.voxel_size - eps;
+    let max_y = grid.min.y + grid.dims[1] as f64 * grid.voxel_size - eps;
+    let max_z = grid.min.z + grid.dims[2] as f64 * grid.voxel_size - eps;
+    seed.x = seed.x.clamp(grid.min.x + eps, max_x.max(grid.min.x + eps));
+    seed.y = seed.y.clamp(grid.min.y + eps, max_y.max(grid.min.y + eps));
+    seed.z = seed.z.clamp(grid.min.z + eps, max_z.max(grid.min.z + eps));
+    seed
 }
 
 fn apply_collision_fill(
@@ -1101,8 +1542,8 @@ fn capsule_fits(
     true
 }
 
-/// PlayCanvas `carve.ts`: dilate solid → BFS empty through dilated obstacles → dilate
-/// reachable empty → navigable volume (matches `gpuDilate3` + `twoLevelBFS` + invert mesh).
+/// Dilate solid → BFS empty through dilated obstacles → dilate reachable empty
+/// → navigable volume.
 fn carve_pc_style(
     grid: &VoxelGrid,
     solid: &[bool],
@@ -1119,8 +1560,13 @@ fn carve_pc_style(
         return vec![false; solid.len()];
     };
 
-    let max_radius = (kernel_r.max(y_half) * 2) as isize;
-    let Some(found) = nearest_free_voxel(grid, &blocked, seed_voxel, max_radius) else {
+    let near_radius = (kernel_r.max(y_half) * 2) as isize;
+    let full_radius = grid.dims[0]
+        .max(grid.dims[1])
+        .max(grid.dims[2]) as isize;
+    let Some(found) = nearest_free_voxel(grid, &blocked, seed_voxel, near_radius)
+        .or_else(|| nearest_free_voxel(grid, &blocked, seed_voxel, full_radius))
+    else {
         return vec![false; solid.len()];
     };
     seed_voxel = found;
@@ -1133,6 +1579,44 @@ fn carve_pc_style(
         .collect();
 
     dilate_voxels_box(grid, &empty, kernel_r, y_half)
+}
+
+/// Prefer a free capsule cell near `prefer`, then scan the full region grid.
+fn find_free_capsule_seed_in_grid(
+    grid: &VoxelGrid,
+    solid: &[bool],
+    prefer: Vector3<f64>,
+    height: f64,
+    radius: f64,
+) -> Option<Vector3<f64>> {
+    let prefer_voxel = grid.point_to_voxel(&prefer).unwrap_or((
+        grid.dims[0] / 2,
+        grid.dims[1] / 2,
+        grid.dims[2] / 2,
+    ));
+    let max_r = grid.dims[0].max(grid.dims[2]) as isize;
+    for search in 0..=max_r {
+        let x0 = (prefer_voxel.0 as isize - search).max(0) as usize;
+        let x1 = (prefer_voxel.0 as isize + search).min(grid.dims[0] as isize - 1) as usize;
+        let z0 = (prefer_voxel.2 as isize - search).max(0) as usize;
+        let z1 = (prefer_voxel.2 as isize + search).min(grid.dims[2] as isize - 1) as usize;
+        for z in z0..=z1 {
+            for x in x0..=x1 {
+                let on_ring = search == 0
+                    || (x as isize - prefer_voxel.0 as isize).abs() == search
+                    || (z as isize - prefer_voxel.2 as isize).abs() == search;
+                if !on_ring {
+                    continue;
+                }
+                for y in 0..grid.dims[1] {
+                    if capsule_fits(grid, solid, x, y, z, height, radius) {
+                        return Some(grid.center(x, y, z));
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn dilate_voxels_box(
@@ -1525,6 +2009,459 @@ fn mesh_from_obstacle_shell(
 /// Walkable floor + stair tread tops for Recast (PC-style): upward-facing quads on
 /// solid voxels that border carved nav volume above. Skips wall/ceiling shells that
 /// fragment Recast into green shards.
+const MC_FLOOR_UP_DOT_MIN: f64 = 0.35;
+const DEFAULT_FLOOR_PROJECT_FLATTEN_M: f64 = 0.08;
+const DEFAULT_OUTDOOR_FLOOR_PROJECT_FLATTEN_M: f64 = 0.35;
+const MAX_FLOOR_PROJECT_FLATTEN_M: f64 = 0.5;
+const MC_FLOOR_BAND_EPS_M: f64 = 0.15;
+const MC_FLOOR_GAP_JUMP_CAP_M: f64 = 0.25;
+
+/// Downward-project MC isosurface to a heightfield floor mesh for Recast.
+/// Interior: cast from carved void. Open/outdoor: cast from sky. Picks floor-band
+/// hits, gap-fills, and flattens toward local minima — never mutates the MC shell.
+fn project_mc_floor_mesh(
+    mc: &ReconstructedMesh,
+    grid: &VoxelGrid,
+    solid: &[bool],
+    nav_region: &[bool],
+    interior: bool,
+    outdoor: bool,
+    flatten_m: f64,
+    walk_band_m: f64,
+) -> ReconstructedMesh {
+    if mc.indices.len() < 3 || mc.vertices.len() < 9 {
+        return ReconstructedMesh {
+            vertices: Vec::new(),
+            indices: Vec::new(),
+        };
+    }
+
+    let tris = mc_triangles(mc);
+    let width = grid.dims[0];
+    let depth = grid.dims[2];
+    let mut heights = vec![None::<f64>; width * depth];
+
+    for z in 0..depth {
+        for x in 0..width {
+            let start_y = if interior {
+                column_nav_top_y(grid, nav_region, x, z)
+            } else {
+                Some(grid.min.y + grid.dims[1] as f64 * grid.voxel_size + grid.voxel_size)
+            };
+            let Some(sy) = start_y else {
+                continue;
+            };
+            if interior {
+                if !(0..grid.dims[1]).any(|y| nav_region[grid.idx(x, y, z)]) {
+                    continue;
+                }
+            } else if !(0..grid.dims[1]).any(|y| solid[grid.idx(x, y, z)]) {
+                continue;
+            }
+
+            let Some(band_center) =
+                column_band_center_y(grid, solid, nav_region, x, z, interior, outdoor)
+            else {
+                continue;
+            };
+
+            let ox = grid.min.x + (x as f64 + 0.5) * grid.voxel_size;
+            let oz = grid.min.z + (z as f64 + 0.5) * grid.voxel_size;
+            let origin = Vector3::new(ox, sy, oz);
+            let dir = Vector3::new(0.0, -1.0, 0.0);
+            if let Some(hit_y) =
+                raycast_mc_floor_band(&tris, origin, dir, band_center, walk_band_m)
+            {
+                heights[z * width + x] = Some(hit_y);
+            }
+        }
+    }
+
+    let jump_cap = MC_FLOOR_GAP_JUMP_CAP_M.max(flatten_m);
+    fill_heightfield_gaps(&mut heights, width, depth, jump_cap);
+    fill_heightfield_gaps(&mut heights, width, depth, jump_cap);
+    flatten_heightfield(&mut heights, width, depth, flatten_m);
+    fill_heightfield_gaps(&mut heights, width, depth, jump_cap);
+    heightfield_to_mesh(grid, &heights, width, depth)
+}
+
+fn column_nav_top_y(
+    grid: &VoxelGrid,
+    nav_region: &[bool],
+    x: usize,
+    z: usize,
+) -> Option<f64> {
+    let mut top: Option<usize> = None;
+    for y in 0..grid.dims[1] {
+        if nav_region[grid.idx(x, y, z)] {
+            top = Some(y);
+        }
+    }
+    top.map(|y| grid.min.y + (y as f64 + 0.95) * grid.voxel_size)
+}
+
+/// Solid-column top Y (world) for a grid column, if any solid exists.
+fn column_solid_top_y(grid: &VoxelGrid, solid: &[bool], x: usize, z: usize) -> Option<f64> {
+    let mut top: Option<usize> = None;
+    for y in 0..grid.dims[1] {
+        if solid[grid.idx(x, y, z)] {
+            top = Some(y);
+        }
+    }
+    top.map(|y| grid.min.y + (y as f64 + 1.0) * grid.voxel_size)
+}
+
+/// Floor of the carved pocket (solid under lowest nav), outdoor local solid-top
+/// minima (3×3), or highest solid top for open indoor fallback.
+fn column_band_center_y(
+    grid: &VoxelGrid,
+    solid: &[bool],
+    nav_region: &[bool],
+    x: usize,
+    z: usize,
+    interior: bool,
+    outdoor: bool,
+) -> Option<f64> {
+    if outdoor {
+        let mut min_top: Option<f64> = None;
+        for dz in -1isize..=1 {
+            for dx in -1isize..=1 {
+                let nx = x as isize + dx;
+                let nz = z as isize + dz;
+                if nx < 0 || nz < 0 || nx >= grid.dims[0] as isize || nz >= grid.dims[2] as isize {
+                    continue;
+                }
+                if let Some(top_y) = column_solid_top_y(grid, solid, nx as usize, nz as usize) {
+                    min_top = Some(match min_top {
+                        Some(m) => m.min(top_y),
+                        None => top_y,
+                    });
+                }
+            }
+        }
+        return min_top;
+    }
+    if interior {
+        let mut lowest_nav: Option<usize> = None;
+        for y in 0..grid.dims[1] {
+            if nav_region[grid.idx(x, y, z)] {
+                lowest_nav = Some(y);
+                break;
+            }
+        }
+        if let Some(ny) = lowest_nav {
+            for y in (0..ny).rev() {
+                if solid[grid.idx(x, y, z)] {
+                    return Some(grid.min.y + (y as f64 + 1.0) * grid.voxel_size);
+                }
+            }
+            return Some(grid.min.y + ny as f64 * grid.voxel_size);
+        }
+    }
+    column_solid_top_y(grid, solid, x, z)
+}
+
+struct McTri {
+    a: Vector3<f64>,
+    b: Vector3<f64>,
+    c: Vector3<f64>,
+    normal: Vector3<f64>,
+}
+
+fn mc_triangles(mc: &ReconstructedMesh) -> Vec<McTri> {
+    let mut out = Vec::with_capacity(mc.indices.len() / 3);
+    let v = &mc.vertices;
+    for tri in mc.indices.chunks_exact(3) {
+        let i0 = tri[0] as usize * 3;
+        let i1 = tri[1] as usize * 3;
+        let i2 = tri[2] as usize * 3;
+        if i0 + 2 >= v.len() || i1 + 2 >= v.len() || i2 + 2 >= v.len() {
+            continue;
+        }
+        let a = Vector3::new(v[i0] as f64, v[i0 + 1] as f64, v[i0 + 2] as f64);
+        let b = Vector3::new(v[i1] as f64, v[i1 + 1] as f64, v[i1 + 2] as f64);
+        let c = Vector3::new(v[i2] as f64, v[i2 + 1] as f64, v[i2 + 2] as f64);
+        let n = (b - a).cross(&(c - a));
+        let len = n.norm();
+        if len < 1e-12 {
+            continue;
+        }
+        out.push(McTri {
+            a,
+            b,
+            c,
+            normal: n / len,
+        });
+    }
+    out
+}
+
+/// Prefer lowest upward hit in the floor band; else lowest upward; else closest any hit.
+fn raycast_mc_floor_band(
+    tris: &[McTri],
+    origin: Vector3<f64>,
+    dir: Vector3<f64>,
+    band_center: f64,
+    walk_band_m: f64,
+) -> Option<f64> {
+    let mut up_hits = Vec::<f64>::new();
+    let mut closest_any_t: Option<f64> = None;
+    for tri in tris {
+        let Some(t) = ray_triangle_t(origin, dir, tri.a, tri.b, tri.c) else {
+            continue;
+        };
+        if t <= 1e-6 {
+            continue;
+        }
+        closest_any_t = Some(closest_any_t.map_or(t, |b| b.min(t)));
+        if tri.normal.y >= MC_FLOOR_UP_DOT_MIN {
+            up_hits.push(origin.y + dir.y * t);
+        }
+    }
+    let lo = band_center - MC_FLOOR_BAND_EPS_M;
+    let hi = band_center + walk_band_m.max(0.5);
+    let mut best_in_band: Option<f64> = None;
+    let mut best_up: Option<f64> = None;
+    for y in up_hits {
+        best_up = Some(best_up.map_or(y, |b| b.min(y)));
+        if y >= lo && y <= hi {
+            best_in_band = Some(best_in_band.map_or(y, |b| b.min(y)));
+        }
+    }
+    if let Some(y) = best_in_band.or(best_up) {
+        return Some(y);
+    }
+    closest_any_t.map(|t| origin.y + dir.y * t)
+}
+
+/// Möller–Trumbore; returns ray parameter t along `dir` (unnormalized OK if unit).
+fn ray_triangle_t(
+    origin: Vector3<f64>,
+    dir: Vector3<f64>,
+    v0: Vector3<f64>,
+    v1: Vector3<f64>,
+    v2: Vector3<f64>,
+) -> Option<f64> {
+    const EPS: f64 = 1e-8;
+    let e1 = v1 - v0;
+    let e2 = v2 - v0;
+    let p = dir.cross(&e2);
+    let det = e1.dot(&p);
+    if det.abs() < EPS {
+        return None;
+    }
+    let inv = 1.0 / det;
+    let tvec = origin - v0;
+    let u = tvec.dot(&p) * inv;
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let q = tvec.cross(&e1);
+    let v = dir.dot(&q) * inv;
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    let t = e2.dot(&q) * inv;
+    if t > EPS {
+        Some(t)
+    } else {
+        None
+    }
+}
+
+fn fill_heightfield_gaps(
+    heights: &mut [Option<f64>],
+    width: usize,
+    depth: usize,
+    jump_cap: f64,
+) {
+    let mut filled = heights.to_vec();
+    for z in 0..depth {
+        for x in 0..width {
+            let i = z * width + x;
+            if heights[i].is_some() {
+                continue;
+            }
+            let mut sum = 0.0;
+            let mut count = 0usize;
+            // Orthogonal + diagonal neighbors so a 2×2 hole can fill from the ring.
+            for dz in -1isize..=1 {
+                for dx in -1isize..=1 {
+                    if dx == 0 && dz == 0 {
+                        continue;
+                    }
+                    let nx = x as isize + dx;
+                    let nz = z as isize + dz;
+                    if nx < 0 || nz < 0 || nx >= width as isize || nz >= depth as isize {
+                        continue;
+                    }
+                    if let Some(h) = heights[nz as usize * width + nx as usize] {
+                        sum += h;
+                        count += 1;
+                    }
+                }
+            }
+            if count < 2 {
+                continue;
+            }
+            let avg = sum / count as f64;
+            let mut ok = true;
+            for dz in -1isize..=1 {
+                for dx in -1isize..=1 {
+                    if dx == 0 && dz == 0 {
+                        continue;
+                    }
+                    let nx = x as isize + dx;
+                    let nz = z as isize + dz;
+                    if nx < 0 || nz < 0 || nx >= width as isize || nz >= depth as isize {
+                        continue;
+                    }
+                    if let Some(h) = heights[nz as usize * width + nx as usize] {
+                        if (h - avg).abs() > jump_cap {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !ok {
+                    break;
+                }
+            }
+            if ok {
+                filled[i] = Some(avg);
+            }
+        }
+    }
+    heights.copy_from_slice(&filled);
+}
+
+fn flatten_heightfield(heights: &mut [Option<f64>], width: usize, depth: usize, flatten_m: f64) {
+    if flatten_m <= 0.0 || !flatten_m.is_finite() {
+        return;
+    }
+    // 3×3 median pass.
+    let mut medianed = heights.to_vec();
+    for z in 0..depth {
+        for x in 0..width {
+            let i = z * width + x;
+            if heights[i].is_none() {
+                continue;
+            }
+            let mut samples = Vec::<f64>::with_capacity(9);
+            for dz in -1isize..=1 {
+                for dx in -1isize..=1 {
+                    let nx = x as isize + dx;
+                    let nz = z as isize + dz;
+                    if nx < 0 || nz < 0 || nx >= width as isize || nz >= depth as isize {
+                        continue;
+                    }
+                    if let Some(h) = heights[nz as usize * width + nx as usize] {
+                        samples.push(h);
+                    }
+                }
+            }
+            if samples.is_empty() {
+                continue;
+            }
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            medianed[i] = Some(samples[samples.len() / 2]);
+        }
+    }
+    // Erode residual highs toward local minima when within flatten_m (keeps steps).
+    let mut snapped = medianed.clone();
+    for z in 0..depth {
+        for x in 0..width {
+            let i = z * width + x;
+            let Some(h) = medianed[i] else {
+                continue;
+            };
+            let mut local_min = h;
+            let mut count = 0usize;
+            for dz in -1isize..=1 {
+                for dx in -1isize..=1 {
+                    let nx = x as isize + dx;
+                    let nz = z as isize + dz;
+                    if nx < 0 || nz < 0 || nx >= width as isize || nz >= depth as isize {
+                        continue;
+                    }
+                    if let Some(n) = medianed[nz as usize * width + nx as usize] {
+                        local_min = local_min.min(n);
+                        count += 1;
+                    }
+                }
+            }
+            if count == 0 {
+                continue;
+            }
+            if h - local_min <= flatten_m {
+                snapped[i] = Some(local_min);
+            }
+        }
+    }
+    heights.copy_from_slice(&snapped);
+}
+
+fn heightfield_to_mesh(
+    grid: &VoxelGrid,
+    heights: &[Option<f64>],
+    width: usize,
+    depth: usize,
+) -> ReconstructedMesh {
+    let mut vertices = Vec::<f32>::new();
+    let mut indices = Vec::<u32>::new();
+    let mut vertex_map = std::collections::HashMap::<(usize, usize), u32>::new();
+
+    let mut emit = |x: usize, z: usize, y: f64| -> u32 {
+        let key = (x, z);
+        if let Some(i) = vertex_map.get(&key) {
+            return *i;
+        }
+        let px = (grid.min.x + (x as f64 + 0.5) * grid.voxel_size) as f32;
+        let pz = (grid.min.z + (z as f64 + 0.5) * grid.voxel_size) as f32;
+        let idx = (vertices.len() / 3) as u32;
+        vertices.push(px);
+        vertices.push(y as f32);
+        vertices.push(pz);
+        vertex_map.insert(key, idx);
+        idx
+    };
+
+    for z in 0..depth.saturating_sub(1) {
+        for x in 0..width.saturating_sub(1) {
+            let mut corners = [
+                heights[z * width + x],
+                heights[z * width + (x + 1)],
+                heights[(z + 1) * width + x],
+                heights[(z + 1) * width + (x + 1)],
+            ];
+            let present: Vec<f64> = corners.iter().filter_map(|h| *h).collect();
+            if present.len() < 3 {
+                continue;
+            }
+            if present.len() == 3 {
+                let avg = present.iter().sum::<f64>() / 3.0;
+                for c in &mut corners {
+                    if c.is_none() {
+                        *c = Some(avg);
+                    }
+                }
+            }
+            let (Some(a), Some(b), Some(c), Some(d)) =
+                (corners[0], corners[1], corners[2], corners[3])
+            else {
+                continue;
+            };
+            let i00 = emit(x, z, a);
+            let i10 = emit(x + 1, z, b);
+            let i01 = emit(x, z + 1, c);
+            let i11 = emit(x + 1, z + 1, d);
+            indices.extend_from_slice(&[i00, i11, i10, i00, i01, i11]);
+        }
+    }
+
+    ReconstructedMesh { vertices, indices }
+}
+
 fn mesh_from_walkable_floors(
     grid: &VoxelGrid,
     solid: &[bool],
@@ -3546,5 +4483,370 @@ fn state_name(state: &GroundFieldCellState) -> &'static str {
         GroundFieldCellState::Filled => "filled",
         GroundFieldCellState::Eroded => "eroded",
         GroundFieldCellState::DiscardedComponent => "discarded_component",
+    }
+}
+
+#[cfg(test)]
+mod region_cull_tests {
+    use super::{
+        camera_centered_fallback_region, cull_points_outside_region, fill_heightfield_gaps,
+        flatten_heightfield, project_mc_floor_mesh, DEFAULT_FLOOR_PROJECT_FLATTEN_M,
+        EMPTY_REGION_FULL_CLOUD_MAX_SPLATS, MC_FLOOR_GAP_JUMP_CAP_M, ReconstructedMesh, VoxelGrid,
+    };
+    use crate::splat::PointNormal;
+    use crate::MeshSettings;
+    use nalgebra::{Point3, Vector3};
+
+    fn pt(x: f64, y: f64, z: f64) -> PointNormal {
+        PointNormal {
+            point: Point3::new(x, y, z),
+            normal: Vector3::new(0.0, 1.0, 0.0),
+            scale: Vector3::new(0.1, 0.1, 0.1),
+            opacity: 1.0,
+        }
+    }
+
+    fn settings_from_json(value: serde_json::Value) -> MeshSettings {
+        serde_json::from_value(value).expect("MeshSettings")
+    }
+
+    #[test]
+    fn culls_points_outside_aabb() {
+        let settings = settings_from_json(serde_json::json!({
+            "mode": 2,
+            "region_min": [-1.0, -1.0, -1.0],
+            "region_max": [1.0, 1.0, 1.0]
+        }));
+        let points = vec![pt(0.0, 0.0, 0.0), pt(5.0, 0.0, 0.0), pt(0.0, 0.0, -5.0)];
+        let (kept, discarded) = cull_points_outside_region(&points, &settings);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(discarded, 2);
+        assert!((kept[0].point.x - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn no_region_keeps_all() {
+        let settings = settings_from_json(serde_json::json!({ "mode": 2 }));
+        let points = vec![pt(0.0, 0.0, 0.0), pt(50.0, 0.0, 0.0)];
+        let (kept, discarded) = cull_points_outside_region(&points, &settings);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(discarded, 0);
+    }
+
+    #[test]
+    fn camera_centered_fallback_region_is_reasonable() {
+        let (min, max) = camera_centered_fallback_region([10.0, 2.0, -3.0]);
+        assert_eq!(min.len(), 3);
+        assert_eq!(max.len(), 3);
+        assert!((min[0] - (10.0 - 12.0)).abs() < 1e-9);
+        assert!((max[0] - (10.0 + 12.0)).abs() < 1e-9);
+        assert!((min[1] - (2.0 - 5.0)).abs() < 1e-9);
+        assert!((max[1] - (2.0 + 15.0)).abs() < 1e-9);
+        assert!((min[2] - (-3.0 - 12.0)).abs() < 1e-9);
+        assert!((max[2] - (-3.0 + 12.0)).abs() < 1e-9);
+        // Immense threshold is documented for empty-pin policy.
+        assert_eq!(EMPTY_REGION_FULL_CLOUD_MAX_SPLATS, 500_000);
+    }
+
+    fn project(
+        mc: &ReconstructedMesh,
+        grid: &VoxelGrid,
+        solid: &[bool],
+        nav: &[bool],
+        interior: bool,
+    ) -> ReconstructedMesh {
+        project_mc_floor_mesh(
+            mc,
+            grid,
+            solid,
+            nav,
+            interior,
+            false,
+            DEFAULT_FLOOR_PROJECT_FLATTEN_M,
+            2.0,
+        )
+    }
+
+    #[test]
+    fn open_projection_hits_flat_mc_slab() {
+        // Two triangles forming a floor at y=1 covering [0,2] x [0,2].
+        let mc = ReconstructedMesh {
+            vertices: vec![
+                0.0, 1.0, 0.0, 2.0, 1.0, 0.0, 2.0, 1.0, 2.0, 0.0, 1.0, 2.0,
+            ],
+            indices: vec![0, 1, 2, 0, 2, 3],
+        };
+        let grid = VoxelGrid {
+            min: Vector3::new(0.0, 0.0, 0.0),
+            dims: [4, 4, 4],
+            voxel_size: 0.5,
+        };
+        let solid = vec![true; grid.len()];
+        let nav = vec![false; grid.len()];
+        let floor = project(&mc, &grid, &solid, &nav, false);
+        assert!(
+            !floor.indices.is_empty(),
+            "open projection should produce floor tris"
+        );
+        let ys: Vec<f32> = floor.vertices.chunks(3).map(|c| c[1]).collect();
+        assert!(ys.iter().all(|y| (*y - 1.0).abs() < 0.15));
+    }
+
+    #[test]
+    fn sealed_interior_projection_hits_near_floor_y() {
+        // Sealed box: upward floor at y=0.5 plus ceiling at y=3.5. Interior rays
+        // start in carved nav and must land on the floor, not the ceiling.
+        let mc = ReconstructedMesh {
+            vertices: vec![
+                0.0, 0.5, 0.0, 2.0, 0.5, 0.0, 2.0, 0.5, 2.0, 0.0, 0.5, 2.0, 0.0, 3.5,
+                0.0, 2.0, 3.5, 0.0, 2.0, 3.5, 2.0, 0.0, 3.5, 2.0,
+            ],
+            indices: vec![0, 1, 2, 0, 2, 3, 4, 6, 5, 4, 7, 6],
+        };
+        let grid = VoxelGrid {
+            min: Vector3::new(0.0, 0.0, 0.0),
+            dims: [4, 8, 4],
+            voxel_size: 0.5,
+        };
+        let mut solid = vec![false; grid.len()];
+        let mut nav = vec![false; grid.len()];
+        for z in 0..grid.dims[2] {
+            for x in 0..grid.dims[0] {
+                solid[grid.idx(x, 0, z)] = true;
+                for y in 1..6 {
+                    nav[grid.idx(x, y, z)] = true;
+                }
+            }
+        }
+        let floor = project(&mc, &grid, &solid, &nav, true);
+        assert!(
+            !floor.indices.is_empty(),
+            "sealed interior projection should produce floor tris"
+        );
+        let ys: Vec<f32> = floor.vertices.chunks(3).map(|c| c[1]).collect();
+        assert!(
+            ys.iter().all(|y| (*y - 0.5).abs() < 0.15),
+            "interior hits should be near floor Y=0.5, got {:?}",
+            ys
+        );
+    }
+
+    #[test]
+    fn sealed_room_open_sky_cast_hits_roof_interior_hits_floor() {
+        // Regression: sky-down (open) lands on the roof; carved interior must hit floor.
+        let mc = ReconstructedMesh {
+            vertices: vec![
+                0.0, 0.5, 0.0, 2.0, 0.5, 0.0, 2.0, 0.5, 2.0, 0.0, 0.5, 2.0, 0.0, 3.5,
+                0.0, 2.0, 3.5, 0.0, 2.0, 3.5, 2.0, 0.0, 3.5, 2.0,
+            ],
+            indices: vec![0, 1, 2, 0, 2, 3, 4, 6, 5, 4, 7, 6],
+        };
+        let grid = VoxelGrid {
+            min: Vector3::new(0.0, 0.0, 0.0),
+            dims: [4, 8, 4],
+            voxel_size: 0.5,
+        };
+        let mut solid = vec![false; grid.len()];
+        let mut nav = vec![false; grid.len()];
+        for z in 0..grid.dims[2] {
+            for x in 0..grid.dims[0] {
+                solid[grid.idx(x, 0, z)] = true;
+                solid[grid.idx(x, 7, z)] = true;
+                for y in 1..6 {
+                    nav[grid.idx(x, y, z)] = true;
+                }
+            }
+        }
+        let roof = project(&mc, &grid, &solid, &nav, false);
+        let floor = project(&mc, &grid, &solid, &nav, true);
+        assert!(!roof.indices.is_empty() && !floor.indices.is_empty());
+        let roof_ys: Vec<f32> = roof.vertices.chunks(3).map(|c| c[1]).collect();
+        let floor_ys: Vec<f32> = floor.vertices.chunks(3).map(|c| c[1]).collect();
+        assert!(
+            roof_ys.iter().all(|y| (*y - 3.5).abs() < 0.25),
+            "open/sky cast should hit roof ~3.5, got {:?}",
+            roof_ys
+        );
+        assert!(
+            floor_ys.iter().all(|y| (*y - 0.5).abs() < 0.15),
+            "interior cast should hit floor ~0.5, got {:?}",
+            floor_ys
+        );
+    }
+
+    #[test]
+    fn furniture_top_rejected_for_floor_band() {
+        // Floor at y=0.5 plus a raised furniture slab at y=1.2. Interior band
+        // is the solid under nav (floor) so projection must land near 0.5.
+        let mc = ReconstructedMesh {
+            vertices: vec![
+                0.0, 0.5, 0.0, 2.0, 0.5, 0.0, 2.0, 0.5, 2.0, 0.0, 0.5, 2.0, 0.5, 1.2,
+                0.5, 1.5, 1.2, 0.5, 1.5, 1.2, 1.5, 0.5, 1.2, 1.5,
+            ],
+            indices: vec![0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7],
+        };
+        let grid = VoxelGrid {
+            min: Vector3::new(0.0, 0.0, 0.0),
+            dims: [4, 8, 4],
+            voxel_size: 0.5,
+        };
+        let mut solid = vec![false; grid.len()];
+        let mut nav = vec![false; grid.len()];
+        for z in 0..grid.dims[2] {
+            for x in 0..grid.dims[0] {
+                solid[grid.idx(x, 0, z)] = true;
+                for y in 1..6 {
+                    nav[grid.idx(x, y, z)] = true;
+                }
+            }
+        }
+        let floor = project(&mc, &grid, &solid, &nav, true);
+        assert!(!floor.indices.is_empty());
+        let ys: Vec<f32> = floor.vertices.chunks(3).map(|c| c[1]).collect();
+        assert!(
+            ys.iter().all(|y| (*y - 0.5).abs() < 0.2),
+            "should prefer floor over furniture, got {:?}",
+            ys
+        );
+    }
+
+    #[test]
+    fn gap_fill_recovers_single_missing_cell() {
+        let width = 3usize;
+        let depth = 3usize;
+        let mut heights = vec![Some(1.0); width * depth];
+        heights[1 * width + 1] = None;
+        fill_heightfield_gaps(&mut heights, width, depth, MC_FLOOR_GAP_JUMP_CAP_M);
+        assert!(
+            heights[1 * width + 1].is_some_and(|h| (h - 1.0).abs() < 1e-9),
+            "center gap should fill from neighbors"
+        );
+    }
+
+    #[test]
+    fn gap_fill_closes_two_by_two_hole() {
+        let width = 4usize;
+        let depth = 4usize;
+        let mut heights = vec![Some(1.0); width * depth];
+        heights[1 * width + 1] = None;
+        heights[1 * width + 2] = None;
+        heights[2 * width + 1] = None;
+        heights[2 * width + 2] = None;
+        fill_heightfield_gaps(&mut heights, width, depth, MC_FLOOR_GAP_JUMP_CAP_M);
+        fill_heightfield_gaps(&mut heights, width, depth, MC_FLOOR_GAP_JUMP_CAP_M);
+        assert!(
+            heights[1 * width + 1].is_some()
+                && heights[1 * width + 2].is_some()
+                && heights[2 * width + 1].is_some()
+                && heights[2 * width + 2].is_some(),
+            "2x2 hole should close after two fill passes, got {:?}",
+            heights
+        );
+    }
+
+    #[test]
+    fn project_leaves_mc_shell_bytes_unchanged() {
+        let mc = ReconstructedMesh {
+            vertices: vec![
+                0.0, 1.0, 0.0, 2.0, 1.0, 0.0, 2.0, 1.0, 2.0, 0.0, 1.0, 2.0,
+            ],
+            indices: vec![0, 1, 2, 0, 2, 3],
+        };
+        let before = mc.clone();
+        let grid = VoxelGrid {
+            min: Vector3::new(0.0, 0.0, 0.0),
+            dims: [4, 4, 4],
+            voxel_size: 0.5,
+        };
+        let solid = vec![true; grid.len()];
+        let nav = vec![false; grid.len()];
+        let _floor = project_mc_floor_mesh(
+            &mc,
+            &grid,
+            &solid,
+            &nav,
+            false,
+            false,
+            DEFAULT_FLOOR_PROJECT_FLATTEN_M,
+            2.0,
+        );
+        assert_eq!(mc.vertices, before.vertices);
+        assert_eq!(mc.indices, before.indices);
+    }
+
+    #[test]
+    fn outdoor_band_uses_local_solid_top_minima() {
+        // Center column solid top at y=2 voxels; neighbors at y=1 → outdoor band = lower top.
+        let grid = VoxelGrid {
+            min: Vector3::new(0.0, 0.0, 0.0),
+            dims: [3, 4, 3],
+            voxel_size: 1.0,
+        };
+        let mut solid = vec![false; grid.len()];
+        for z in 0..3 {
+            for x in 0..3 {
+                solid[grid.idx(x, 0, z)] = true;
+                solid[grid.idx(x, 1, z)] = true;
+            }
+        }
+        // Vegetation spike in center only.
+        solid[grid.idx(1, 2, 1)] = true;
+        let nav = vec![false; grid.len()];
+        let outdoor_band =
+            super::column_band_center_y(&grid, &solid, &nav, 1, 1, false, true).unwrap();
+        let spike_band =
+            super::column_band_center_y(&grid, &solid, &nav, 1, 1, false, false).unwrap();
+        assert!(
+            outdoor_band < spike_band - 0.5,
+            "outdoor minima ({outdoor_band}) should sit below spike top ({spike_band})"
+        );
+        assert!((outdoor_band - 2.0).abs() < 1e-9, "expected neighbor top y=2.0, got {outdoor_band}");
+    }
+
+    #[test]
+    fn flatten_removes_small_ripple_keeps_step() {
+        // 5×1: small ±0.05 ripple on a flat 1.0 ledge, then a 0.25 step.
+        let width = 5usize;
+        let depth = 1usize;
+        let mut heights = vec![
+            Some(1.00),
+            Some(1.05),
+            Some(0.95),
+            Some(1.00),
+            Some(1.25),
+        ];
+        flatten_heightfield(&mut heights, width, depth, 0.08);
+        let flat: Vec<f64> = heights[..4].iter().map(|h| h.unwrap()).collect();
+        let max_flat = flat.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let min_flat = flat.iter().cloned().fold(f64::INFINITY, f64::min);
+        assert!(
+            max_flat - min_flat < 0.06,
+            "ripple should flatten, got {:?}",
+            heights
+        );
+        let step = heights[4].unwrap();
+        let flat_mean = flat.iter().sum::<f64>() / flat.len() as f64;
+        assert!(
+            (step - flat_mean).abs() > 0.12,
+            "0.25-scale step should remain, got {:?}",
+            heights
+        );
+    }
+
+    #[test]
+    fn empty_mc_projection_returns_empty() {
+        let mc = ReconstructedMesh {
+            vertices: vec![],
+            indices: vec![],
+        };
+        let grid = VoxelGrid {
+            min: Vector3::new(0.0, 0.0, 0.0),
+            dims: [2, 2, 2],
+            voxel_size: 1.0,
+        };
+        let solid = vec![false; grid.len()];
+        let nav = vec![false; grid.len()];
+        let floor = project(&mc, &grid, &solid, &nav, true);
+        assert!(floor.indices.is_empty());
     }
 }

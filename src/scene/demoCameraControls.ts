@@ -157,8 +157,66 @@ export const frameOrbitCameraToScene = (scene: Scene, camera: ArcRotateCamera): 
   camera.radius = Math.max(2, radius * 2);
 };
 
+/** Look-at distance used when deriving FreeCamera target from rotation / NavKit euler. */
+const LOOK_TARGET_DISTANCE = 10;
+
+/**
+ * Sync FreeCamera `_currentTarget` from position + rotation so preserveView /
+ * getTarget() match the live look direction (Babylon caches target until view matrix).
+ */
+export const syncFreeCameraTargetFromRotation = (camera: FreeCamera): void => {
+  const forward = camera.getDirection(Vector3.Forward());
+  const target = camera.position.add(forward.scale(LOOK_TARGET_DISTANCE));
+  camera.setTarget(target);
+};
+
+/**
+ * FreeCamera-style euler degrees (pitch/yaw/roll) from a unit look direction.
+ * Yaw 0 looks +Z (Babylon LH); pitch is rotation.x.
+ */
+export const freeCameraEulerDegreesFromLookDirection = (
+  direction: Vector3
+): { x: number; y: number; z: number } => {
+  const len = Math.hypot(direction.x, direction.y, direction.z);
+  if (!(len > 1e-8)) {
+    return { x: 0, y: 0, z: 0 };
+  }
+  const fx = direction.x / len;
+  const fy = direction.y / len;
+  const fz = direction.z / len;
+  const yaw = Math.atan2(fx, fz);
+  const pitch = -Math.asin(Math.max(-1, Math.min(1, fy)));
+  const radToDeg = 180 / Math.PI;
+  return {
+    x: pitch * radToDeg,
+    y: yaw * radToDeg,
+    z: 0,
+  };
+};
+
+/** Look-at point from FreeCamera-style position + euler degrees. */
+export const lookTargetFromFreeCameraEuler = (options: {
+  readonly position: { readonly x: number; readonly y: number; readonly z: number };
+  readonly eulerDegrees: { readonly x: number; readonly y: number; readonly z: number };
+  readonly lookDistance?: number;
+}): Vector3 => {
+  const degToRad = Math.PI / 180;
+  const pitch = options.eulerDegrees.x * degToRad;
+  const yaw = options.eulerDegrees.y * degToRad;
+  const dist = options.lookDistance ?? LOOK_TARGET_DISTANCE;
+  const fx = Math.sin(yaw) * Math.cos(pitch);
+  const fy = -Math.sin(pitch);
+  const fz = Math.cos(yaw) * Math.cos(pitch);
+  return new Vector3(
+    options.position.x + fx * dist,
+    options.position.y + fy * dist,
+    options.position.z + fz * dist
+  );
+};
+
 export const captureActiveCameraView = (camera: Camera): PreservedCameraView | null => {
   if (camera instanceof FreeCamera) {
+    syncFreeCameraTargetFromRotation(camera);
     return {
       position: camera.position.clone(),
       target: camera.getTarget().clone(),
@@ -200,11 +258,20 @@ export const createOrbitCameraFromView = (
     );
   }
 
-  const offset = view.position.subtract(view.target);
-  const radius = Math.max(0.5, offset.length());
-  const beta = Math.acos(Math.max(-1, Math.min(1, offset.y / radius)));
-  const alpha = Math.atan2(offset.x, offset.z);
-  return new ArcRotateCamera(name, alpha, beta, radius, view.target.clone(), scene);
+  // Babylon ArcRotate: offset = (r·cosα·sinβ, r·cosβ, r·sinα·sinβ) → α = atan2(z, x).
+  // Manual atan2(x, z) swapped axes and landed NavKit restores on the opposite orbit side.
+  // setPosition → rebuildAnglesAndRadius / ComputeAlpha owns the conversion.
+  const radius = Math.max(0.5, view.position.subtract(view.target).length());
+  const camera = new ArcRotateCamera(
+    name,
+    0,
+    Math.PI / 2,
+    radius,
+    view.target.clone(),
+    scene
+  );
+  camera.setPosition(view.position.clone());
+  return camera;
 };
 
 export const demoCameraModeLabel = (mode: DemoCameraMode): string =>

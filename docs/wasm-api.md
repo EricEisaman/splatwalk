@@ -46,7 +46,7 @@ The same parity rule as `flip_y` applies: requesting `handedness: 'left'` (or `w
 Every v2 result carries three compatibility fields:
 
 - `api_version` (currently `2`) — the **hard** data contract. Treat a mismatch as a fatal, fail-fast condition.
-- `semver` (e.g. `"0.6.4"`) — the semantic version of the WASM core build, tracking the crate version. Use it for logging, cache keys, and human-facing diagnostics.
+- `semver` (e.g. `"0.6.10"`) — the semantic version of the WASM core build, tracking the crate version. Use it for logging, cache keys, and human-facing diagnostics.
 
 ### Host renderer (WebGL / WebGPU)
 
@@ -54,7 +54,7 @@ The WASM core does **not** create a GPU context and does not advertise a `webgpu
 capability. Choose **WebGL** vs **WebGPU** in the host app (for example Babylon’s
 `Engine` / `WebGPUEngine` via SplatWalk’s `createBabylonEngine` helper). Mesh,
 navmesh, collision, and SOG outputs are identical regardless of the host backend.
-- `capabilities` — an additive `string[]` of supported features (`collision_voxel_boundary`, `collision_voxel_volume`, `progress_protocol_v1`, `glb_export`, `room_floor_mesh`, `sog_export`, `streamed_sog`, `fast_nav_preset`, `output_space`, `recast_config`, `progress_callback`, `splat_ingest`). Feature-detect against this list so additive changes (new entry points / fields) do not force a hard failure. Never assume a capability is present without checking; never fail solely because an unknown capability appears.
+- `capabilities` — an additive `string[]` of supported features (`collision_voxel_boundary`, `collision_voxel_volume`, `sdf_marching_cubes`, `sdf_mc_floor_project`, `progress_protocol_v1`, `glb_export`, `room_floor_mesh`, `sog_export`, `streamed_sog`, `fast_nav`, `fast_nav_preset`, `output_space`, `recast_config`, `progress_callback`, `splat_ingest`). Feature-detect against this list so additive changes (new entry points / fields) do not force a hard failure. Never assume a capability is present without checking; never fail solely because an unknown capability appears.
 
 For cheap **pre-flight** feature detection (before parsing any bytes), call the standalone exports `splatwalk_version()`, `splatwalk_api_version()`, and `splatwalk_capabilities()` — they return the same values that appear on a full result, without the cost of a parse/field build.
 
@@ -136,7 +136,7 @@ Builds the PlayCanvas-style runtime collision representation: splat occupancy ->
 }
 ```
 
-Set `emit_glb: true` to receive `.collision.glb` bytes directly. Set `emit_volume: true` to receive the dense voxel volume used by runtime voxel walk (solid + carved `nav_region`). Volume bitmasks stay in `splatwalk_oriented` and are omitted when `output_space` remaps geometry. Otherwise call `mesh_to_glb(result.mesh.vertices, result.mesh.indices)` with the returned mesh. `collision_mesh_mode: "faces"` emits exact exposed voxel faces, matching PlayCanvas `splat-transform -K faces` semantics. `collision_mesh_mode: "smooth"` is reserved and is rejected until a marching-cubes-style surface is implemented.
+Set `emit_glb: true` to receive `.collision.glb` bytes directly. Set `emit_volume: true` to receive the dense voxel volume used by runtime voxel walk (solid + carved `nav_region`). Volume bitmasks stay in `splatwalk_oriented` and are omitted when `output_space` remaps geometry. Otherwise call `mesh_to_glb(result.mesh.vertices, result.mesh.indices)` with the returned mesh. `collision_mesh_mode: "faces"` / `"obstacle_shell"` emit exact exposed voxel faces. `collision_mesh_mode: "walkable_floors"` emits walkable floor quads from the carve. `collision_mesh_mode: "smooth"` builds a truncated 3D SDF + Marching Cubes isosurface (capability `sdf_marching_cubes`), then **downward-projects** that surface to a Recast-ready floor mesh in `mesh` (capability `sdf_mc_floor_project`). The full MC shell is returned as optional `collider_mesh` for cyan overlay. Sealed indoor carve (`!external_fill_leaked`, `collision_scene_type: "indoor"`) uses **interior** downward rays from the carved void; otherwise **open** sky-down projection. Diagnostics: `collision_floor_project_mode` (`"interior"` | `"open"`). Optional settings: `sdf_band_voxels` (default `3`), `mc_iso_level` (default `0`), `mc_smooth_iterations` (default `1`). Progress stages include `collision_sdf`, `collision_marching_cubes`, and `collision_floor_project`.
 
 ### `convert_splat_to_navmesh_basis(bytes, settings)`
 
@@ -477,11 +477,64 @@ without higher-order SH:
 
 ## Fast Nav And Collider NavMesh Pipelines
 
-SplatWalk exposes two navigation workflows in the UI.
+### `fast_nav(bytes, settings)` (capability `fast_nav`)
 
-### Fast Floor Nav
+Star product export: one-shot splat → Recast-ready mesh for
+`settings.algo`: `"floor_field" | "voxel_collision" | "sdf_marching_cubes"`
+(default `"floor_field"`). Hosts run Recast/crowd on the returned mesh.
+Feature-detect with `splatwalk_capabilities().includes("fast_nav")`.
 
-`FAST NAV` is the opinionated one-button path for room-scale splats. It prioritizes a reasonable visible floor result over a full physics collider:
+Lower-level exports (`build_room_floor_mesh`, `build_collision_voxel_boundary`, …)
+remain for specialized tooling; prefer `fast_nav` for product FastNav.
+
+**Specified region (optional but recommended on large scenes):** pass both
+
+```ts
+region_min: [x, y, z],  // splatwalk_oriented AABB min
+region_max: [x, y, z],  // splatwalk_oriented AABB max
+```
+
+in the same settings object as `algo`. When set, WASM:
+
+1. Validates both corners (length 3, finite, `min <= max` per axis) — failures use reason `invalid_region`.
+2. Culls splats outside the box **before floater prune** (progress stage `region_cull`).
+3. Runs the chosen algo only on the culled set (collision grids are also sized to this box).
+
+**Empty-region / empty-mesh / region_too_large immunity:** collision algos (`voxel_collision`, `sdf_marching_cubes`) **never** bake against the full city AABB:
+
+- **No `region_*` pin** → WASM immediately defaults to a **camera-centered** AABB (~±12 m XZ, −5/+15 m Y) around `camera_position` → `collision_seed` → `[0,1,0]`.
+- **Empty pin** (culls every splat) → same camera box (small clouds may use all splats only when ≤ 500 000).
+- **`region_too_large`** → recovery shrinks to camera box (12 m → 8 m) then coarsens voxels — never expands.
+
+Pass `camera_position: [x,y,z]` from the live view. Success sets `fallback_used: true` / `step_label`; exhaustion still throws `empty_mesh` with `attempted[]`. Floor path retries with a camera/unclipped region after ladder failure when a pin was present.
+
+Space: post-`flip_y`, post-`rotation`, metres matching `environment_scale`. Obtain a starter box from `suggest_region`, or pin the host selection gizmo / camera-select AABB.
+
+### Algo sweet spots
+
+Pick `algo` from the scene shape — not from habit. Default stays `floor_field`.
+
+| `algo` | Sweet spot | Prefer when | Avoid when | Host notes |
+| --- | --- | --- | --- | --- |
+| `floor_field` | Flat / gently varying floors, large outdoor streams, quick one-click room nav | Bedrooms, pads, plazas, church yards, “click and walk the floor”; huge streamed AABBs with a pinned region | Stairs, multi-level interiors, ramps that need continuous climb geometry | Cheapest path; 2.5D ground field + recovery. Recast crowd only. |
+| `voxel_collision` | Indoor stairs and multi-level spaces that need a carved volume | Furnished interiors with steps/landings; need voxel walk **or** Recast from carve spans; physics/collision overlay | Pure flat floors (overkill); city-scale without a tight selection region | PlayCanvas-style fill/carve. Use `collision_scene_type: "indoor"` for sealed rooms/stairs, `"outdoor"` for floor-fill ground. Pin `region_min`/`region_max` on large scenes. |
+| `sdf_marching_cubes` | Same voxel volume; Recast from a **downward-projected floor** on the MC surface | Stairs/ramps where voxel-face quads fragment Recast; want smooth floor sheet + MC shell overlay | Memory-tight devices; scenes that already work with floor field; when you only need voxel walk (no Recast bake) | Forces `collision_mesh_mode: "smooth"`. `mesh` = projected floor (Recast); `collider_mesh` = MC shell (overlay). Interior vs open project per seal. Tune `floor_project_flatten_m` (default `0.08`) for undulations; MC knobs stay `sdf_band_voxels` / `mc_iso_level` / `mc_smooth_iterations`. |
+
+**Rule of thumb**
+
+1. Start with `floor_field` (default).
+2. If agents fail on stairs / levels → `voxel_collision` (+ indoor scene type, selection box covering the climb).
+3. If Recast still fragments the stair run → `sdf_marching_cubes`.
+
+**Settings that matter per algo**
+
+- **floor_field** — `fast_nav_preset` / recovery ladder, `region_*`, seed, prune floaters. Min room area defaults to `4 m²`.
+- **voxel_collision** — `collision_voxel_size` (~`0.05` indoor), carve capsule, fill size, `collision_mesh_mode` (`faces` / `walkable_floors`; not `smooth`). Set `emit_volume: true` when you need voxel walk.
+- **sdf_marching_cubes** — same collision knobs as voxel, plus SDF/MC band/iso/smooth; Recast uses the projected floor in `mesh` (not the MC shell — use `collider_mesh` for overlay).
+
+### Fast Floor Nav (`algo: "floor_field"`)
+
+`floor_field` is the opinionated one-button path for room-scale and outdoor-floor splats. It prioritizes a reasonable visible floor result over a full physics collider:
 
 ```none
 input splat -> suggested/region seed -> 2.5D floor field -> accepted floor component -> floor mesh -> Recast -> crowd + NPC
@@ -676,7 +729,7 @@ Prune and region settings (no new WASM fields — existing contract):
 - `prune_floaters`: when `true` (default), statistical outlier removal runs once in `parse_splats` before any geometry / region / seed work. Set `false` to keep every splat. The Storage Adapter **Navmesh settings / overrides** panel exposes this as **Prune floaters** for Fast Nav and collision generation.
 - `prune_floaters_k`: neighbours sampled per splat for outlier removal (default `16`). Higher = smoother / more conservative.
 - `prune_floaters_std_ratio`: keep splats within `mean + std_ratio * stddev` (default `2.0`). Lower = more aggressive pruning.
-- `region_min` / `region_max`: optional AABB in `splatwalk_oriented` space. When both are set, WASM discards points outside the box during `build_context`, and **`build_collision_voxel_boundary` sizes its voxel grid to this box** (plus PlayCanvas-style exterior-fill padding) rather than the full splat AABB — required for city-scale / multi-chunk materialized streams so `collision_voxel_size` is not coarsened away under the dense-grid cap. In the TypeScript Fast Nav path (`runFastNav`), a visible Viewer selection-region gizmo is copied into these fields so the box is the pinned consideration region; that also prevents the dense-floor recovery ladder from auto-adapting a different default region. When absent, callers should use `suggest_region` (and optional dense-floor adaptation) as usual. The Storage Adapter overrides panel **Selection region** toggle shows/hides that gizmo. Hosts may also pass **`FastNavOptions.cameraSelect`** (`view` + optional offsets) so `runFastNav` derives the AABB via `regionBoundsFromCameraSelect` / `regionBoundsFromCameraPose` (`src/navigation/cameraSelectRegion.ts`) — yaw-aware footprint (default 10 m left/right, 15 m forward, 5 m behind, 5 m below / 15 m above) — enables the yellow box, pins `region_min` / `region_max`, and restores that camera view after nav. Demos support **Upload / Download nav artifacts** (zip or multi-select). The Storage Adapter Region/prune UI can rebuild the AABB from the live fly camera (**Apply select region from camera**) with editable offsets. This is host tooling only; there is no WASM camera-region capability and no oriented-box wire format (`api_version` remains 2).
+- `region_min` / `region_max`: optional AABB `[x,y,z]` each in `splatwalk_oriented` space. **First-class input on every WASM entry point including `fast_nav`.** When both are set, WASM culls out-of-box splats **before floater prune** (stage `region_cull`) and again in `build_context`, and **`build_collision_voxel_boundary` / `fast_nav` collision algos size the voxel grid to this box** (plus PlayCanvas-style exterior-fill padding) rather than the full splat AABB — required for city-scale / multi-chunk materialized streams so `collision_voxel_size` is not coarsened away under the dense-grid cap. Both must be set together (or both omitted); malformed boxes reject with a clear error (`invalid_region` on `fast_nav`). When absent, callers should use `suggest_region` (and optional dense-floor adaptation) as usual. Host tooling (yellow selection gizmo, `FastNavOptions.cameraSelect`) only *produces* these two arrays — there is no WASM camera-region capability and no oriented-box wire format (`api_version` remains 2).
 
 Collision/reconstruction settings:
 
@@ -687,11 +740,15 @@ Collision/reconstruction settings:
 - `collision_fill_size`: fill/seal distance in meters.
 - `collision_carve_height`: capsule height in meters for reachable-space carving.
 - `collision_carve_radius`: capsule radius in meters for reachable-space carving.
-- `collision_mesh_mode`: `"faces"` emits exact exposed voxel faces. `"smooth"` is reserved for a later marching-cubes/copanar-merge path and is rejected by the current binary.
+- `collision_mesh_mode`: `"faces"` / `"obstacle_shell"` emit exact exposed voxel faces. `"walkable_floors"` emits walkable floor quads. `"smooth"` runs WASM truncated SDF + Marching Cubes, then downward floor project into `mesh` with MC shell in `collider_mesh` (capabilities `sdf_marching_cubes`, `sdf_mc_floor_project`).
+- `sdf_band_voxels`: truncation half-width in voxels for `"smooth"` (default `3`, clamped `[1, 16]`).
+- `mc_iso_level`: Marching Cubes iso level for `"smooth"` (default `0`).
+- `mc_smooth_iterations`: Laplacian iterations after Marching Cubes (default `1`, max `8`).
+- `floor_project_flatten_m`: metres of undulation to flatten on the **projected Recast floor** only after SDF-MC downward project (default `0.08`; `0` disables; clamped `[0, 0.5]`). Does **not** alter the MC shell in `collider_mesh`.
 - `emit_glb`: accepted by `build_collision_voxel_boundary`; when true, the result includes GLB bytes suitable for saving as `.collision.glb`.
 - `emit_volume`: accepted by `build_collision_voxel_boundary`; when true, the result includes packed `solid` + `nav_region` bitmasks for PC-style runtime walk (capability `collision_voxel_volume`).
 
-The diagnostics include `collision_grid_width`, `collision_grid_height`, `collision_grid_depth`, `collision_occupied_voxels`, `collision_cluster_kept_voxels`, `collision_cluster_discarded_voxels`, `collision_filled_voxels`, `collision_carved_voxels`, `collision_surface_faces`, `collision_seed_used`, `collision_seed_state`, `collision_scene_type`, `collision_mesh_mode`, `collision_external_fill_leaked`, and `collision_failure_reason`.
+The diagnostics include `collision_grid_width`, `collision_grid_height`, `collision_grid_depth`, `collision_occupied_voxels`, `collision_cluster_kept_voxels`, `collision_cluster_discarded_voxels`, `collision_filled_voxels`, `collision_carved_voxels`, `collision_surface_faces`, `collision_seed_used`, `collision_seed_state`, `collision_scene_type`, `collision_mesh_mode`, `collision_external_fill_leaked`, `collision_failure_reason`, plus for `"smooth"`: `collision_sdf_band_voxels`, `collision_mc_iso_level`, `collision_mc_smooth_iterations`, `collision_floor_project_mode`, and `collision_floor_project_flatten_m`.
 
 UI integrations may bypass generated collision by importing a collider GLB and sending its mesh buffers directly to Recast. This is the most accurate route for PlayCanvas/SuperSplat `.collision.glb` and World Labs Collider Mesh GLB assets.
 

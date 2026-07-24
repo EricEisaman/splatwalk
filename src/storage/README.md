@@ -8,8 +8,8 @@ The Storage Adapter playground can prefer **WebGPU** or **WebGL** (`Stream setti
 toggle, or `?renderer=webgpu|webgl`). WebGPU uses `setMaximumLimits` for the GS
 work-buffer MRT and falls back to WebGL when unsupported or below the color-
 attachment budget. Engine creation: `src/scene/createBabylonEngine.ts`. The WASM
-core stays renderer-agnostic. Use **Download Storage Adapter kit** for the
-Playground paste zip (`/integration-kits/splatwalk-storage-adapter.zip`, v0.6.4).
+core stays renderer-agnostic. Use **Download Storage Adapter Component Pack** for the
+Playground paste zip (`/integration-kits/splatwalk-storage-adapter.zip`, v0.6.10).
 **Oval interior** arms `cameraSelect` (preset fly view + AABB offsets) after settle
 and restores that view after nav. **Region and prune** exposes editable offsets and
 **Apply select region from camera**. Other CDN examples do not force `cameraSelect`.

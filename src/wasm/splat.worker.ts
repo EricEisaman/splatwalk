@@ -7,10 +7,14 @@ import init, {
     convert_splat_to_mesh,
     convert_splat_to_navmesh_basis,
     convert_to_sog,
+    fast_nav,
     get_splat_bounds,
     mesh_to_glb,
     slice_splat,
     splat_to_ply,
+    splatwalk_api_version,
+    splatwalk_capabilities,
+    splatwalk_version,
     spz_to_ply,
     suggest_region,
 } from '@splatwalk/core';
@@ -107,6 +111,20 @@ ctx.onmessage = async (e: MessageEvent): Promise<void> => {
             return;
         }
 
+        // Pre-flight probes — no splat bytes required.
+        if (type === 'capabilities') {
+            ctx.postMessage({ kind: 'result', id, ok: true, result: splatwalk_capabilities() });
+            return;
+        }
+        if (type === 'version') {
+            ctx.postMessage({ kind: 'result', id, ok: true, result: splatwalk_version() });
+            return;
+        }
+        if (type === 'apiVersion') {
+            ctx.postMessage({ kind: 'result', id, ok: true, result: splatwalk_api_version() });
+            return;
+        }
+
         if (!currentData) throw new Error('No splat loaded in worker');
 
         const settings = payload.settings;
@@ -170,11 +188,19 @@ ctx.onmessage = async (e: MessageEvent): Promise<void> => {
             case 'buildRoomFloorMesh':
                 result = build_room_floor_mesh(currentData, settings);
                 break;
+            case 'fastNav':
+                result = fast_nav(currentData, settings);
+                break;
             default:
                 throw new Error(`Unknown splat worker op: ${type}`);
         }
         ctx.postMessage({ kind: 'result', id, ok: true, result });
     } catch (err) {
+        // Preserve structured WASM failures (objects with reason/message) for the bridge.
+        if (err && typeof err === 'object' && !(err instanceof Error)) {
+            ctx.postMessage({ kind: 'result', id, ok: false, error: err });
+            return;
+        }
         const error = err instanceof Error ? err.message : String(err);
         ctx.postMessage({ kind: 'result', id, ok: false, error });
     }

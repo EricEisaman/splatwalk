@@ -840,6 +840,22 @@ input[type=range]::-webkit-slider-runnable-track {
   transform: translateY(0);
 }
 
+.icon-button:disabled,
+.icon-button[aria-disabled='true'] {
+  opacity: 0.35;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}
+
+.icon-button:disabled:hover,
+.icon-button[aria-disabled='true']:hover {
+  background: rgba(0, 0, 0, 0.5);
+  color: var(--neon-blue);
+  box-shadow: none;
+  transform: none;
+}
+
 .cyber-button {
   width: 100%;
   background: linear-gradient(90deg, rgb(var(--neon-green-rgb) / 0.1) 0%, rgb(var(--neon-green-rgb) / 0.2) 50%, rgb(var(--neon-green-rgb) / 0.1) 100%);
@@ -1280,4 +1296,32 @@ input[type="radio"] {
 
 .cyber-button-pink:active {
   transform: translateY(1px);
+}
+
+.pose-info-panel {
+  margin: 0 0 0.75rem;
+  padding: 0.35rem 0.5rem 0.5rem;
+  border: 1px solid rgb(var(--neon-blue-rgb) / 0.25);
+  border-radius: 6px;
+  background: rgb(0 0 0 / 0.22);
+  backdrop-filter: blur(8px);
+}
+
+.pose-info-panel > summary {
+  cursor: pointer;
+  list-style: none;
+}
+
+.pose-info-panel > summary::-webkit-details-marker {
+  display: none;
+}
+
+.pose-info-panel .font-mono,
+.font-mono {
+  font-family: var(--font-mono);
+}
+
+.pose-info-panel .muted,
+.muted {
+  color: var(--text-muted);
 }

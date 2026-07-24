@@ -17,6 +17,7 @@ import {
   volumeToSolidExteriorMesh,
   volumeToWalkableFloorMesh,
 } from '@/navigation/voxelWalkRuntime';
+import { walkableFloorsMeshToGlb } from '@/navigation/walkableFloorsGlb';
 import { splatwalk, type CollisionVoxelVolume } from '@/wasm/bridge';
 
 /** Full or minimal pack (volume fields optional when `recast.navmesh.bin` is present). */
@@ -58,11 +59,18 @@ export interface BuildNavArtifactBundleOptions {
 
 export interface BuildMinimalNavArtifactBundleOptions {
   readonly collisionGlb?: Uint8Array | null;
+  /** Recast debug overlay triangles (oriented space) → `walkable_floors.glb`. */
+  readonly debugIndices?: ArrayLike<number> | null;
+  readonly debugPositions?: ArrayLike<number> | null;
   readonly navMeshData: Uint8Array;
   readonly playerSpawn?: readonly [number, number, number] | null;
   readonly regionMax?: readonly number[] | null;
   readonly regionMin?: readonly number[] | null;
   readonly seed?: readonly number[] | null;
+  /** When present (voxel / SDF-MC), include volume trio for Dual / Voxel Live hot-swap. */
+  readonly volume?: CollisionVoxelVolume | null;
+  /** Prebuilt walkable floors GLB (skips meshToGlb when set). */
+  readonly walkableFloorsGlb?: Uint8Array | null;
 }
 
 const meshHasGeometry = (
@@ -162,14 +170,21 @@ export const buildNavArtifactBundle = async (
   return bundle;
 };
 
-/** Minimal Fast Nav pack: session + Recast binary (+ optional collision GLB). */
-export const buildMinimalNavArtifactBundle = (
+/**
+ * Minimal Fast Nav pack: session + Recast binary (+ optional collision GLB /
+ * volume + walkable_floors.glb from Recast debug mesh).
+ */
+export const buildMinimalNavArtifactBundle = async (
   options: BuildMinimalNavArtifactBundleOptions
-): NavArtifactBundle => {
+): Promise<NavArtifactBundle> => {
   if (!options.navMeshData.byteLength) {
     throw new Error('Minimal nav artifacts require non-empty recast.navmesh.bin bytes.');
   }
+  const hasVolume = Boolean(
+    options.volume?.solid?.byteLength && options.volume?.nav_region?.byteLength
+  );
   const session: NavSessionArtifactV1 = {
+    activeNavigationMode: hasVolume ? 'recast_and_voxel_mesh' : 'recast',
     collisionSeed: options.seed ?? null,
     locomotionMode: 'recast_crowd',
     playerSpawn: options.playerSpawn ?? null,
@@ -177,6 +192,39 @@ export const buildMinimalNavArtifactBundle = (
     regionMin: options.regionMin ?? null,
     version: 1,
   };
+  const volume = options.volume;
+  const volumeFields =
+    hasVolume && volume
+      ? {
+          volumeMetaJson: `${JSON.stringify(
+            {
+              dims: [volume.dims[0], volume.dims[1], volume.dims[2]],
+              format: NAV_VOLUME_FORMAT,
+              origin: [volume.origin[0], volume.origin[1], volume.origin[2]],
+              voxel_size: volume.voxel_size,
+            } satisfies NavVolumeMetaV1,
+            null,
+            2
+          )}\n`,
+          volumeNavRegionBin: volume.nav_region,
+          volumeSolidBin: volume.solid,
+        }
+      : {};
+  let walkableFloorsGlb =
+    options.walkableFloorsGlb && options.walkableFloorsGlb.byteLength > 0
+      ? options.walkableFloorsGlb
+      : null;
+  if (
+    !walkableFloorsGlb &&
+    options.debugPositions &&
+    options.debugIndices &&
+    meshHasGeometry(options.debugPositions, options.debugIndices)
+  ) {
+    walkableFloorsGlb = await walkableFloorsMeshToGlb(
+      options.debugPositions,
+      options.debugIndices
+    );
+  }
   return {
     collisionGlb:
       options.collisionGlb && options.collisionGlb.byteLength > 0
@@ -184,8 +232,36 @@ export const buildMinimalNavArtifactBundle = (
         : undefined,
     navSessionJson: `${JSON.stringify(session, null, 2)}\n`,
     recastNavmeshBin: options.navMeshData,
+    walkableFloorsGlb: walkableFloorsGlb ?? undefined,
+    ...volumeFields,
   };
 };
+
+/**
+ * Rebuild a downloadable pack from live Detour + oriented debug mesh.
+ * Always regenerates `walkable_floors.glb` from debug buffers (never keeps a
+ * stale GLB from `base`). Preserves collision GLB from `base` when present.
+ */
+export const rebuildNavArtifactBundleFromLiveMesh = async (options: {
+  readonly base: NavArtifactBundle;
+  readonly debugIndices: ArrayLike<number>;
+  readonly debugPositions: ArrayLike<number>;
+  readonly navMeshData: Uint8Array;
+  readonly playerSpawn?: readonly [number, number, number] | null;
+  readonly regionMax?: readonly number[] | null;
+  readonly regionMin?: readonly number[] | null;
+  readonly volume?: CollisionVoxelVolume | null;
+}): Promise<NavArtifactBundle> =>
+  buildMinimalNavArtifactBundle({
+    collisionGlb: options.base.collisionGlb ?? null,
+    debugIndices: options.debugIndices,
+    debugPositions: options.debugPositions,
+    navMeshData: options.navMeshData,
+    playerSpawn: options.playerSpawn,
+    regionMax: options.regionMax,
+    regionMin: options.regionMin,
+    volume: options.volume,
+  });
 
 /** Zip member map for {@link NAV_ARTIFACT_FILES} (omit empty optional members). */
 export const navArtifactZipEntries = (
@@ -290,11 +366,36 @@ const parseVolumeMetaJson = (text: string): NavVolumeMetaV1 => {
   return raw;
 };
 
-const entriesToParsed = (entries: Record<string, Uint8Array>): ParsedNavArtifacts => {
+/**
+ * Normalize zip paths to contract basenames.
+ * Accepts flat members or a directory prefix (e.g. `nav/nav_session.json`).
+ */
+export const normalizeNavArtifactEntryMap = (
+  entries: Record<string, Uint8Array>,
+  options?: { readonly preferPrefix?: string }
+): Record<string, Uint8Array> => {
+  const preferPrefix = options?.preferPrefix?.replace(/\\/g, '/');
   const byName: Record<string, Uint8Array> = {};
-  for (const [path, bytes] of Object.entries(entries)) {
-    byName[basenameOf(path)] = bytes;
+  for (const [rawPath, bytes] of Object.entries(entries)) {
+    const path = rawPath.replace(/\\/g, '/');
+    const base = basenameOf(path);
+    if (preferPrefix && path.startsWith(preferPrefix)) {
+      byName[base] = bytes;
+      continue;
+    }
+    if (!(base in byName)) {
+      byName[base] = bytes;
+    }
   }
+  return byName;
+};
+
+/** Parse a basename → bytes map into validated {@link ParsedNavArtifacts}. */
+export const parseNavArtifactEntries = (
+  entries: Record<string, Uint8Array>,
+  options?: { readonly preferPrefix?: string }
+): ParsedNavArtifacts => {
+  const byName = normalizeNavArtifactEntryMap(entries, options);
 
   const sessionBytes = byName[NAV_ARTIFACT_FILES.navSessionJson];
   if (!sessionBytes) {
@@ -350,7 +451,7 @@ export const parseNavArtifactZip = (bytes: Uint8Array): ParsedNavArtifacts => {
     const detail = error instanceof Error ? error.message : String(error);
     throw new Error(`Failed to unzip nav artifacts: ${detail}`);
   }
-  return entriesToParsed(entries);
+  return parseNavArtifactEntries(entries);
 };
 
 const readFileBytes = async (file: File): Promise<Uint8Array> =>
@@ -385,5 +486,5 @@ export const parseNavArtifactFiles = async (
     }
     entries[base] = await readFileBytes(file);
   }
-  return entriesToParsed(entries);
+  return parseNavArtifactEntries(entries);
 };

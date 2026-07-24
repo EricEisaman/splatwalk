@@ -16,12 +16,12 @@ TypeScript bridge and Babylon UI live in the main SplatWalk repository.
 
 **Renderer note:** `@splatwalk/core` is engine-agnostic. WebGL vs WebGPU is chosen
 by the host (e.g. Babylon `Engine` / `WebGPUEngine`). The WASM binary does not
-create a GPU context. Reference UI demos in the main repo (v0.6.4+) expose a
-WebGPU/WebGL toggle for Babylon and ship **Download FastNav kit** zips under
+create a GPU context. Reference UI demos in the main repo (v0.6.10+) expose a
+WebGPU/WebGL toggle for Babylon and ship **Download FastNav Component Pack** zips under
 `/integration-kits/`. Camera-based select regions use host
 `FastNavOptions.cameraSelect` / `regionBoundsFromCameraSelect` → WASM
 `region_min`/`region_max` AABB (`api_version` 2). Storage Adapter Region/prune
-can apply the AABB from the live fly camera with editable offsets (v0.6.4+).
+can apply the AABB from the live fly camera with editable offsets.
 
 ## Install
 

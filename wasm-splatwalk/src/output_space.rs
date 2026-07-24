@@ -213,6 +213,9 @@ pub fn apply_collision_voxel_boundary(
 ) {
     if let Some(t) = transform_for(settings) {
         apply_mesh_buffers(&t, &mut result.mesh);
+        if let Some(ref mut collider) = result.collider_mesh {
+            apply_mesh_buffers(&t, collider);
+        }
         apply_basis(&t, &mut result.basis);
         apply_floor_plane(&t, &mut result.floor_plane);
         result.space = t.coordinate_space();

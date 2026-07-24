@@ -144,3 +144,58 @@ export const regionBoundsFromCameraSelect = (
     pose: poseFromCameraSelectView(input.view),
     offsets: input.offsets,
   });
+
+/**
+ * Clamp a point into an AABB. When a region pin is set, seed and camera must
+ * never leave this box.
+ */
+export const clampPointToAabb = (params: {
+  readonly point: { readonly x: number; readonly y: number; readonly z: number } | readonly number[];
+  readonly regionMax: readonly number[];
+  readonly regionMin: readonly number[];
+}): number[] => {
+  const { point, regionMax, regionMin } = params;
+  const x = Array.isArray(point) ? point[0]! : (point as { x: number }).x;
+  const y = Array.isArray(point) ? point[1]! : (point as { y: number }).y;
+  const z = Array.isArray(point) ? point[2]! : (point as { z: number }).z;
+  return [
+    Math.min(regionMax[0]!, Math.max(regionMin[0]!, x)),
+    Math.min(regionMax[1]!, Math.max(regionMin[1]!, y)),
+    Math.min(regionMax[2]!, Math.max(regionMin[2]!, z)),
+  ];
+};
+
+const GROUND_REGION_Y_BELOW_M = 1;
+const GROUND_REGION_Y_MIN_ABOVE_M = 3;
+
+/**
+ * Horizontal footprint from camera yaw; vertical band from floor (not eye height).
+ * Avoids sky-high boxes when the view is top-down.
+ */
+export const groundAnchoredCameraRegion = (params: {
+  readonly carveHeight: number;
+  readonly floorY: number;
+  readonly offsets?: Partial<CameraSelectRegionOffsets>;
+  readonly pose: CameraSelectRegionPose;
+}): RegionBoundsAabb => {
+  const above = Math.max(GROUND_REGION_Y_MIN_ABOVE_M, params.carveHeight + 1);
+  const foot = regionBoundsFromCameraPose({
+    offsets: {
+      ...params.offsets,
+      above,
+      below: GROUND_REGION_Y_BELOW_M,
+    },
+    pose: {
+      position: {
+        x: params.pose.position.x,
+        y: params.floorY,
+        z: params.pose.position.z,
+      },
+      yawRadians: params.pose.yawRadians,
+    },
+  });
+  return {
+    min: [foot.min[0]!, params.floorY - GROUND_REGION_Y_BELOW_M, foot.min[2]!],
+    max: [foot.max[0]!, params.floorY + above, foot.max[2]!],
+  };
+};

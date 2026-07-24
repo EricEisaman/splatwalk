@@ -3,19 +3,48 @@ import { DEFAULT_FAST_NAV_RECOVERY, type FastNavRecoveryConfig, type StrayTrimOp
 
 /** A selectable example splat scene shown in the "Example scenes" menu. */
 export interface ExampleScene {
+  readonly collisionSceneType: 'indoor' | 'outdoor';
   readonly title: string;
   readonly url: string;
 }
 
 /** Built-in example scenes; override via the `exampleScenes` prop. */
 export const DEFAULT_EXAMPLE_SCENES: readonly ExampleScene[] = [
-  { title: 'Bedroom', url: 'https://raw.githubusercontent.com/EricEisaman/assets/main/environment/splats/bedroom.ply' },
-  { title: 'PurplePad', url: 'https://raw.githubusercontent.com/EricEisaman/assets/main/environment/splats/PurplePad.spz' },
-  { title: 'Bridge', url: 'https://raw.githubusercontent.com/EricEisaman/assets/main/environment/splats/Bridge.spz' },
-  { title: 'Meadow', url: 'https://raw.githubusercontent.com/EricEisaman/assets/main/environment/splats/meadow.spz' },
-  { title: 'Tropical Compound', url: 'https://raw.githubusercontent.com/EricEisaman/assets/main/environment/splats/tropical_compound.ply' },
-  { title: 'Industrial Warehouse', url: 'https://raw.githubusercontent.com/EricEisaman/assets/main/environment/splats/industrial_warehouse.ply' },
-  { title: 'Stairs', url: 'https://raw.githubusercontent.com/EricEisaman/assets/main/environment/splats/stairs.spz' },
+  {
+    collisionSceneType: 'indoor',
+    title: 'Bedroom',
+    url: 'https://raw.githubusercontent.com/EricEisaman/assets/main/environment/splats/bedroom.ply',
+  },
+  {
+    collisionSceneType: 'indoor',
+    title: 'PurplePad',
+    url: 'https://raw.githubusercontent.com/EricEisaman/assets/main/environment/splats/PurplePad.spz',
+  },
+  {
+    collisionSceneType: 'outdoor',
+    title: 'Bridge',
+    url: 'https://raw.githubusercontent.com/EricEisaman/assets/main/environment/splats/Bridge.spz',
+  },
+  {
+    collisionSceneType: 'outdoor',
+    title: 'Meadow',
+    url: 'https://raw.githubusercontent.com/EricEisaman/assets/main/environment/splats/meadow.spz',
+  },
+  {
+    collisionSceneType: 'outdoor',
+    title: 'Tropical Compound',
+    url: 'https://raw.githubusercontent.com/EricEisaman/assets/main/environment/splats/tropical_compound.ply',
+  },
+  {
+    collisionSceneType: 'indoor',
+    title: 'Industrial Warehouse',
+    url: 'https://raw.githubusercontent.com/EricEisaman/assets/main/environment/splats/industrial_warehouse.ply',
+  },
+  {
+    collisionSceneType: 'indoor',
+    title: 'Stairs',
+    url: 'https://raw.githubusercontent.com/EricEisaman/assets/main/environment/splats/stairs.spz',
+  },
 ];
 
 // Re-exported so integrators can extend the built-in recovery ladder.
@@ -28,6 +57,16 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref, watch, type Compon
 
 import { useBabylonViewer } from '@/composables/useBabylonViewer';
 import { useSplatFastNav, type LogTag, type SogExportMode } from '@/composables/useSplatFastNav';
+import {
+  ACTIVE_NAVIGATION_MODE_OPTIONS,
+  activeNavigationModeLabel,
+  liveNavBackendLabel,
+  type ActiveNavigationMode,
+} from '@/navigation/activeNavigation';
+import {
+  DEMO_NAV_FLOOR_SLIDER_FIELDS,
+  DEMO_NAV_RECAST_SLIDER_FIELDS,
+} from '@/navigation/navSettings';
 import type { BabylonRendererPreference } from '@/scene/createBabylonEngine';
 import { downloadIntegrationKit } from '@/utils/downloadIntegrationKit';
 import {
@@ -96,18 +135,38 @@ const {
   loadExample,
   exportSog,
   exportNavmesh,
+  downloadNavKit,
   downloadNavArtifacts,
   uploadNavArtifacts,
   hasNavArtifactBundle,
+  hasNavKit,
   navArtifactUploadHint,
+  navKitUploadHint,
   cameraSelectOffsets,
   resetCameraSelectOffsets,
+  cameraInfo,
+  cameraInfoCopyText,
+  copyCameraPose,
+  setCameraInfoPanelOpen,
+  playerInfo,
+  playerInfoCopyText,
+  copyPlayerPose,
+  setPlayerInfoPanelOpen,
   applySelectRegionFromCamera,
   generateCollisionBoundary,
   exportCollisionMesh,
   setCollisionBoundaryVisible,
+  hasCollisionBoundary,
   setNavMeshVisible,
+  setNavMeshEditorEnabled,
+  setNavMeshEditorMode,
+  navMeshEditorGlobalY,
+  navMeshEditorFillHole,
+  navMeshEditorDeleteVertices,
+  applyNavMeshEditorToLive,
+  onNavMeshEditorStatus,
   goToPlayer,
+  topDownViewApplied,
   navSettings,
   resetNavSettings,
   hasNavMesh,
@@ -116,10 +175,190 @@ const {
   selectionRegionVisible,
   setSelectionRegionVisible,
   rerunFastNav,
+  navGenerationMode,
+  collisionSceneType,
+  setCollisionSceneType,
+  activeNavigationMode,
+  setActiveNavigationMode,
+  activeNavigationModeDisabledReason,
+  liveBackend,
+  controlsMode,
+  setControlsMode,
+  controlsWasdLegend,
   applyEnvironmentScale,
-  setPendingEnvironmentScale,
+  applyScaleMultiplier,
+  sessionEnvironmentScale,
   reset,
 } = useSplatFastNav(babylon, { recovery: props.recovery, strayTrim: props.strayTrim, prune: props.prune });
+
+const collisionSceneTypeOptions = [
+  { title: 'Indoor (sealed rooms, stairs)', value: 'indoor' },
+  { title: 'Outdoor (floor fill)', value: 'outdoor' },
+] as const;
+
+const activeModeOptions = ACTIVE_NAVIGATION_MODE_OPTIONS;
+
+const onCollisionSceneType = (sceneType: 'indoor' | 'outdoor' | null): void => {
+  if (!sceneType) {
+    return;
+  }
+  setCollisionSceneType(sceneType);
+};
+
+const onActiveNavigationMode = (mode: ActiveNavigationMode | null): void => {
+  if (!mode) {
+    return;
+  }
+  void setActiveNavigationMode(mode).catch(() => undefined);
+};
+
+const navMeshEditorEnabled = ref(false);
+const navMeshEditorMode = ref<'vertex' | 'circle' | 'global'>('circle');
+const navMeshEditorStatusText = ref('Off');
+const navMeshEditorHoleReady = ref(false);
+const navMeshEditorDeleteReady = ref(false);
+const navMeshEditorPendingApply = ref(false);
+const navMeshEditorApplying = ref(false);
+
+/** Camera / Player Information collapsed by default; sampling runs only while open. */
+const cameraInfoPanels = ref<number[]>([]);
+const playerInfoPanels = ref<number[]>([]);
+const cameraInfoCopied = ref(false);
+const playerInfoCopied = ref(false);
+
+const cameraPositionLabel = computed(() => {
+  const p = cameraInfo.value.position;
+  return `${p.x.toFixed(3)}, ${p.y.toFixed(3)}, ${p.z.toFixed(3)}`;
+});
+
+const cameraEulerLabel = computed(() => {
+  const e = cameraInfo.value.eulerDegrees;
+  return `X ${e.x.toFixed(1)}° · Y ${e.y.toFixed(1)}° · Z ${e.z.toFixed(1)}°`;
+});
+
+const playerPositionLabel = computed(() => {
+  if (!playerInfo.value.available) {
+    return '—';
+  }
+  const p = playerInfo.value.position;
+  return `${p.x.toFixed(3)}, ${p.y.toFixed(3)}, ${p.z.toFixed(3)}`;
+});
+
+const playerYawLabel = computed(() => {
+  if (!playerInfo.value.available) {
+    return '—';
+  }
+  return `${playerInfo.value.eulerDegrees.y.toFixed(1)}°`;
+});
+
+watch(
+  cameraInfoPanels,
+  (panels) => {
+    setCameraInfoPanelOpen(panels.includes(0));
+  },
+  { deep: true }
+);
+
+watch(
+  playerInfoPanels,
+  (panels) => {
+    setPlayerInfoPanelOpen(panels.includes(0));
+  },
+  { deep: true }
+);
+
+const flashCopied = (flag: typeof cameraInfoCopied): void => {
+  flag.value = true;
+  window.setTimeout(() => {
+    flag.value = false;
+  }, 1600);
+};
+
+const onCopyCameraPose = async (): Promise<void> => {
+  const ok = await copyCameraPose();
+  if (ok) {
+    flashCopied(cameraInfoCopied);
+  }
+};
+
+const onCopyPlayerPose = async (): Promise<void> => {
+  const ok = await copyPlayerPose();
+  if (ok) {
+    flashCopied(playerInfoCopied);
+  }
+};
+
+watch(navMeshEditorEnabled, (on) => {
+  setNavMeshEditorEnabled(on);
+});
+
+const onNavMeshEditorModeChange = (mode: 'vertex' | 'circle' | 'global' | null): void => {
+  if (!mode) {
+    return;
+  }
+  navMeshEditorMode.value = mode;
+  setNavMeshEditorMode(mode);
+};
+
+let unsubNavMeshEditorStatus: (() => void) | null = null;
+onMounted(() => {
+  unsubNavMeshEditorStatus = onNavMeshEditorStatus((st) => {
+    if (!st.enabled) {
+      navMeshEditorStatusText.value = 'Off';
+      navMeshEditorHoleReady.value = false;
+      navMeshEditorDeleteReady.value = false;
+      navMeshEditorPendingApply.value = false;
+      navMeshEditorApplying.value = false;
+      return;
+    }
+    if (navMeshEditorMode.value !== st.mode) {
+      navMeshEditorMode.value = st.mode;
+    }
+    const parts = [
+      st.mode,
+      st.brushFollow ? 'follow' : 'pinned',
+      `${st.selectedCount} sel`,
+      `r=${st.brushRadius.toFixed(2)}`,
+    ];
+    if (st.holeDetected) {
+      parts.push('hole');
+    }
+    if (st.hasPendingLiveApply) {
+      parts.push('pending apply');
+    }
+    if (st.rebaking) {
+      parts.push('applying…');
+    }
+    if (st.message) {
+      parts.push(st.message);
+    }
+    navMeshEditorStatusText.value = parts.join(' · ');
+    navMeshEditorHoleReady.value =
+      st.mode === 'circle' && st.holeDetected && !st.rebaking;
+    navMeshEditorDeleteReady.value =
+      (st.mode === 'vertex' || st.mode === 'circle') &&
+      st.selectedCount > 0 &&
+      !st.rebaking;
+    navMeshEditorPendingApply.value = st.hasPendingLiveApply;
+    navMeshEditorApplying.value = st.rebaking;
+  });
+});
+
+const onApplyNavMeshEditorToLive = (): void => {
+  void applyNavMeshEditorToLive();
+};
+const onDeleteNavMeshEditorVertices = (): void => {
+  void navMeshEditorDeleteVertices();
+};
+const isActiveNavigationModeEnabled = (mode: ActiveNavigationMode): boolean => {
+  if (isBusy.value) {
+    return false;
+  }
+  if (navGenerationMode.value === 'floor_field') {
+    return mode === 'recast';
+  }
+  return true;
+};
 
 const navArtifactsInputRef = ref<HTMLInputElement | null>(null);
 
@@ -291,19 +530,20 @@ function onNavMeshVisible(visible: boolean): void {
 
 async function runApplyEnvironmentScale(): Promise<void> {
   if (scaleApplying.value || isBusy.value) return;
-  const scale = Number(environmentScale.value);
-  if (!Number.isFinite(scale) || scale <= 0) {
-    scaleSummary.value = 'Scale Environment must be a positive number.';
+  const factor = Number(environmentScale.value);
+  if (!Number.isFinite(factor) || factor <= 0) {
+    scaleSummary.value = 'Scale multiplier must be a positive number.';
     return;
   }
   scaleApplying.value = true;
   scaleSummary.value = null;
   try {
-    await applyEnvironmentScale(scale);
+    await applyEnvironmentScale(factor);
+    environmentScale.value = 1;
     scaleSummary.value =
       status.value === 'done'
-        ? `Environment scale applied: ${scale}.`
-        : `Environment scale set to ${scale} — applies on next Fast Nav.`;
+        ? `Session scale: ${sessionEnvironmentScale.value}.`
+        : `Session scale: ${sessionEnvironmentScale.value} — applies on next Fast Nav.`;
   } catch (error) {
     scaleSummary.value = `Scale failed: ${error instanceof Error ? error.message : String(error)}`;
   } finally {
@@ -357,7 +597,7 @@ const steps = computed(() => {
     { label: 'Load splat', active: status.value === 'loading', done: loadDone },
     { label: pruneLabel, active: pruneActive, done: pruneDone || navDone },
     { label: 'FAST NAV', active: navActive, done: navDone },
-    { label: 'Top-down view', active: false, done: navDone },
+    { label: 'Top-down view', active: false, done: topDownViewApplied.value },
   ];
 });
 
@@ -372,7 +612,11 @@ const tagColor: Record<LogTag, string> = {
 
 function pickFile(file: File | null | undefined): void {
   if (file) {
-    setPendingEnvironmentScale(Number(environmentScale.value));
+    const factor = Number(environmentScale.value);
+    if (Number.isFinite(factor) && factor > 0) {
+      applyScaleMultiplier(factor);
+      environmentScale.value = 1;
+    }
     void loadAndProcess(file);
   }
 }
@@ -392,9 +636,17 @@ function onDrop(event: DragEvent): void {
   pickFile(event.dataTransfer?.files?.[0]);
 }
 
-function onLoadExample(url: string, title: string): void {
-  setPendingEnvironmentScale(Number(environmentScale.value));
-  void loadExample(url, title);
+function onLoadExample(
+  url: string,
+  title: string,
+  collisionSceneType: 'indoor' | 'outdoor' = 'indoor'
+): void {
+  const factor = Number(environmentScale.value);
+  if (Number.isFinite(factor) && factor > 0) {
+    applyScaleMultiplier(factor);
+    environmentScale.value = 1;
+  }
+  void loadExample(url, title, collisionSceneType);
 }
 
 function onReset(): void {
@@ -415,9 +667,17 @@ async function runRerunFastNav(): Promise<void> {
   if (rerunApplying.value || isBusy.value) {
     return;
   }
+  const factor = Number(environmentScale.value);
+  if (!Number.isFinite(factor) || factor <= 0) {
+    scaleSummary.value = 'Scale multiplier must be a positive number.';
+    return;
+  }
   rerunApplying.value = true;
   try {
-    await rerunFastNav();
+    // Factor 1 keeps session scale; factor ≠ 1 multiplies then bakes.
+    await rerunFastNav({ scaleMultiplier: factor });
+    environmentScale.value = 1;
+    scaleSummary.value = `Session scale: ${sessionEnvironmentScale.value}.`;
   } catch {
     // Error surfaced via errorMessage / snackbar.
   } finally {
@@ -444,7 +704,13 @@ function onFullscreenChange(): void {
 }
 
 onMounted(() => document.addEventListener('fullscreenchange', onFullscreenChange));
-onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscreenChange));
+onBeforeUnmount(() => {
+  setCameraInfoPanelOpen(false);
+  setPlayerInfoPanelOpen(false);
+  document.removeEventListener('fullscreenchange', onFullscreenChange);
+  unsubNavMeshEditorStatus?.();
+  unsubNavMeshEditorStatus = null;
+});
 </script>
 
 <template>
@@ -455,8 +721,12 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
           Gaussian Splat <span class="text-primary">FAST NAV</span>
         </div>
         <p class="text-body-2 text-medium-emphasis mb-3">
-          Drop a <strong>.ply</strong>, <strong>.spz</strong>, or <strong>.splat</strong> 3D Gaussian Splat. It loads into Babylon.js, auto-runs
-          the FAST NAV pipeline (collider &rarr; navmesh &rarr; crowd &rarr; NPC), then frames the player top-down.
+          Drop a <strong>.ply</strong>, <strong>.spz</strong>, <strong>.splat</strong>, or a
+          <strong>navkit.zip</strong> (model + baked nav). Splats load into Babylon.js and
+          auto-run Fast Nav (default <strong>floor field</strong>; or
+          <strong>voxel collision</strong> / <strong>SDF Marching Cubes</strong> via Navmesh settings)
+          → navmesh → crowd → NPC, then frame the player top-down. NavKit restore keeps the saved
+          camera pose (no forced top-down).
         </p>
 
         <div class="d-flex flex-wrap align-center ga-3 mb-3">
@@ -467,7 +737,17 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
             :disabled="isBusy"
             @click="onDownloadFastNavKit"
           >
-            Download FastNav kit
+            Download FastNav Component Pack
+          </v-btn>
+          <v-btn
+            color="primary"
+            variant="flat"
+            prepend-icon="mdi-package-down"
+            :disabled="!hasNavKit || isBusy"
+            :title="navKitUploadHint"
+            @click="downloadNavKit"
+          >
+            Download NavKit
           </v-btn>
           <div class="d-flex align-center flex-wrap ga-2">
             <v-btn-toggle
@@ -567,7 +847,7 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
                       :key="scene.url"
                       :title="scene.title"
                       prepend-icon="mdi-cube-outline"
-                      @click="onLoadExample(scene.url, scene.title)"
+                      @click="onLoadExample(scene.url, scene.title, scene.collisionSceneType)"
                     />
                   </v-list>
                 </v-menu>
@@ -621,10 +901,191 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
             </template>
             <template #text>
               <p class="text-caption text-medium-emphasis mb-3">
-                Set Scale Environment before loading a splat to bake it into the first Fast Nav run,
-                or Apply / Recompute after Fast Nav to rebuild at the new scale.
+                Scale Environment is a multiplier on the current session scale (starts at 1).
+                After Apply / Recompute it resets to 1; the absolute session scale is shown below.
                 Orbit: hold <strong class="text-primary">SHIFT</strong> for 10× pan / drive (wheel).
               </p>
+
+              <v-select
+                v-model="navGenerationMode"
+                :items="[
+                  { title: 'Floor field', value: 'floor_field' },
+                  { title: 'Voxel collision', value: 'voxel_collision' },
+                  { title: 'SDF Marching Cubes', value: 'sdf_marching_cubes' },
+                ]"
+                item-title="title"
+                item-value="value"
+                label="Nav generation technique"
+                density="compact"
+                hide-details
+                class="mb-3"
+                :disabled="isBusy"
+              />
+              <v-select
+                :model-value="collisionSceneType"
+                :items="collisionSceneTypeOptions"
+                item-title="title"
+                item-value="value"
+                label="Scene type"
+                density="compact"
+                hide-details
+                class="mb-3"
+                :disabled="isBusy || navGenerationMode === 'floor_field'"
+                @update:model-value="onCollisionSceneType"
+              />
+              <p
+                v-if="navGenerationMode !== 'floor_field'"
+                class="text-caption text-medium-emphasis mb-3"
+              >
+                Indoor seals rooms; outdoor keeps open sky / floor fill. Example scenes seed this;
+                change it before load or Recompute (applies matching DemoNavSettings bands).
+              </p>
+
+              <div class="d-flex align-center flex-wrap ga-2 mb-2">
+                <div class="text-subtitle-2">Active navigation mode</div>
+                <v-chip size="x-small" variant="tonal" color="secondary">
+                  Live: {{ liveNavBackendLabel(liveBackend) }}
+                </v-chip>
+              </div>
+              <v-btn-toggle
+                :model-value="activeNavigationMode"
+                mandatory
+                density="comfortable"
+                color="secondary"
+                class="mb-2"
+                :disabled="isBusy"
+                @update:model-value="onActiveNavigationMode"
+              >
+                <v-btn
+                  v-for="option in activeModeOptions"
+                  :key="option.value"
+                  :value="option.value"
+                  :disabled="!isActiveNavigationModeEnabled(option.value)"
+                  :title="activeNavigationModeDisabledReason(option.value) ?? option.subtitle"
+                >
+                  {{ option.title }}
+                </v-btn>
+              </v-btn-toggle>
+              <p class="text-caption text-medium-emphasis mb-4">
+                {{ activeModeOptions.find((o) => o.value === activeNavigationMode)?.subtitle }}
+                Active: {{ activeNavigationModeLabel(activeNavigationMode) }}.
+                The Live chip is what click-to-move uses right now.
+              </p>
+
+              <div class="text-subtitle-2 mb-2">Controls</div>
+              <v-btn-toggle
+                :model-value="controlsMode"
+                mandatory
+                density="comfortable"
+                color="primary"
+                class="mb-2"
+                :disabled="isBusy || !hasNavMesh"
+                @update:model-value="(mode) => mode && setControlsMode(mode)"
+              >
+                <v-btn value="click_to_move">Click to move</v-btn>
+                <v-btn value="wasdqe">WASDQE</v-btn>
+                <v-btn value="both">Both</v-btn>
+              </v-btn-toggle>
+              <p class="text-caption text-medium-emphasis mb-4">
+                <template v-if="!hasNavMesh">
+                  Run Fast Nav or load a NavKit to enable player controls.
+                </template>
+                <template v-else-if="controlsMode === 'wasdqe' || controlsMode === 'both'">
+                  {{ controlsWasdLegend
+                  }}{{ controlsMode === 'both' ? ' · click navmesh also works' : '' }}
+                </template>
+                <template v-else>Click the green navmesh to move.</template>
+              </p>
+
+              <v-expansion-panels v-model="cameraInfoPanels" class="mb-2" variant="accordion" multiple>
+                <v-expansion-panel>
+                  <template #title>
+                    <div class="d-flex align-center ga-2">
+                      <v-icon icon="mdi-camera-control" size="small" color="primary" />
+                      <span>Camera Information</span>
+                    </div>
+                  </template>
+                  <template #text>
+                    <p class="text-caption text-medium-emphasis mb-3">
+                      Live camera pose. Values refresh only while this section is open.
+                      Download NavKit writes the live pose at click time into
+                      <code>meta-nav.json</code> (<code>camPos</code> /
+                      <code>camTarget</code> / <code>camEulerDeg</code>).
+                    </p>
+                    <div class="text-body-2 mb-2 font-monospace">
+                      <span class="text-medium-emphasis">Position:</span>
+                      {{ cameraPositionLabel }}
+                    </div>
+                    <div class="text-body-2 mb-3 font-monospace">
+                      <span class="text-medium-emphasis">Orientation (euler °):</span>
+                      {{ cameraEulerLabel }}
+                    </div>
+                    <v-btn
+                      size="small"
+                      variant="tonal"
+                      color="primary"
+                      prepend-icon="mdi-content-copy"
+                      @click="onCopyCameraPose"
+                    >
+                      {{ cameraInfoCopied ? 'Copied' : 'Copy pose' }}
+                    </v-btn>
+                    <div class="text-caption text-medium-emphasis mt-2 font-monospace text-wrap">
+                      {{ cameraInfoCopyText }}
+                    </div>
+                  </template>
+                </v-expansion-panel>
+              </v-expansion-panels>
+
+              <v-expansion-panels v-model="playerInfoPanels" class="mb-4" variant="accordion" multiple>
+                <v-expansion-panel>
+                  <template #title>
+                    <div class="d-flex align-center ga-2">
+                      <v-icon icon="mdi-account" size="small" color="primary" />
+                      <span>Player Information</span>
+                    </div>
+                  </template>
+                  <template #text>
+                    <p class="text-caption text-medium-emphasis mb-3">
+                      Live player pose. Values refresh only while this section is open.
+                      Download NavKit writes <code>playerPos</code> /
+                      <code>playerEulerDeg</code> at click time.
+                    </p>
+                    <div class="text-body-2 mb-2 font-monospace">
+                      <span class="text-medium-emphasis">Position:</span>
+                      {{ playerPositionLabel }}
+                    </div>
+                    <div class="text-body-2 mb-3 font-monospace">
+                      <span class="text-medium-emphasis">Yaw °:</span>
+                      {{ playerYawLabel }}
+                    </div>
+                    <div class="d-flex flex-wrap ga-2">
+                      <v-btn
+                        size="small"
+                        variant="tonal"
+                        color="primary"
+                        prepend-icon="mdi-content-copy"
+                        :disabled="!playerInfo.available"
+                        @click="onCopyPlayerPose"
+                      >
+                        {{ playerInfoCopied ? 'Copied' : 'Copy pose' }}
+                      </v-btn>
+                      <v-btn
+                        size="small"
+                        variant="tonal"
+                        color="secondary"
+                        prepend-icon="mdi-account-arrow-down"
+                        :disabled="isBusy || !hasNavMesh"
+                        @click="goToPlayer"
+                      >
+                        Go to Player
+                      </v-btn>
+                    </div>
+                    <div class="text-caption text-medium-emphasis mt-2 font-monospace text-wrap">
+                      {{ playerInfoCopyText }}
+                    </div>
+                  </template>
+                </v-expansion-panel>
+              </v-expansion-panels>
 
               <div class="d-flex flex-wrap align-center ga-3 mb-4">
                 <v-btn
@@ -637,7 +1098,8 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
                   Recompute
                 </v-btn>
                 <span class="text-caption text-medium-emphasis">
-                  Re-runs Fast Nav with current prune, selection region, and scale.
+                  Re-runs the selected technique with current prune, selection region, and session scale
+                  (Scale multiplier × session when not 1).
                 </span>
               </div>
 
@@ -699,105 +1161,26 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
 
               <div class="text-subtitle-2 mb-2">Floor coverage</div>
               <v-row density="comfortable">
-                <v-col cols="12" sm="6" md="4">
+                <v-col
+                  v-for="field in DEMO_NAV_FLOOR_SLIDER_FIELDS"
+                  :key="field.key"
+                  cols="12"
+                  sm="6"
+                  md="4"
+                >
                   <v-slider
-                    v-model="navSettings.sameLevelBelow"
-                    :min="0.25"
-                    :max="4"
-                    :step="0.05"
-                    color="primary"
+                    v-model="navSettings[field.key]"
+                    :min="field.min"
+                    :max="field.max"
+                    :step="field.step"
+                    :color="field.color ?? 'primary'"
                     density="compact"
                     thumb-label
                     hide-details
                     :disabled="isBusy"
                   >
                     <template #prepend>
-                      <span class="text-caption text-medium-emphasis settings-label">Band below (m)</span>
-                    </template>
-                  </v-slider>
-                </v-col>
-                <v-col cols="12" sm="6" md="4">
-                  <v-slider
-                    v-model="navSettings.sameLevelAbove"
-                    :min="0.3"
-                    :max="4"
-                    :step="0.05"
-                    color="primary"
-                    density="compact"
-                    thumb-label
-                    hide-details
-                    :disabled="isBusy"
-                  >
-                    <template #prepend>
-                      <span class="text-caption text-medium-emphasis settings-label">Band above (m)</span>
-                    </template>
-                  </v-slider>
-                </v-col>
-                <v-col cols="12" sm="6" md="4">
-                  <v-slider
-                    v-model="navSettings.holeFillRadius"
-                    :min="0"
-                    :max="8"
-                    :step="1"
-                    color="primary"
-                    density="compact"
-                    thumb-label
-                    hide-details
-                    :disabled="isBusy"
-                  >
-                    <template #prepend>
-                      <span class="text-caption text-medium-emphasis settings-label">Hole fill (cells)</span>
-                    </template>
-                  </v-slider>
-                </v-col>
-                <v-col cols="12" sm="6" md="4">
-                  <v-slider
-                    v-model="navSettings.sdfCellSize"
-                    :min="0.1"
-                    :max="0.4"
-                    :step="0.01"
-                    color="secondary"
-                    density="compact"
-                    thumb-label
-                    hide-details
-                    :disabled="isBusy"
-                  >
-                    <template #prepend>
-                      <span class="text-caption text-medium-emphasis settings-label">SDF cell (m)</span>
-                    </template>
-                  </v-slider>
-                </v-col>
-                <v-col cols="12" sm="6" md="4">
-                  <v-slider
-                    v-model="navSettings.sdfDensityThreshold"
-                    :min="0.01"
-                    :max="0.12"
-                    :step="0.005"
-                    color="secondary"
-                    density="compact"
-                    thumb-label
-                    hide-details
-                    :disabled="isBusy"
-                  >
-                    <template #prepend>
-                      <span class="text-caption text-medium-emphasis settings-label">Density thresh</span>
-                    </template>
-                  </v-slider>
-                </v-col>
-                <v-col cols="12" sm="6" md="4">
-                  <v-slider
-                    v-model="navSettings.maxLocalHeightVariance"
-                    :min="0.08"
-                    :max="0.6"
-                    :step="0.02"
-                    color="secondary"
-                    density="compact"
-                    thumb-label
-                    hide-details
-                    :disabled="isBusy"
-                  >
-                    <template #prepend>
-                      <span class="text-caption text-medium-emphasis settings-label">Height variance</span>
+                      <span class="text-caption text-medium-emphasis settings-label">{{ field.label }}</span>
                     </template>
                   </v-slider>
                 </v-col>
@@ -806,122 +1189,26 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
               <v-divider class="my-4" />
               <div class="text-subtitle-2 mb-2">Recast agent</div>
               <v-row density="comfortable">
-                <v-col cols="12" sm="6" md="4">
+                <v-col
+                  v-for="field in DEMO_NAV_RECAST_SLIDER_FIELDS"
+                  :key="field.key"
+                  cols="12"
+                  sm="6"
+                  md="4"
+                >
                   <v-slider
-                    v-model="navSettings.walkableSlopeAngle"
-                    :min="30"
-                    :max="70"
-                    :step="1"
-                    color="success"
+                    v-model="navSettings[field.key]"
+                    :min="field.min"
+                    :max="field.max"
+                    :step="field.step"
+                    :color="field.color ?? 'primary'"
                     density="compact"
                     thumb-label
                     hide-details
                     :disabled="isBusy"
                   >
                     <template #prepend>
-                      <span class="text-caption text-medium-emphasis settings-label">Max slope (°)</span>
-                    </template>
-                  </v-slider>
-                </v-col>
-                <v-col cols="12" sm="6" md="4">
-                  <v-slider
-                    v-model="navSettings.walkableRadius"
-                    :min="0.15"
-                    :max="0.6"
-                    :step="0.05"
-                    color="success"
-                    density="compact"
-                    thumb-label
-                    hide-details
-                    :disabled="isBusy"
-                  >
-                    <template #prepend>
-                      <span class="text-caption text-medium-emphasis settings-label">Agent radius (m)</span>
-                    </template>
-                  </v-slider>
-                </v-col>
-                <v-col cols="12" sm="6" md="4">
-                  <v-slider
-                    v-model="navSettings.walkableClimb"
-                    :min="0.25"
-                    :max="1"
-                    :step="0.05"
-                    color="success"
-                    density="compact"
-                    thumb-label
-                    hide-details
-                    :disabled="isBusy"
-                  >
-                    <template #prepend>
-                      <span class="text-caption text-medium-emphasis settings-label">Max climb (m)</span>
-                    </template>
-                  </v-slider>
-                </v-col>
-                <v-col cols="12" sm="6" md="4">
-                  <v-slider
-                    v-model="navSettings.minRegionArea"
-                    :min="0"
-                    :max="24"
-                    :step="1"
-                    color="success"
-                    density="compact"
-                    thumb-label
-                    hide-details
-                    :disabled="isBusy"
-                  >
-                    <template #prepend>
-                      <span class="text-caption text-medium-emphasis settings-label">Min region</span>
-                    </template>
-                  </v-slider>
-                </v-col>
-                <v-col cols="12" sm="6" md="4">
-                  <v-slider
-                    v-model="navSettings.maxIslandSeedDistance"
-                    :min="6"
-                    :max="200"
-                    :step="2"
-                    color="warning"
-                    density="compact"
-                    thumb-label
-                    hide-details
-                    :disabled="isBusy"
-                  >
-                    <template #prepend>
-                      <span class="text-caption text-medium-emphasis settings-label">Island↔seed max (m)</span>
-                    </template>
-                  </v-slider>
-                </v-col>
-                <v-col cols="12" sm="6" md="4">
-                  <v-slider
-                    v-model="navSettings.cellBandBelow"
-                    :min="0.5"
-                    :max="4"
-                    :step="0.1"
-                    color="primary"
-                    density="compact"
-                    thumb-label
-                    hide-details
-                    :disabled="isBusy"
-                  >
-                    <template #prepend>
-                      <span class="text-caption text-medium-emphasis settings-label">Cell band − (m)</span>
-                    </template>
-                  </v-slider>
-                </v-col>
-                <v-col cols="12" sm="6" md="4">
-                  <v-slider
-                    v-model="navSettings.cellBandAbove"
-                    :min="0.45"
-                    :max="4"
-                    :step="0.1"
-                    color="primary"
-                    density="compact"
-                    thumb-label
-                    hide-details
-                    :disabled="isBusy"
-                  >
-                    <template #prepend>
-                      <span class="text-caption text-medium-emphasis settings-label">Cell band + (m)</span>
+                      <span class="text-caption text-medium-emphasis settings-label">{{ field.label }}</span>
                     </template>
                   </v-slider>
                 </v-col>
@@ -974,16 +1261,136 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
                   :label="navMeshVisible ? 'Shown' : 'Hidden'"
                   @update:model-value="onNavMeshVisible(Boolean($event))"
                 />
-                <v-btn
-                  size="small"
-                  variant="tonal"
-                  color="secondary"
-                  prepend-icon="mdi-account-arrow-down"
+              </v-sheet>
+
+              <v-sheet
+                v-if="hasNavMesh"
+                border
+                rounded="lg"
+                class="pa-3 mb-4"
+                color="surface"
+              >
+                <div class="text-body-2 font-weight-medium mb-1">NavMesh Editor</div>
+                <div class="text-caption text-medium-emphasis mb-3">
+                  Modes: <kbd>1</kbd> Vertex · <kbd>2</kbd> Circle · <kbd>3</kbd> Global Y (0.1 m).
+                  Circle: click pin · click/+Shift ±0.1 m · <kbd>2</kbd> resume · <kbd>T</kbd> gizmo ·
+                  <kbd>F</kbd> fill · <kbd>X</kbd> delete. Then Apply when needed.
+                </div>
+                <v-switch
+                  v-model="navMeshEditorEnabled"
+                  color="pink"
+                  density="comfortable"
+                  hide-details
+                  inset
+                  class="mb-3"
                   :disabled="isBusy"
-                  @click="goToPlayer"
-                >
-                  Go to Player
-                </v-btn>
+                  :label="navMeshEditorEnabled ? 'Editor on' : 'Editor off'"
+                />
+                <v-select
+                  :model-value="navMeshEditorMode"
+                  :items="[
+                    { title: '1 Vertex', value: 'vertex' },
+                    { title: '2 Circle', value: 'circle' },
+                    { title: '3 Global Y', value: 'global' },
+                  ]"
+                  label="Mode"
+                  density="compact"
+                  variant="outlined"
+                  hide-details
+                  class="mb-2"
+                  style="max-width: 12rem"
+                  :disabled="isBusy || !navMeshEditorEnabled"
+                  @update:model-value="onNavMeshEditorModeChange"
+                />
+                <div v-if="navMeshEditorMode === 'global'" class="mb-2">
+                  <div class="text-caption text-medium-emphasis mb-2">Keys: ↑ / ↓ (0.1 m)</div>
+                  <div class="d-flex ga-2">
+                    <v-btn size="small" variant="tonal" :disabled="!navMeshEditorEnabled" @click="navMeshEditorGlobalY(1)">Up 0.1</v-btn>
+                    <v-btn size="small" variant="tonal" :disabled="!navMeshEditorEnabled" @click="navMeshEditorGlobalY(-1)">Down 0.1</v-btn>
+                  </div>
+                </div>
+                <div v-if="navMeshEditorMode === 'circle'" class="mb-2">
+                  <div class="text-caption text-medium-emphasis mb-2">
+                    Pin circle, grow until pink, then <kbd>F</kbd>
+                  </div>
+                  <v-btn
+                    size="small"
+                    color="pink"
+                    class="me-2"
+                    :disabled="!navMeshEditorHoleReady"
+                    @click="navMeshEditorFillHole()"
+                  >
+                    {{ navMeshEditorHoleReady ? 'Fill gap (F)' : 'Fill gap (waiting for pink / F)' }}
+                  </v-btn>
+                </div>
+                <div v-if="navMeshEditorMode === 'vertex' || navMeshEditorMode === 'circle'" class="mb-2">
+                  <v-btn
+                    size="small"
+                    color="error"
+                    :loading="navMeshEditorApplying"
+                    :disabled="!navMeshEditorDeleteReady"
+                    @click="onDeleteNavMeshEditorVertices"
+                  >
+                    {{ navMeshEditorDeleteReady ? 'Delete (X)' : 'Delete (select verts / X)' }}
+                  </v-btn>
+                </div>
+                <div v-if="navMeshEditorPendingApply" class="mb-2">
+                  <div class="text-caption text-medium-emphasis mb-2">
+                    Updates pathfinding and downloadable nav artifacts
+                  </div>
+                  <v-btn
+                    size="small"
+                    color="primary"
+                    :loading="navMeshEditorApplying"
+                    :disabled="navMeshEditorApplying"
+                    @click="onApplyNavMeshEditorToLive"
+                  >
+                    Apply to Live Navmesh
+                  </v-btn>
+                </div>
+                <div class="text-caption">{{ navMeshEditorStatusText }}</div>
+              </v-sheet>
+
+              <v-sheet
+                v-if="hasCollisionBoundary"
+                border
+                rounded="lg"
+                class="d-flex align-center flex-wrap ga-4 pa-3 mb-4 navmesh-toggle-bar"
+                color="surface"
+              >
+                <v-icon
+                  :icon="collisionBoundaryVisible ? 'mdi-cube-outline' : 'mdi-cube-off-outline'"
+                  :color="collisionBoundaryVisible ? 'info' : 'medium-emphasis'"
+                  size="22"
+                />
+                <div class="flex-grow-1">
+                  <div class="text-body-2 font-weight-medium">
+                    {{
+                      navGenerationMode === 'sdf_marching_cubes'
+                        ? 'MC shell (cyan)'
+                        : 'Collision boundary'
+                    }}
+                  </div>
+                  <div class="text-caption text-medium-emphasis">
+                    {{
+                      collisionBoundaryVisible
+                        ? navGenerationMode === 'sdf_marching_cubes'
+                          ? 'Cyan interior MC shell visible'
+                          : 'Cyan collision boundary visible'
+                        : 'Hidden — toggle on to show the cyan overlay'
+                    }}
+                  </div>
+                </div>
+                <v-switch
+                  v-model="collisionBoundaryVisible"
+                  color="info"
+                  density="comfortable"
+                  hide-details
+                  inset
+                  :disabled="isBusy"
+                  :label="collisionBoundaryVisible ? 'Shown' : 'Hidden'"
+                  @update:model-value="setCollisionBoundaryVisible(Boolean($event))"
+                />
               </v-sheet>
 
               <div class="text-subtitle-2 mb-2">Scale</div>
@@ -993,7 +1400,7 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
                   type="number"
                   min="0.01"
                   step="0.1"
-                  label="Scale Environment"
+                  label="Scale multiplier"
                   density="compact"
                   variant="outlined"
                   hide-details
@@ -1009,7 +1416,10 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
                 >
                   Apply
                 </v-btn>
-                <div v-if="scaleSummary" class="text-caption text-medium-emphasis">{{ scaleSummary }}</div>
+                <div class="text-caption text-medium-emphasis">
+                  Session scale: {{ sessionEnvironmentScale }}
+                  <span v-if="scaleSummary"> · {{ scaleSummary }}</span>
+                </div>
               </div>
             </template>
           </v-expansion-panel>
@@ -1031,11 +1441,21 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
                 <v-btn
                   variant="tonal"
                   color="primary"
+                  prepend-icon="mdi-package-down"
+                  :disabled="!hasNavKit || isBusy"
+                  :title="navKitUploadHint"
+                  @click="downloadNavKit"
+                >
+                  Download NavKit
+                </v-btn>
+                <v-btn
+                  variant="outlined"
+                  color="primary"
                   prepend-icon="mdi-download"
                   :disabled="!hasNavArtifactBundle || isBusy"
                   @click="downloadNavArtifacts"
                 >
-                  Download nav artifacts
+                  Download nav artifacts (legacy)
                 </v-btn>
                 <div
                   class="nav-artifacts-upload-wrap"
@@ -1049,7 +1469,7 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
                     tabindex="-1"
                     :disabled="!hasLoadedSplat || isBusy"
                   >
-                    Upload nav artifacts
+                    Upload nav artifacts (legacy)
                   </v-btn>
                   <input
                     v-if="hasLoadedSplat && !isBusy"
@@ -1063,6 +1483,7 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
                   >
                 </div>
               </div>
+              <p class="text-caption text-medium-emphasis mb-2">{{ navKitUploadHint }}</p>
               <p class="text-caption text-medium-emphasis mb-4">{{ navArtifactUploadHint }}</p>
 
               <v-sheet
@@ -1112,10 +1533,14 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
                 </v-btn>
                 <v-switch
                   v-model="collisionBoundaryVisible"
-                  color="primary"
+                  color="info"
                   density="compact"
                   hide-details
-                  label="Show collision boundary"
+                  :label="
+                    navGenerationMode === 'sdf_marching_cubes'
+                      ? 'Show MC shell (cyan)'
+                      : 'Show collision boundary'
+                  "
                   @update:model-value="setCollisionBoundaryVisible(Boolean($event))"
                 />
                 <v-btn
@@ -1235,7 +1660,7 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscr
     <input
       ref="fileInputRef"
       type="file"
-      accept=".ply,.spz,.splat"
+      accept=".ply,.spz,.splat,.zip,application/zip"
       class="d-none"
       @change="onFileChange"
     >

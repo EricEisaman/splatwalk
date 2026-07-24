@@ -49,7 +49,7 @@ One **`FAST NAV`** click takes a raw splat all the way to a walkable navmesh wit
 
 - **Instant Visualization** — Load and view Gaussian Splat files the moment they land.
 - **Orientation Control** — Rotate and align splats visually before conversion (90° increments). Rotate a splat *after* a navmesh exists and SplatWalk automatically re-runs the same generation path, so the navmesh, spawn point, and agents stay locked to the re-oriented splat.
-- **Fast Floor Nav Path** — One button picks a seed, extracts a walkable floor field, feeds that floor mesh to Recast, initializes the crowd, spawns an NPC, and enables click-to-move.
+- **FastNav (`fast_nav` algo)** — One star WASM export with three techniques (default `floor_field`): flat floors & outdoor streams; `voxel_collision` for indoor stairs / multi-level carve; `sdf_marching_cubes` for a smoother Recast stair mesh. See [algo sweet spots](docs/wasm-api.md#algo-sweet-spots).
 - **Floater Pruning (WASM)** — Built-in statistical outlier removal strips stray "floater" splats at ingest so bounds, region, seed, and floor detection lock onto the real scene. On by default and fully tunable (see *Built-in floater pruning* below).
 - **Advanced Collider NavMesh Basis** — Import a dedicated `.collision.glb` / World Labs Collider Mesh GLB, or generate a fallback collider from the splat, then feed only that collider to Recast for hands-on tuning.
 - **PlayCanvas / SuperSplat Workflow** — Scene type, seed, voxel fill/seal, carve, and collider mesh diagnostics, modeled after the PlayCanvas collision pipeline.
@@ -59,6 +59,7 @@ One **`FAST NAV`** click takes a raw splat all the way to a walkable navmesh wit
 - **Streamed SOG Export** — Convert a splat into a SOG bundle — a single `meta.json` set or a streamed, Morton-ordered multi-chunk `lod-meta.json` set with lossless WebP planes — decodable by Babylon's SOG loaders and aimed at the GS streaming loader (PR #18563). Full spherical harmonics (configurable degree); large scenes (>1M splats) default to streamed LOD. See [`docs/wasm-api.md`](docs/wasm-api.md), [`MILESTONES.md`](MILESTONES.md), and the ecosystem roadmap in [`MUTUALISM_MILESTONES.md`](MUTUALISM_MILESTONES.md).
 - **`.spz` / `.splat` Support** — `.spz` (Niantic) and `.splat` (antimatter15) are normalized to a full-fidelity `.ply` in WASM at ingest (`spz_to_ply` / `splat_to_ply`) so the viewer drives only Babylon's PLY loader (no CDN-hosted `.spz` decoder) and the nav pipeline only ever deals with PLY.
 - **One-Click Export** — Download production-ready `.glb` meshes and Recast-compatible navmesh binaries.
+- **NavKit** — Download / drop a `navkit-<slug>.zip` (original splat + baked nav + `meta-nav.json` + `walkable_floors.glb`) on Workbench, Vuetify, and R3F demos to restore a walkable scene without re-running Fast Nav. See [`docs/navkit.md`](docs/navkit.md).
 
 ## Technology Stack
 
@@ -72,11 +73,11 @@ One **`FAST NAV`** click takes a raw splat all the way to a walkable navmesh wit
 
 > **New here?** Start with the [Integration Guide](docs/INTEGRATION.md) and the runnable [`examples/`](examples/). Install the published core with `npm install @splatwalk/core` (MIT, free forever).
 
-### Download FastNav kits
+### Download FastNav Component Packs
 
-Each live demo has a **Download … kit** button that ships a zip under `/integration-kits/` (built by `npm run build:kits`):
+Each live demo has a **Download … Component Pack** button that ships an integrator zip under `/integration-kits/` (built by `npm run build:kits`). These are docs + peer-deps snippets — not the same as **NavKit** scene packs (`navkit-*.zip`; see [`docs/navkit.md`](docs/navkit.md)).
 
-| Demo | Route | Kit zip |
+| Demo | Route | Component Pack zip |
 | --- | --- | --- |
 | Vuetify + Babylon FastNav | [`/vuetify`](vuetify.html) | `splatwalk-fastnav-vuetify.zip` |
 | React / R3F FastNav | [`/react`](react.html) | `splatwalk-fastnav-r3f.zip` |

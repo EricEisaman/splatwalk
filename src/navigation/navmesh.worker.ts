@@ -8,6 +8,11 @@ const ctx: Worker = self as any;
 
 let isInitialized = false;
 
+/** Soft-fail XY heightfield cells before Recast (avoids opaque worker abort / OOM). */
+const MAX_HEIGHTFIELD_XY_CELLS = 2_000_000;
+/** Soft-fail W×D×H voxel volume before Recast bake. */
+const MAX_HEIGHTFIELD_VOLUME_CELLS = 20_000_000;
+
 function calculateBounds(positions: Float32Array | number[]): { min: [number, number, number], max: [number, number, number] } {
     let minX = Infinity, minY = Infinity, minZ = Infinity;
     let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
@@ -62,7 +67,8 @@ ctx.onmessage = async (e: MessageEvent) => {
             const allowed =
                 label.includes('collider') ||
                 label.includes('floor_field') ||
-                label.includes('voxel_volume');
+                label.includes('voxel_volume') ||
+                label.includes('sdf_mc');
             if (sourceLabel && !allowed) {
                 ctx.postMessage({ type: 'error', payload: `Rejected non-collider Recast input source: ${sourceLabel}` });
                 return;
@@ -141,11 +147,19 @@ ctx.onmessage = async (e: MessageEvent) => {
             if (params.autoCellSize !== false) {
                 const budget = params.maxNavCells && params.maxNavCells > 0 ? params.maxNavCells : DEFAULT_MAX_NAV_CELLS;
                 finalCS = autoNavCellSize(width, depth, walkableRadiusM, budget);
+                const guidelineCoarsest = walkableRadiusM / 2;
                 console.log(
                     `[WORKER] Auto cell size: cs=${finalCS.toFixed(3)} ` +
-                    `(agentRadius=${params.walkableRadius}m -> [${(params.walkableRadius / 3).toFixed(3)}, ${(params.walkableRadius / 2).toFixed(3)}], ` +
+                    `(agentRadius=${params.walkableRadius}m -> [${(params.walkableRadius / 3).toFixed(3)}, ${guidelineCoarsest.toFixed(3)}], ` +
                     `budget=${budget} cells, bounds=${width.toFixed(1)}x${depth.toFixed(1)})`
                 );
+                if (finalCS > guidelineCoarsest + 1e-6) {
+                    console.warn(
+                        `[WORKER] Cell size ${finalCS.toFixed(3)}m exceeds guideline radius/2 ` +
+                        `(${guidelineCoarsest.toFixed(3)}m) to fit maxNavCells=${budget} — ` +
+                        `consider a smaller region pin (seed-centered outdoor) or larger cs.`
+                    );
+                }
             }
             const maxDimension = Math.max(width, depth);
             const minResolution = 50; // We want at least 50 cells across the longest side
@@ -200,8 +214,16 @@ ctx.onmessage = async (e: MessageEvent) => {
                 console.log(`[WORKER]   - Collider Bounds: ${JSON.stringify(colliderBounds.min)} to ${JSON.stringify(colliderBounds.max)}`);
             }
 
-            if (gridW * gridD > 10000000) {
-                const error = `Voxel grid too dense (${gridW}x${gridD}). Increase Cell Size (cs).`;
+            const xyCells = gridW * gridD;
+            const volumeCells = xyCells * Math.max(1, gridH);
+            if (xyCells > MAX_HEIGHTFIELD_XY_CELLS || volumeCells > MAX_HEIGHTFIELD_VOLUME_CELLS) {
+                const error =
+                    `Recast heightfield too large for bake ` +
+                    `(XY ${gridW}x${gridD}=${xyCells} cells, volume=${volumeCells}; ` +
+                    `caps XY=${MAX_HEIGHTFIELD_XY_CELLS}, volume=${MAX_HEIGHTFIELD_VOLUME_CELLS}). ` +
+                    `Pin a smaller region (outdoor seed-centered ~100m), increase Cell Size (cs), ` +
+                    `or lower maxNavCells.`;
+                console.error(`[WORKER] ${error}`);
                 ctx.postMessage({ type: 'error', payload: error });
                 return;
             }
@@ -263,7 +285,9 @@ ctx.onmessage = async (e: MessageEvent) => {
             const useFloorSheetBake =
                 sourceLabel === 'fast_floor_field' ||
                 sourceLabel === 'generated_voxel_collider' ||
-                sourceLabel === 'generated_voxel_volume';
+                sourceLabel === 'generated_voxel_volume' ||
+                sourceLabel === 'generated_sdf_mc_collider' ||
+                sourceLabel === 'generated_sdf_mc_floor_project';
             if (sourceLabel === 'generated_voxel_volume') {
                 console.log(
                     '[WORKER] Voxel volume spans — floor-sheet Recast bake (treads + step ramps from carve).'
@@ -271,6 +295,13 @@ ctx.onmessage = async (e: MessageEvent) => {
             } else if (sourceLabel === 'generated_voxel_collider') {
                 console.log(
                     '[WORKER] Voxel collider — floor-sheet Recast bake (skip ledge filter) for stair connectivity.'
+                );
+            } else if (
+                sourceLabel === 'generated_sdf_mc_collider' ||
+                sourceLabel === 'generated_sdf_mc_floor_project'
+            ) {
+                console.log(
+                    '[WORKER] SDF Marching Cubes floor project — floor-sheet Recast bake (skip ledge filter).'
                 );
             }
             if (sourceLabel === 'generated_voxel_collider' && height < 0.2) {

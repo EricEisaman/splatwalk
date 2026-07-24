@@ -43,6 +43,39 @@ export interface ActivateNavBackendResult {
 /** Matches default Nav generation mode (`floor_field`). Oval example switches to dual-ready. */
 export const DEFAULT_ACTIVE_NAVIGATION_MODE: ActiveNavigationMode = 'recast';
 
+/** Shared Active-mode UI options for Storage / Fast Nav / playground. */
+export interface ActiveNavigationModeOption {
+  readonly subtitle: string;
+  readonly title: string;
+  readonly value: ActiveNavigationMode;
+}
+
+export const ACTIVE_NAVIGATION_MODE_OPTIONS: readonly ActiveNavigationModeOption[] = [
+  {
+    value: 'recast',
+    title: 'Recast',
+    subtitle: 'Live Recast crowd — click the green navmesh (NPCs). Floor field always uses this.',
+  },
+  {
+    value: 'voxel_mesh',
+    title: 'Voxel mesh',
+    subtitle:
+      'Live Voxel walk — click surfaces; player walks to nearest floor cell (needs carved volume).',
+  },
+  {
+    value: 'recast_and_voxel_mesh',
+    title: 'Recast + voxel mesh',
+    subtitle:
+      'Dual-ready: Live starts on Voxel walk (click surfaces). Switch to Recast for crowd without re-carve.',
+  },
+] as const;
+
+export type NavGenerationAlgoForActive =
+  | 'floor_field'
+  | 'voxel_collision'
+  | 'sdf_marching_cubes'
+  | string;
+
 export const activeNavigationModeLabel = (mode: ActiveNavigationMode): string => {
   switch (mode) {
     case 'recast':
@@ -190,6 +223,39 @@ export const activeModeUnavailableReason = (
     case 'recast_and_voxel_mesh':
       return 'Needs dual-ready pack (volume + Recast). Run Nav with Recast + voxel mesh under voxel collision.';
   }
+};
+
+/**
+ * Disable reason for Active mode controls (busy / floor_field / missing assets).
+ * Returns null when the control may be selected (as next-run intent or hot-swap).
+ */
+export const activeNavigationModeDisabledReason = (params: {
+  readonly algo: NavGenerationAlgoForActive;
+  readonly busy?: boolean;
+  readonly caps: NavCapabilities;
+  readonly liveBackend?: LiveNavBackend;
+  readonly mode: ActiveNavigationMode;
+}): string | null => {
+  if (params.busy) {
+    return 'Wait for the current job to finish.';
+  }
+  if (params.algo === 'floor_field' && params.mode !== 'recast') {
+    return (
+      'Floor field generation only produces Recast. Switch Nav generation to voxel ' +
+      'collision or SDF Marching Cubes for Voxel mesh / dual-ready.'
+    );
+  }
+  if (
+    params.liveBackend &&
+    params.liveBackend !== 'none' &&
+    !isActiveModeAvailable(params.mode, params.caps)
+  ) {
+    if (params.mode === 'recast_and_voxel_mesh') {
+      return activeModeUnavailableReason(params.mode, params.caps);
+    }
+    return null;
+  }
+  return null;
 };
 
 /**

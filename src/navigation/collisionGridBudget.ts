@@ -223,3 +223,91 @@ export const clampRegionToDenseBudget = ({
   });
   return { ...next, fits: budget.fits };
 };
+
+export interface EnsureSdfMcRegionForDenseBudgetResult {
+  /** True when a Selection region must be pinned for the bake. */
+  readonly pinned: boolean;
+  /** Region AABB when pinned; null keeps SDF-MC unpinned (full MC shell). */
+  readonly region: MutableRegionAabb | null;
+  /** Short reason for logs. */
+  readonly reason: string;
+}
+
+/**
+ * Decide whether unpinned SDF-MC can use the full splat AABB, or must auto-pin
+ * a dense-budget Selection region (Meadow-scale outdoor clouds).
+ *
+ * - Existing user region: clamp to dense budget when oversized (never expand).
+ * - No region + full AABB fits: leave unpinned.
+ * - No region + full AABB fails: pin `candidateRegion` (camera/ground box) after clamp.
+ */
+export const ensureSdfMcRegionForDenseBudget = (params: {
+  readonly candidateRegion: OrientedAabb;
+  readonly existingRegion?: OrientedAabb | null;
+  readonly fillSize?: number;
+  readonly maxVoxels?: number;
+  readonly sceneType?: string;
+  readonly splatBounds: OrientedAabb;
+}): EnsureSdfMcRegionForDenseBudgetResult => {
+  const fillSize = params.fillSize ?? 1.6;
+  const maxVoxels = params.maxVoxels ?? DEFAULT_COLLISION_MAX_VOXELS;
+  const sceneType = params.sceneType ?? 'indoor';
+
+  if (params.existingRegion) {
+    const budget = regionFitsDenseBudget({
+      fillSize,
+      maxVoxels,
+      region: params.existingRegion,
+      sceneType,
+    });
+    if (budget.fits) {
+      return {
+        pinned: true,
+        reason: 'using existing Selection region',
+        region: {
+          max: [...params.existingRegion.max],
+          min: [...params.existingRegion.min],
+        },
+      };
+    }
+    const clamped = clampRegionToDenseBudget({
+      fillSize,
+      maxVoxels,
+      region: params.existingRegion,
+      sceneType,
+    });
+    return {
+      pinned: true,
+      reason: `clamped Selection region to ~${clamped.footprintMeters.toFixed(1)}m for dense budget`,
+      region: { max: clamped.max, min: clamped.min },
+    };
+  }
+
+  const fullBudget = fitsDenseVoxelBudgetAtMaxCoarseness({
+    bounds: params.splatBounds,
+    fillSize,
+    maxVoxels,
+    sceneType,
+  });
+  if (fullBudget.fits) {
+    return {
+      pinned: false,
+      reason: 'full AABB fits dense budget — unpinned MC shell',
+      region: null,
+    };
+  }
+
+  const clamped = clampRegionToDenseBudget({
+    fillSize,
+    maxVoxels,
+    region: params.candidateRegion,
+    sceneType,
+  });
+  return {
+    pinned: true,
+    reason:
+      `full AABB exceeds dense budget (~${fullBudget.footprintMeters.toFixed(1)}m) — ` +
+      `auto-pinned Selection ~${clamped.footprintMeters.toFixed(1)}m`,
+    region: { max: clamped.max, min: clamped.min },
+  };
+};

@@ -89,13 +89,8 @@
                                 Stairs (.spz)</option>
                         </select>
                         <div class="mobile-upload-divider">OR</div>
-                        <button id="chooseFileBtn" class="cyber-button-pink">CHOOSE LOCAL FILE</button>
-                        <button id="uploadNavArtifactsBtn" class="cyber-button secondary"
-                            title="Upload nav-artifacts .zip or multi-select contract files">UPLOAD NAV ARTIFACTS</button>
-                        <input type="file" id="localFileInput" accept=".ply,.spz,.splat" style="display: none;">
-                        <input type="file" id="navArtifactsInput" multiple
-                            accept=".zip,application/zip,.glb,.bin,.json,application/json"
-                            style="display: none;">
+                        <button id="chooseFileBtn" class="cyber-button-pink">CHOOSE LOCAL FILE / NAVKIT</button>
+                        <input type="file" id="localFileInput" accept=".ply,.spz,.splat,.zip,application/zip" style="display: none;">
                     </div>
                 </div>
 
@@ -117,15 +112,26 @@
                             </button>
                         </div>
 
-                        <!-- Right: Download kit + Fullscreen -->
+                        <!-- Right: Component Pack + NavKit + Fullscreen -->
                         <div class="controls-right">
                             <button id="downloadFastNavKitBtn" class="icon-button glass-btn" type="button"
-                                title="Download FastNav workbench integration kit">
+                                title="Download FastNav workbench Component Pack (integrator zip)">
                                 <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                                     stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                                     <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
                                     <polyline points="7 10 12 15 17 10"></polyline>
                                     <line x1="12" y1="15" x2="12" y2="3"></line>
+                                </svg>
+                            </button>
+                            <button id="downloadNavKitToolbarBtn" class="icon-button glass-btn" type="button"
+                                disabled
+                                aria-disabled="true"
+                                title="Download NavKit (navkit.zip — model + baked nav). Run Fast Nav first.">
+                                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                    stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                    <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path>
+                                    <polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline>
+                                    <line x1="12" y1="22.08" x2="12" y2="12"></line>
                                 </svg>
                             </button>
                             <button id="fullscreenBtn" class="icon-button glass-btn" title="Fullscreen">
@@ -382,6 +388,48 @@
                                 <input type="range" id="navMeshOpacity" min="0" max="1" step="0.05" value="0.55">
                             </div>
 
+                            <div class="section-title nav-section-title">NavMesh Editor</div>
+                            <div class="nav-legend">
+                                <div>Modes: <kbd>1</kbd> Vertex · <kbd>2</kbd> Circle · <kbd>3</kbd> Global Y (0.1 m).</div>
+                                <div>Circle: click pin · click/+Shift radius ±0.1 · <kbd>2</kbd> resume follow · <kbd>T</kbd> gizmo · <kbd>F</kbd> fill · <kbd>X</kbd> delete+apply. Then Apply to Live when needed.</div>
+                            </div>
+                            <div class="control-row">
+                                <label>Enable Editor:</label>
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="navMeshEditorEnabled">
+                                    <span class="slider"></span>
+                                </label>
+                            </div>
+                            <div class="control-row">
+                                <label>Mode:</label>
+                                <select id="navMeshEditorMode" class="cyber-select">
+                                    <option value="circle" selected>2 Circle</option>
+                                    <option value="vertex">1 Vertex</option>
+                                    <option value="global">3 Global Y</option>
+                                </select>
+                            </div>
+                            <div class="control-row" id="navMeshEditorGlobalRow" style="display: none;">
+                                <label>Global Y:</label>
+                                <button type="button" id="navMeshEditorYUp" class="cyber-button tertiary small">UP 0.1</button>
+                                <button type="button" id="navMeshEditorYDown" class="cyber-button tertiary small">DOWN 0.1</button>
+                            </div>
+                            <div class="control-row" id="navMeshEditorFillRow">
+                                <label>Hole:</label>
+                                <button type="button" id="navMeshEditorFillBtn" class="cyber-button tertiary small" disabled>FILL (F)</button>
+                            </div>
+                            <div class="control-row" id="navMeshEditorDeleteRow">
+                                <label>Delete:</label>
+                                <button type="button" id="navMeshEditorDeleteBtn" class="cyber-button tertiary small" disabled>DELETE (X)</button>
+                            </div>
+                            <div class="control-row" id="navMeshEditorApplyRow" style="display: none;">
+                                <label>Live:</label>
+                                <button type="button" id="navMeshEditorApplyBtn" class="cyber-button primary small" disabled>Apply to Live Navmesh</button>
+                            </div>
+                            <div class="control-row">
+                                <label>Status:</label>
+                                <span id="navMeshEditorStatus" class="muted">Off</span>
+                            </div>
+
                             <div class="control-row">
                                 <label title="Voxel cell size">Cell Size:</label>
                                 <input type="number" id="paramNavCS" value="0.2" step="0.05" min="0.01">
@@ -426,7 +474,10 @@
                                 <input type="file" id="colliderGlbInput" accept=".glb,.gltf" hidden>
                             </div>
                             <div class="control-row">
-                                <label title="Visible when a collider mesh is generated or imported.">Show Collider:</label>
+                                <label
+                                    id="showColliderMeshLabel"
+                                    title="Visible when a collider mesh is generated or imported."
+                                >Show Collider:</label>
                                 <label class="toggle-switch">
                                     <input type="checkbox" id="showColliderMesh" checked>
                                     <span class="slider"></span>
@@ -480,12 +531,104 @@
                                 <input type="number" id="paramCollisionCarveRadius" value="0.25" step="0.05" min="0.05">
                             </div>
                             <div class="control-row">
-                                <label title="Collision mesh emitted from the voxel grid. Faces is exact and stable; smooth is reserved.">Mesh Mode:</label>
+                                <label title="Collision mesh from the voxel grid. faces = exact voxel faces; smooth = WASM SDF + Marching Cubes.">Mesh Mode:</label>
                                 <select id="paramCollisionMeshMode" class="cyber-select">
                                     <option value="faces" selected>faces</option>
-                                    <option value="smooth" disabled>smooth (coming soon)</option>
+                                    <option value="walkable_floors">walkable_floors</option>
+                                    <option value="smooth">smooth (SDF Marching Cubes)</option>
                                 </select>
                             </div>
+                            <div class="control-row">
+                                <label title="SDF truncation band (voxels) for smooth mesh mode.">SDF band (vox):</label>
+                                <input type="number" id="paramSdfBandVoxels" value="3" step="0.5" min="1" max="16">
+                            </div>
+                            <div class="control-row">
+                                <label title="Marching Cubes iso level for smooth mesh mode.">MC iso:</label>
+                                <input type="number" id="paramMcIsoLevel" value="0" step="0.05">
+                            </div>
+                            <div class="control-row">
+                                <label title="Laplacian smooth iterations after Marching Cubes.">MC smooth iters:</label>
+                                <input type="number" id="paramMcSmoothIterations" value="1" step="1" min="0" max="8">
+                            </div>
+                            <div class="control-row">
+                                <label title="FAST NAV technique. Floor field is the default one-click path; voxel / SDF-MC use the collision pipeline.">Nav technique:</label>
+                                <select id="paramNavGenerationMode" class="cyber-select">
+                                    <option value="floor_field" selected>floor_field</option>
+                                    <option value="voxel_collision">voxel_collision</option>
+                                    <option value="sdf_marching_cubes">sdf_marching_cubes</option>
+                                </select>
+                            </div>
+                            <div class="control-row">
+                                <label title="Active locomotion after bake (Recast / Voxel mesh / dual-ready).">Active nav mode:</label>
+                                <select id="paramActiveNavigationMode" class="cyber-select">
+                                    <option value="recast" selected>Recast</option>
+                                    <option value="voxel_mesh">Voxel mesh</option>
+                                    <option value="recast_and_voxel_mesh">Recast + voxel mesh</option>
+                                </select>
+                            </div>
+                            <div class="control-row">
+                              <label title="Player input: click navmesh, WASDQE keys, or both.">Controls:</label>
+                              <select id="paramControlsMode" class="cyber-select">
+                                <option value="click_to_move">Click to move</option>
+                                <option value="wasdqe">WASDQE</option>
+                                <option value="both" selected>Both</option>
+                              </select>
+                            </div>
+                            <p class="control-hint" id="controlsModeHint" style="margin: 0 0 0.75rem; font-size: 0.75rem; opacity: 0.75;">
+                              W/S move · A/D turn · Q/E strafe (when WASDQE or Both)
+                            </p>
+                            <p class="control-hint" id="activeNavLiveHint" style="margin: 0 0 0.75rem; font-size: 0.75rem; opacity: 0.75;">
+                                Live: none
+                            </p>
+
+                            <details id="cameraInfoPanel" class="pose-info-panel">
+                                <summary class="section-title nav-section-title">Camera Information</summary>
+                                <p class="control-hint" style="margin: 0 0 0.5rem; font-size: 0.75rem; opacity: 0.75;">
+                                    Live pose while open. Download NavKit writes camPos / camEulerDeg into meta-nav.json at click time.
+                                </p>
+                                <div class="control-row">
+                                    <label>Position:</label>
+                                    <span id="cameraInfoPosition" class="muted font-mono">—</span>
+                                </div>
+                                <div class="control-row">
+                                    <label>Euler °:</label>
+                                    <span id="cameraInfoEuler" class="muted font-mono">—</span>
+                                </div>
+                                <div class="nav-button-group">
+                                    <button type="button" id="copyCameraPoseBtn" class="cyber-button tertiary small">Copy pose</button>
+                                </div>
+                                <p id="cameraInfoCopyText" class="control-hint font-mono" style="margin: 0.35rem 0 0.75rem; font-size: 0.7rem; opacity: 0.7; word-break: break-word;"></p>
+                            </details>
+
+                            <details id="playerInfoPanel" class="pose-info-panel">
+                                <summary class="section-title nav-section-title">Player Information</summary>
+                                <p class="control-hint" style="margin: 0 0 0.5rem; font-size: 0.75rem; opacity: 0.75;">
+                                    Live pose while open. Download NavKit writes playerPos / playerEulerDeg at click time.
+                                </p>
+                                <div class="control-row">
+                                    <label>Position:</label>
+                                    <span id="playerInfoPosition" class="muted font-mono">—</span>
+                                </div>
+                                <div class="control-row">
+                                    <label>Yaw °:</label>
+                                    <span id="playerInfoYaw" class="muted font-mono">—</span>
+                                </div>
+                                <div class="nav-button-group">
+                                    <button type="button" id="copyPlayerPoseBtn" class="cyber-button tertiary small">Copy pose</button>
+                                    <button type="button" id="goToPlayerBtn" class="cyber-button secondary small">Go to Player</button>
+                                </div>
+                                <p id="playerInfoCopyText" class="control-hint font-mono" style="margin: 0.35rem 0 0.75rem; font-size: 0.7rem; opacity: 0.7; word-break: break-word;"></p>
+                            </details>
+
+                            <details open>
+                                <summary class="section-title nav-section-title">Demo Nav Settings</summary>
+                                <div id="demoNavSettingsMount"></div>
+                                <div class="control-row" style="margin-top: 0.5rem;">
+                                    <button type="button" id="resetDemoNavSettingsBtn" class="cyber-button" style="width: auto; padding: 0.35rem 0.75rem;">
+                                        Reset defaults
+                                    </button>
+                                </div>
+                            </details>
 
                             <details>
                                 <summary class="section-title nav-section-title">Experimental 2.5D SDF Debug</summary>
@@ -579,9 +722,8 @@
                                 <button id="downloadNavBtn" class="cyber-button secondary"
                                     style="display: none;">DOWNLOAD NAVMESH</button>
                                 <button id="downloadNavArtifactsBtn" class="cyber-button secondary"
-                                    style="display: none;">DOWNLOAD NAV ARTIFACTS</button>
-                                <button id="uploadNavArtifactsNavBtn" class="cyber-button tertiary"
-                                    title="Same as header Upload Nav Artifacts">UPLOAD NAV ARTIFACTS</button>
+                                    style="display: none;"
+                                    title="Legacy nav-artifacts zip (no embedded model)">DOWNLOAD NAV ARTIFACTS (LEGACY)</button>
                             </div>
 
                             <!-- NPC Simulation -->

@@ -69,7 +69,7 @@ interface SwModule {
 
 export class Playground {
   private static readonly SPLATWALK_CORE_ESM =
-    'https://cdn.jsdelivr.net/npm/@splatwalk/core@0.6.4/wasm_splatwalk.js';
+    'https://cdn.jsdelivr.net/npm/@splatwalk/core@0.6.9/wasm_splatwalk.js';
   private static readonly RECAST_JS = 'https://cdn.babylonjs.com/recast.js';
 
   private static readonly SCENES: DemoScene[] = [
@@ -187,11 +187,16 @@ export class Playground {
       }
       world.collision?.dispose();
       ui.setStatus('Generating collision voxel boundary...', 'busy');
+      const meshModeSelect = document.getElementById('sw-collision-mesh-mode') as HTMLSelectElement | null;
+      const meshMode = meshModeSelect?.value === 'smooth' ? 'smooth' : 'faces';
       const settings = Object.assign({}, sw.fast_nav_preset(), {
         mode: 2,
         flip_y: world.splatFlipY,
         emit_glb: true,
-        collision_mesh_mode: 'faces',
+        collision_mesh_mode: meshMode,
+        ...(meshMode === 'smooth'
+          ? { sdf_band_voxels: 3, mc_iso_level: 0, mc_smooth_iterations: 1 }
+          : {}),
       });
       const result = sw.build_collision_voxel_boundary(world.ply, settings);
       const mesh = new BABYLON.Mesh('collision_boundary', scene);
@@ -595,6 +600,11 @@ export class Playground {
         <label class="sw-toggle"><input type="checkbox" id="sw-t-nav" checked> Navmesh</label>
         <label class="sw-toggle"><input type="checkbox" id="sw-t-fs"> Full screen</label>
       </div>
+      <div class="sw-label">Collision mesh mode</div>
+      <select class="sw-select" id="sw-collision-mesh-mode">
+        <option value="faces" selected>faces (exact voxels)</option>
+        <option value="smooth">smooth (SDF Marching Cubes)</option>
+      </select>
       <button class="sw-btn" id="sw-recenter">RECENTER CAMERA</button>
       <button class="sw-btn secondary" id="sw-export-nav">EXPORT NAVMESH</button>
       <button class="sw-btn secondary" id="sw-generate-collision">GENERATE COLLISION</button>

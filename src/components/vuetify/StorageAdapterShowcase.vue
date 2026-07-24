@@ -12,6 +12,11 @@ import {
   type StorageDemoSource,
   type StreamQualityPreset,
 } from '@/composables/useStorageAdapterDemo';
+import { ACTIVE_NAVIGATION_MODE_OPTIONS } from '@/navigation/activeNavigation';
+import {
+  DEMO_NAV_FLOOR_SLIDER_FIELDS,
+  DEMO_NAV_RECAST_SLIDER_FIELDS,
+} from '@/navigation/navSettings';
 import { resolveLodMetaCdnUrl } from '@/storage/sogStreamLoader';
 import {
   parseCameraModeQuery,
@@ -58,6 +63,7 @@ const {
   busy,
   cameraInfo,
   cameraInfoCopyText,
+  cameraNavKitCopyText,
   cameraType,
   clear,
   clearNavArtifacts,
@@ -86,6 +92,7 @@ const {
   navPhase,
   navPlyRotationLabel,
   navSettings,
+  applyNavSettingsForSceneType,
   resetNavSettings,
   resetVoxelNavSettings,
   resetStreamSettings,
@@ -102,6 +109,9 @@ const {
   setNavMeshVisible,
   setSelectionRegionVisible,
   setCameraInfoPanelOpen,
+  setPlayerInfoPanelOpen,
+  playerInfo,
+  playerInfoCopyText,
   setCameraType,
   applySelectRegionFromCamera,
   cameraSelectOffsets,
@@ -126,13 +136,16 @@ const {
   rendererPreference,
 } = useStorageAdapterDemo(canvasRef);
 
-/** Camera Information collapsed by default; sampling runs only while open. */
+/** Camera / Player Information collapsed by default; sampling runs only while open. */
 const cameraInfoPanels = ref<number[]>([]);
+const playerInfoPanels = ref<number[]>([]);
 /** Expand Navigation + nested Navmesh settings on load (prune + orientation visible). */
 const navSectionPanels = ref<number[]>([0]);
 const navSettingsPanels = ref<number[]>([0]);
 const canAdjustOrientation = computed(() => hasStream.value || hasNavSession.value);
 const cameraInfoCopied = ref(false);
+const cameraNavKitCopied = ref(false);
+const playerInfoCopied = ref(false);
 
 const onDownloadStorageKit = (): void => {
   downloadIntegrationKit('storage-adapter');
@@ -158,6 +171,21 @@ const cameraOrbitLabel = computed(() => {
   );
 });
 
+const playerPositionLabel = computed(() => {
+  if (!playerInfo.value.available) {
+    return '—';
+  }
+  const p = playerInfo.value.position;
+  return `${p.x.toFixed(3)}, ${p.y.toFixed(3)}, ${p.z.toFixed(3)}`;
+});
+
+const playerYawLabel = computed(() => {
+  if (!playerInfo.value.available) {
+    return '—';
+  }
+  return `${playerInfo.value.eulerDegrees.y.toFixed(1)}°`;
+});
+
 watch(
   cameraInfoPanels,
   (panels) => {
@@ -166,15 +194,45 @@ watch(
   { deep: true }
 );
 
+watch(
+  playerInfoPanels,
+  (panels) => {
+    setPlayerInfoPanelOpen(panels.includes(0));
+  },
+  { deep: true }
+);
+
+const flashCopied = (flag: typeof cameraInfoCopied): void => {
+  flag.value = true;
+  window.setTimeout(() => {
+    flag.value = false;
+  }, 1600);
+};
+
 const copyCameraInfo = async (): Promise<void> => {
   try {
     await navigator.clipboard.writeText(cameraInfoCopyText.value);
-    cameraInfoCopied.value = true;
-    window.setTimeout(() => {
-      cameraInfoCopied.value = false;
-    }, 1600);
+    flashCopied(cameraInfoCopied);
   } catch {
     cameraInfoCopied.value = false;
+  }
+};
+
+const copyCameraNavKit = async (): Promise<void> => {
+  try {
+    await navigator.clipboard.writeText(cameraNavKitCopyText.value);
+    flashCopied(cameraNavKitCopied);
+  } catch {
+    cameraNavKitCopied.value = false;
+  }
+};
+
+const copyPlayerInfo = async (): Promise<void> => {
+  try {
+    await navigator.clipboard.writeText(playerInfoCopyText.value);
+    flashCopied(playerInfoCopied);
+  } catch {
+    playerInfoCopied.value = false;
   }
 };
 
@@ -296,6 +354,7 @@ const onRendererPreferenceChange = (value: unknown): void => {
 
 onBeforeUnmount(() => {
   setCameraInfoPanelOpen(false);
+  setPlayerInfoPanelOpen(false);
   document.removeEventListener('fullscreenchange', onFullscreenChange);
 });
 
@@ -317,28 +376,31 @@ const cameraControlsHint = computed(() =>
     : 'Orbit: drag to rotate · scroll to zoom · SHIFT = 10× pan/zoom · right-drag to pan'
 );
 
+const usesVoxelVolumeUi = (mode: NavGenerationMode): boolean =>
+  mode === 'voxel_collision' || mode === 'sdf_marching_cubes';
+
 const navSteps = computed(() => {
-  const order =
-    navMode.value === 'voxel_collision'
-      ? (['materialize', 'floor', 'navmesh', 'done'] as const)
-      : (['materialize', 'prune', 'floor', 'navmesh', 'done'] as const);
+  const order = usesVoxelVolumeUi(navMode.value)
+    ? (['materialize', 'floor', 'navmesh', 'done'] as const)
+    : (['materialize', 'prune', 'floor', 'navmesh', 'done'] as const);
   const current = navPhase.value;
   const curIdx = (order as readonly string[]).indexOf(current);
-  const steps =
-    navMode.value === 'voxel_collision'
-      ? [
-          { label: 'Materialize PLY', key: 'materialize' },
-          { label: 'Voxel collider', key: 'floor' },
-          { label: 'Navmesh', key: 'navmesh' },
-          { label: 'Done', key: 'done' },
-        ]
-      : [
-          { label: 'Materialize PLY', key: 'materialize' },
-          { label: 'Prune', key: 'prune' },
-          { label: 'Floor field', key: 'floor' },
-          { label: 'Navmesh', key: 'navmesh' },
-          { label: 'Done', key: 'done' },
-        ];
+  const floorLabel =
+    navMode.value === 'sdf_marching_cubes' ? 'SDF-MC collider' : 'Voxel collider';
+  const steps = usesVoxelVolumeUi(navMode.value)
+    ? [
+        { label: 'Materialize PLY', key: 'materialize' },
+        { label: floorLabel, key: 'floor' },
+        { label: 'Navmesh', key: 'navmesh' },
+        { label: 'Done', key: 'done' },
+      ]
+    : [
+        { label: 'Materialize PLY', key: 'materialize' },
+        { label: 'Prune', key: 'prune' },
+        { label: 'Floor field', key: 'floor' },
+        { label: 'Navmesh', key: 'navmesh' },
+        { label: 'Done', key: 'done' },
+      ];
   return steps.map((step) => {
     const idx = (order as readonly string[]).indexOf(step.key);
     const done = curIdx > idx || current === 'done';
@@ -350,7 +412,7 @@ const navSteps = computed(() => {
 const navModeOptions: { value: NavGenerationMode; title: string; subtitle: string }[] = [
   {
     value: 'floor_field',
-    title: 'Floor field (Fast Nav)',
+    title: 'Floor field',
     subtitle: 'Flat floors and large outdoor streams — 2.5D walkable ground field.',
   },
   {
@@ -358,30 +420,15 @@ const navModeOptions: { value: NavGenerationMode; title: string; subtitle: strin
     title: 'Voxel collision',
     subtitle: 'Indoor stairs and multi-level spaces — voxel fill/carve collision mesh.',
   },
+  {
+    value: 'sdf_marching_cubes',
+    title: 'SDF Marching Cubes',
+    subtitle:
+      'Same voxel volume → WASM truncated SDF + Marching Cubes mesh → Recast (smoother stairs).',
+  },
 ];
 
-const activeModeOptions: {
-  value: ActiveNavigationMode;
-  title: string;
-  subtitle: string;
-}[] = [
-  {
-    value: 'recast',
-    title: 'Recast',
-    subtitle: 'Recast crowd on green navmesh (NPCs). Floor field always uses this.',
-  },
-  {
-    value: 'voxel_mesh',
-    title: 'Voxel mesh',
-    subtitle: 'Voxel walk — solid-ray picks for stairs (needs carved volume).',
-  },
-  {
-    value: 'recast_and_voxel_mesh',
-    title: 'Recast + voxel mesh',
-    subtitle:
-      'Dual-ready pack (volume + Recast). Starts on voxel walk; hot-swap to Recast without re-carve.',
-  },
-];
+const activeModeOptions = ACTIVE_NAVIGATION_MODE_OPTIONS;
 
 const collisionSceneTypeOptions = [
   { title: 'Indoor (sealed rooms, stairs)', value: 'indoor' },
@@ -394,6 +441,19 @@ const onNavGenerationMode = (mode: NavGenerationMode | null): void => {
     return;
   }
   setNavGenerationMode(mode);
+};
+
+const onCollisionSceneType = (sceneType: string | null): void => {
+  if (sceneType !== 'indoor' && sceneType !== 'outdoor' && sceneType !== 'object') {
+    return;
+  }
+  voxelNavSettings.value = {
+    ...voxelNavSettings.value,
+    collisionSceneType: sceneType,
+  };
+  if (sceneType === 'indoor' || sceneType === 'outdoor') {
+    applyNavSettingsForSceneType(sceneType);
+  }
 };
 
 const onActiveNavigationMode = (mode: ActiveNavigationMode | null): void => {
@@ -619,7 +679,7 @@ const onNavArtifactsSelected = async (event: Event): Promise<void> => {
           :disabled="busy"
           @click="onDownloadStorageKit"
         >
-          Download Storage Adapter kit
+          Download Storage Adapter Component Pack
         </v-btn>
 
         <v-btn-toggle
@@ -1106,8 +1166,9 @@ const onNavArtifactsSelected = async (event: Event): Promise<void> => {
             </template>
             <template #text>
               <p class="text-caption text-medium-emphasis mb-3">
-                Live pose for capturing a default view (e.g. Oval stairs). Values refresh only
-                while this section is open.
+                Live pose for deep-link defaults and NavKit. Values refresh only while this
+                section is open. Download NavKit writes the live pose at click time into
+                <code>meta-nav.json</code> (<code>camPos</code> / <code>camEulerDeg</code>).
               </p>
               <div class="text-body-2 mb-2">
                 <span class="text-medium-emphasis">Mode:</span>
@@ -1133,7 +1194,60 @@ const onNavArtifactsSelected = async (event: Event): Promise<void> => {
                   prepend-icon="mdi-content-copy"
                   @click="copyCameraInfo"
                 >
-                  {{ cameraInfoCopied ? 'Copied' : 'Copy pose' }}
+                  {{ cameraInfoCopied ? 'Copied' : 'Copy deep-link' }}
+                </v-btn>
+                <v-btn
+                  size="small"
+                  variant="tonal"
+                  color="secondary"
+                  prepend-icon="mdi-content-copy"
+                  @click="copyCameraNavKit"
+                >
+                  {{ cameraNavKitCopied ? 'Copied' : 'Copy NavKit' }}
+                </v-btn>
+              </div>
+              <div class="text-caption text-medium-emphasis mt-2 font-monospace text-wrap">
+                Deep-link: {{ cameraInfoCopyText }}
+              </div>
+              <div class="text-caption text-medium-emphasis mt-1 font-monospace text-wrap">
+                NavKit: {{ cameraNavKitCopyText }}
+              </div>
+            </template>
+          </v-expansion-panel>
+        </v-expansion-panels>
+
+        <v-expansion-panels v-model="playerInfoPanels" class="mt-2" variant="accordion" multiple>
+          <v-expansion-panel>
+            <template #title>
+              <div class="d-flex align-center ga-2">
+                <v-icon icon="mdi-account" size="small" color="primary" />
+                <span>Player Information</span>
+              </div>
+            </template>
+            <template #text>
+              <p class="text-caption text-medium-emphasis mb-3">
+                Live player pose for NavKit. Values refresh only while this section is open.
+                Download NavKit writes <code>playerPos</code> /
+                <code>playerEulerDeg</code> at click time.
+              </p>
+              <div class="text-body-2 mb-2 font-monospace">
+                <span class="text-medium-emphasis">Position:</span>
+                {{ playerPositionLabel }}
+              </div>
+              <div class="text-body-2 mb-3 font-monospace">
+                <span class="text-medium-emphasis">Yaw °:</span>
+                {{ playerYawLabel }}
+              </div>
+              <div class="d-flex flex-wrap ga-2">
+                <v-btn
+                  size="small"
+                  variant="tonal"
+                  color="primary"
+                  prepend-icon="mdi-content-copy"
+                  :disabled="!playerInfo.available"
+                  @click="copyPlayerInfo"
+                >
+                  {{ playerInfoCopied ? 'Copied' : 'Copy pose' }}
                 </v-btn>
                 <v-tooltip
                   :text="
@@ -1159,7 +1273,7 @@ const onNavArtifactsSelected = async (event: Event): Promise<void> => {
                 </v-tooltip>
               </div>
               <div class="text-caption text-medium-emphasis mt-2 font-monospace text-wrap">
-                {{ cameraInfoCopyText }}
+                {{ playerInfoCopyText }}
               </div>
             </template>
           </v-expansion-panel>
@@ -1172,28 +1286,27 @@ const onNavArtifactsSelected = async (event: Event): Promise<void> => {
                 Materialize a denser LOD PLY from the streamed SOG as a WASM
                 intermediary only (stream visual stays on canvas), then build a
                 walkable navmesh with click-to-move. Choose
-                <strong>floor field</strong> for flat outdoor scenes or
-                <strong>voxel collision</strong> for indoor stairs and multi-level spaces.
+                <strong>Floor field</strong>, <strong>Voxel collision</strong>, or
+                <strong>SDF Marching Cubes</strong> (WASM smooth mesh → Recast).
               </p>
 
               <div class="text-subtitle-2 mb-2">Nav generation mode</div>
-              <v-btn-toggle
+              <v-select
                 :model-value="navMode"
-                mandatory
+                :items="navModeOptions"
+                item-title="title"
+                item-value="value"
                 density="comfortable"
-                color="primary"
+                variant="outlined"
+                hide-details="auto"
                 class="mb-2"
                 :disabled="busy"
                 @update:model-value="onNavGenerationMode"
               >
-                <v-btn
-                  v-for="option in navModeOptions"
-                  :key="option.value"
-                  :value="option.value"
-                >
-                  {{ option.title }}
-                </v-btn>
-              </v-btn-toggle>
+                <template #item="{ props: itemProps, item }">
+                  <v-list-item v-bind="itemProps" :subtitle="item.subtitle" />
+                </template>
+              </v-select>
               <p class="text-caption text-medium-emphasis mb-3">
                 {{
                   navModeOptions.find((option) => option.value === navMode)?.subtitle
@@ -1201,6 +1314,9 @@ const onNavArtifactsSelected = async (event: Event): Promise<void> => {
                 <template v-if="navMode === 'voxel_collision'">
                   Island filtering is skipped when baking Recast from the voxel collider
                   (better for stairs and multi-level spaces).
+                </template>
+                <template v-else-if="navMode === 'sdf_marching_cubes'">
+                  Recast is baked from the WASM SDF Marching Cubes mesh (not voxel-face quads).
                 </template>
               </p>
 
@@ -1251,14 +1367,16 @@ const onNavArtifactsSelected = async (event: Event): Promise<void> => {
                         fix, or raise max slope for steep bowls.
                       </template>
                       <template v-else>
-                        Voxel collision exports a carved volume
+                        Voxel / SDF-MC exports a carved volume
                         (<code class="text-primary">emit_volume</code>). Live backend and dual-ready
                         bake follow <strong>Active navigation mode</strong> above. Cyan collider on by default.
                       </template>
                     </p>
 
-                    <template v-if="navMode === 'voxel_collision'">
-                      <div class="text-subtitle-2 mb-2">Voxel collision</div>
+                    <template v-if="usesVoxelVolumeUi(navMode)">
+                      <div class="text-subtitle-2 mb-2">
+                        {{ navMode === 'sdf_marching_cubes' ? 'SDF Marching Cubes' : 'Voxel collision' }}
+                      </div>
                       <p class="text-caption text-medium-emphasis mb-3">
                         Active: {{ activeNavigationModeLabel(activeNavigationMode) }} ·
                         Live: {{ liveNavBackendLabel(liveBackend) }}
@@ -1266,7 +1384,7 @@ const onNavArtifactsSelected = async (event: Event): Promise<void> => {
                       <v-row density="comfortable" class="mb-2">
                         <v-col cols="12" sm="6" md="4">
                           <v-select
-                            v-model="voxelNavSettings.collisionSceneType"
+                            :model-value="voxelNavSettings.collisionSceneType"
                             :items="collisionSceneTypeOptions"
                             item-title="title"
                             item-value="value"
@@ -1274,6 +1392,7 @@ const onNavArtifactsSelected = async (event: Event): Promise<void> => {
                             density="compact"
                             hide-details
                             :disabled="busy"
+                            @update:model-value="onCollisionSceneType"
                           />
                         </v-col>
                         <v-col cols="12" sm="6" md="4">
@@ -1357,6 +1476,59 @@ const onNavArtifactsSelected = async (event: Event): Promise<void> => {
                           </v-slider>
                         </v-col>
                       </v-row>
+                      <template v-if="navMode === 'sdf_marching_cubes'">
+                        <div class="text-subtitle-2 mb-2 mt-2">WASM SDF / Marching Cubes</div>
+                        <v-row density="comfortable" class="mb-2">
+                          <v-col cols="12" sm="6" md="4">
+                            <v-slider
+                              v-model="voxelNavSettings.sdfBandVoxels"
+                              :min="1"
+                              :max="8"
+                              :step="0.5"
+                              color="teal"
+                              density="compact"
+                              thumb-label
+                              hide-details
+                            >
+                              <template #prepend>
+                                <span class="text-caption text-medium-emphasis settings-label">SDF band (vox)</span>
+                              </template>
+                            </v-slider>
+                          </v-col>
+                          <v-col cols="12" sm="6" md="4">
+                            <v-slider
+                              v-model="voxelNavSettings.mcIsoLevel"
+                              :min="-0.5"
+                              :max="0.5"
+                              :step="0.05"
+                              color="teal"
+                              density="compact"
+                              thumb-label
+                              hide-details
+                            >
+                              <template #prepend>
+                                <span class="text-caption text-medium-emphasis settings-label">MC iso</span>
+                              </template>
+                            </v-slider>
+                          </v-col>
+                          <v-col cols="12" sm="6" md="4">
+                            <v-slider
+                              v-model="voxelNavSettings.mcSmoothIterations"
+                              :min="0"
+                              :max="4"
+                              :step="1"
+                              color="teal"
+                              density="compact"
+                              thumb-label
+                              hide-details
+                            >
+                              <template #prepend>
+                                <span class="text-caption text-medium-emphasis settings-label">MC smooth</span>
+                              </template>
+                            </v-slider>
+                          </v-col>
+                        </v-row>
+                      </template>
                       <div class="d-flex flex-wrap align-center ga-2 mb-4">
                         <v-btn
                           size="small"
@@ -1562,99 +1734,25 @@ const onNavArtifactsSelected = async (event: Event): Promise<void> => {
 
                     <div v-if="navMode === 'floor_field'" class="text-subtitle-2 mb-2">Floor coverage</div>
                     <v-row v-if="navMode === 'floor_field'" density="comfortable">
-                      <v-col cols="12" sm="6" md="4">
+                      <v-col
+                        v-for="field in DEMO_NAV_FLOOR_SLIDER_FIELDS"
+                        :key="field.key"
+                        cols="12"
+                        sm="6"
+                        md="4"
+                      >
                         <v-slider
-                          v-model="navSettings.sameLevelBelow"
-                          :min="0.25"
-                          :max="4"
-                          :step="0.05"
-                          color="primary"
+                          v-model="navSettings[field.key]"
+                          :min="field.min"
+                          :max="field.max"
+                          :step="field.step"
+                          :color="field.color ?? 'primary'"
                           density="compact"
                           thumb-label
                           hide-details
                         >
                           <template #prepend>
-                            <span class="text-caption text-medium-emphasis settings-label">Band below (m)</span>
-                          </template>
-                        </v-slider>
-                      </v-col>
-                      <v-col cols="12" sm="6" md="4">
-                        <v-slider
-                          v-model="navSettings.sameLevelAbove"
-                          :min="0.3"
-                          :max="4"
-                          :step="0.05"
-                          color="primary"
-                          density="compact"
-                          thumb-label
-                          hide-details
-                        >
-                          <template #prepend>
-                            <span class="text-caption text-medium-emphasis settings-label">Band above (m)</span>
-                          </template>
-                        </v-slider>
-                      </v-col>
-                      <v-col cols="12" sm="6" md="4">
-                        <v-slider
-                          v-model="navSettings.holeFillRadius"
-                          :min="0"
-                          :max="8"
-                          :step="1"
-                          color="primary"
-                          density="compact"
-                          thumb-label
-                          hide-details
-                        >
-                          <template #prepend>
-                            <span class="text-caption text-medium-emphasis settings-label">Hole fill (cells)</span>
-                          </template>
-                        </v-slider>
-                      </v-col>
-                      <v-col cols="12" sm="6" md="4">
-                        <v-slider
-                          v-model="navSettings.sdfCellSize"
-                          :min="0.1"
-                          :max="0.4"
-                          :step="0.01"
-                          color="secondary"
-                          density="compact"
-                          thumb-label
-                          hide-details
-                        >
-                          <template #prepend>
-                            <span class="text-caption text-medium-emphasis settings-label">SDF cell (m)</span>
-                          </template>
-                        </v-slider>
-                      </v-col>
-                      <v-col cols="12" sm="6" md="4">
-                        <v-slider
-                          v-model="navSettings.sdfDensityThreshold"
-                          :min="0.01"
-                          :max="0.12"
-                          :step="0.005"
-                          color="secondary"
-                          density="compact"
-                          thumb-label
-                          hide-details
-                        >
-                          <template #prepend>
-                            <span class="text-caption text-medium-emphasis settings-label">Density thresh</span>
-                          </template>
-                        </v-slider>
-                      </v-col>
-                      <v-col cols="12" sm="6" md="4">
-                        <v-slider
-                          v-model="navSettings.maxLocalHeightVariance"
-                          :min="0.08"
-                          :max="0.6"
-                          :step="0.02"
-                          color="secondary"
-                          density="compact"
-                          thumb-label
-                          hide-details
-                        >
-                          <template #prepend>
-                            <span class="text-caption text-medium-emphasis settings-label">Height variance</span>
+                            <span class="text-caption text-medium-emphasis settings-label">{{ field.label }}</span>
                           </template>
                         </v-slider>
                       </v-col>
@@ -1663,115 +1761,25 @@ const onNavArtifactsSelected = async (event: Event): Promise<void> => {
                     <v-divider class="my-4" />
                     <div class="text-subtitle-2 mb-2">Recast agent</div>
                     <v-row density="comfortable">
-                      <v-col cols="12" sm="6" md="4">
+                      <v-col
+                        v-for="field in DEMO_NAV_RECAST_SLIDER_FIELDS"
+                        :key="field.key"
+                        cols="12"
+                        sm="6"
+                        md="4"
+                      >
                         <v-slider
-                          v-model="navSettings.walkableSlopeAngle"
-                          :min="30"
-                          :max="70"
-                          :step="1"
-                          color="success"
+                          v-model="navSettings[field.key]"
+                          :min="field.min"
+                          :max="field.max"
+                          :step="field.step"
+                          :color="field.color ?? 'primary'"
                           density="compact"
                           thumb-label
                           hide-details
                         >
                           <template #prepend>
-                            <span class="text-caption text-medium-emphasis settings-label">Max slope (°)</span>
-                          </template>
-                        </v-slider>
-                      </v-col>
-                      <v-col cols="12" sm="6" md="4">
-                        <v-slider
-                          v-model="navSettings.walkableRadius"
-                          :min="0.15"
-                          :max="0.6"
-                          :step="0.05"
-                          color="success"
-                          density="compact"
-                          thumb-label
-                          hide-details
-                        >
-                          <template #prepend>
-                            <span class="text-caption text-medium-emphasis settings-label">Agent radius (m)</span>
-                          </template>
-                        </v-slider>
-                      </v-col>
-                      <v-col cols="12" sm="6" md="4">
-                        <v-slider
-                          v-model="navSettings.walkableClimb"
-                          :min="0.25"
-                          :max="1"
-                          :step="0.05"
-                          color="success"
-                          density="compact"
-                          thumb-label
-                          hide-details
-                        >
-                          <template #prepend>
-                            <span class="text-caption text-medium-emphasis settings-label">Max climb (m)</span>
-                          </template>
-                        </v-slider>
-                      </v-col>
-                      <v-col cols="12" sm="6" md="4">
-                        <v-slider
-                          v-model="navSettings.minRegionArea"
-                          :min="0"
-                          :max="24"
-                          :step="1"
-                          color="success"
-                          density="compact"
-                          thumb-label
-                          hide-details
-                        >
-                          <template #prepend>
-                            <span class="text-caption text-medium-emphasis settings-label">Min region</span>
-                          </template>
-                        </v-slider>
-                      </v-col>
-                      <v-col cols="12" sm="6" md="4">
-                        <v-slider
-                          v-model="navSettings.maxIslandSeedDistance"
-                          :min="6"
-                          :max="200"
-                          :step="2"
-                          color="warning"
-                          density="compact"
-                          thumb-label
-                          hide-details
-                        >
-                          <template #prepend>
-                            <span class="text-caption text-medium-emphasis settings-label">Island↔seed max (m)</span>
-                          </template>
-                        </v-slider>
-                      </v-col>
-                      <v-col cols="12" sm="6" md="4">
-                        <v-slider
-                          v-model="navSettings.cellBandBelow"
-                          :min="0.5"
-                          :max="4"
-                          :step="0.1"
-                          color="primary"
-                          density="compact"
-                          thumb-label
-                          hide-details
-                        >
-                          <template #prepend>
-                            <span class="text-caption text-medium-emphasis settings-label">Cell band − (m)</span>
-                          </template>
-                        </v-slider>
-                      </v-col>
-                      <v-col cols="12" sm="6" md="4">
-                        <v-slider
-                          v-model="navSettings.cellBandAbove"
-                          :min="0.45"
-                          :max="4"
-                          :step="0.1"
-                          color="primary"
-                          density="compact"
-                          thumb-label
-                          hide-details
-                        >
-                          <template #prepend>
-                            <span class="text-caption text-medium-emphasis settings-label">Cell band + (m)</span>
+                            <span class="text-caption text-medium-emphasis settings-label">{{ field.label }}</span>
                           </template>
                         </v-slider>
                       </v-col>
@@ -1895,7 +1903,7 @@ const onNavArtifactsSelected = async (event: Event): Promise<void> => {
                 </v-btn>
               </div>
               <p
-                v-if="navMode === 'voxel_collision'"
+                v-if="usesVoxelVolumeUi(navMode)"
                 class="text-caption text-medium-emphasis mt-2 mb-0"
               >
                 {{ navArtifactUploadHint }}
@@ -1914,12 +1922,22 @@ const onNavArtifactsSelected = async (event: Event): Promise<void> => {
                   size="22"
                 />
                 <div class="flex-grow-1">
-                  <div class="text-body-2 font-weight-medium">Voxel collider overlay</div>
+                  <div class="text-body-2 font-weight-medium">
+                    {{
+                      navMode === 'sdf_marching_cubes'
+                        ? 'MC shell (cyan)'
+                        : 'Voxel collider overlay'
+                    }}
+                  </div>
                   <div class="text-caption text-medium-emphasis">
                     {{
                       colliderVisible
-                        ? 'Cyan collision boundary visible — walk surfaces for Recast or voxel walk'
-                        : 'Toggle on to show the cyan voxel collider overlay'
+                        ? navMode === 'sdf_marching_cubes'
+                          ? 'Cyan interior MC shell visible'
+                          : 'Cyan collision boundary visible — walk surfaces for Recast or voxel walk'
+                        : navMode === 'sdf_marching_cubes'
+                          ? 'Toggle on to show the cyan MC shell'
+                          : 'Toggle on to show the cyan voxel collider overlay'
                     }}
                   </div>
                 </div>

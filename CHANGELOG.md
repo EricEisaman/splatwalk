@@ -22,11 +22,166 @@ Every v2 result advertises a `capabilities` string array. Current flags:
 | `room_floor_mesh` | exposes `build_room_floor_mesh` (WASM-side FAST NAV floor) |
 | `sog_export` | exposes `convert_to_sog` |
 | `streamed_sog` | exposes `slice_splat` (streamed LOD SOG) |
+| `fast_nav` | exposes star `fast_nav(bytes, { algo, ... })` (`floor_field` / `voxel_collision` / `sdf_marching_cubes`) |
 | `fast_nav_preset` | exposes `fast_nav_preset()` and bakes the preset into `build_room_floor_mesh` |
+| `sdf_marching_cubes` | collision / `fast_nav` can emit smooth Marching Cubes isosurface (`collision_mesh_mode: "smooth"`) |
+| `sdf_mc_floor_project` | SDF-MC returns downward-projected floor in `mesh` + optional MC `collider_mesh` for overlay |
 | `output_space` | honours `settings.output_space` (opt-in handedness / up-axis / winding) |
 | `recast_config` | exposes `recast_agent_defaults()` and `recast_config()` |
 | `progress_callback` | exposes `set_progress_callback()` (opt-in structured progress) |
 | `splat_ingest` | exposes `splat_to_ply` (antimatter15 `.splat` -> PLY normalization) alongside `spz_to_ply` |
+
+## [0.6.10] - 2026-07-24
+
+### Fixed (host)
+
+- **NavKit camera restore** — prefer durable `camPos` + `camTarget`; euler fallback;
+  ArcRotate rebuild uses `setPosition` (fixes tropical_compound α / opposite-orbit
+  regression). Meta is engine-agnostic (no `cameraMode` / Babylon type names).
+- **NavKit player facing** — mesh yaw is oriented `+yaw` on Babylon and R3F (no
+  Z-mirror negate). After teleport / restore, travel-facing is suppressed until
+  click or WASDQE so Recast path/velocity cannot overwrite the saved tip.
+
+### Changed (host)
+
+- **`docs/navkit.md`** — oriented Y-up pose contract; hosts map `camPos`+`camTarget`
+  and player yaw without engine camera type names in the pack.
+
+### Notes
+
+- WASM **`api_version` stays `2`**. Package / crate **0.6.10**. CDN pin
+  `@splatwalk/core@0.6.10`.
+
+## [0.6.9] - 2026-07-24
+
+### Added (host)
+
+- **NavMesh Editor** (Workbench / Vuetify / R3F) — Blender-like modes via keys
+  **1** Vertex · **2** Circle · **3** Global Y (0.1 m). Circle: click to pin,
+  click / Shift+click radius ±0.1 m, **2** resumes follow; **T** translate gizmo,
+  **F** hole fill, **X** delete + Apply live. Overlay edits mark dirty; **Apply to
+  Live Navmesh** rebakes Detour + session artifacts.
+- **NavKit download sync** — Download NavKit / nav-artifacts rebuilds
+  `walkable_floors.glb` from live oriented debug buffers (and auto-Applies pending
+  editor edits) so reload/upload keeps filled/deleted regions.
+
+### Changed (core / npm)
+
+- **`@splatwalk/core@0.6.9`** — first npm publish of the post-0.6.4 WASM line
+  (includes `fast_nav`, SDF-MC floor project / `sdf_mc_floor_project`, early region
+  cull, and related 0.6.5 capabilities that were never on the registry).
+
+### Notes
+
+- WASM **`api_version` stays `2`**. Package / crate **0.6.9**. CDN pin
+  `@splatwalk/core@0.6.9`.
+
+## [0.6.8] - 2026-07-24
+
+### Added
+
+- **NavKit meta controls + pose** — `meta-nav.json` fields: `controls.mode`
+  (`click_to_move` \| `wasdqe` \| `both`), `region`, `camPos` / `camEulerDeg`,
+  `playerPos` / `playerEulerDeg`. Download captures live camera/player/region;
+  restore applies with session fallbacks.
+- **WASDQE player controls** — W/S move, A/D turn, Q/E strafe on Recast crowd
+  (Workbench / Vuetify / R3F). Shared `playerWasdControls.ts`.
+- **Controls UI** on all three demos (live apply + NavKit round-trip).
+
+### Notes
+
+- Host/demo package **0.6.8**. WASM **`api_version` stays `2`**.
+
+## [0.6.7] - 2026-07-24
+
+### Fixed (React NavKit restore)
+- R3F NavKit load crashed in `DropInViewer` (`splatCount` of undefined) when packs
+  stored **gzip `.spz` bytes under a `.ply` filename** (React recompute rewrote the
+  model name). Ingest now sniffs gzip/`ply` magic; NavKit download reconciles the
+  extension; recompute no longer clobbers `*.spz` → `*.ply`.
+
+### Fixed
+
+- **NavKit click-to-move** — minimal / floor_field packs now embed Recast debug mesh as
+  `nav/walkable_floors.glb`. Restore on Workbench, Vuetify, and R3F shows the green
+  overlay before crowd init (PLAYER/NPC alone is not enough for pick-to-move).
+- **R3F NavKit hang** — `SplatNavController.loadSplat` no longer awaits a stuck
+  DropInViewer `dispose()`; splat blob load uses a tight copy + timeout.
+
+### Changed
+
+- **Workbench** — removed **Upload nav artifacts (legacy)** (header + sidebar). Restore
+  is **NavKit** only (drop / choose local file). Legacy **download** nav-artifacts remains
+  as a secondary export.
+- **Download NavKit** sits beside **Download FastNav Component Pack** on all three demos
+  when model + nav pack are ready (`hasNavKit` reactive on Vuetify).
+
+### Notes
+
+- WASM **`api_version` stays `2`**. Host/demo package **0.6.7**. CDN pin for core remains
+  `@splatwalk/core@0.6.5` until the next core publish.
+
+## [0.6.6] - 2026-07-24
+
+### Added
+
+- **NavKit** (`navkit-<slug>.zip`) — core product pack with `meta-nav.json` + original
+  model (`model/`) + nested `nav/` artifacts. Contract: [`docs/navkit.md`](docs/navkit.md).
+  APIs: `navKitContract.ts` / `navKitBundle.ts` (`build` / `peek` / `parse` / `download`).
+- **Download NavKit** + **drop-to-restore** on 3D Workbench, Vuetify Fast Nav, and R3F
+  Fast Nav (loads model + baked nav; does **not** re-run Fast Nav).
+- `npm run check:navkit` — in-memory zip contract smoke test.
+
+### Changed
+
+- Renamed demo UI **Download FastNav kit** → **Download FastNav Component Pack**
+  (integrator zip under `/integration-kits/`) so it is not confused with **NavKit**
+  scene packs.
+- Primary demo export branding prefers NavKit; legacy **nav-artifacts** download/upload
+  remains labeled as legacy (still requires a preloaded splat).
+- Active / Live hot-swap gates on session volume + Recast bytes (stale Vue caps fixed);
+  Dual / Voxel switch Live when artifacts exist after voxel / SDF-MC.
+
+### Notes
+
+- WASM **`api_version` stays `2`**. Host/demo package **0.6.6**. CDN pin for core remains
+  `@splatwalk/core@0.6.5` until the next core publish.
+
+## [0.6.5] - 2026-07-23
+
+### Changed
+
+- **`sdf_marching_cubes` Recast input** — `mesh` is a downward-projected floor on the MC
+  surface (interior cast when sealed indoor carve; open sky-down otherwise). Full MC shell
+  is `collider_mesh` for cyan overlay. Capability `sdf_mc_floor_project`. Diagnostics
+  `collision_floor_project_mode`: `"interior"` | `"open"`.
+- **SDF-MC floor project harden** — floor-band hit pick (prefer room floor over furniture),
+  1-cell gap fill, 3-of-4 quad emit, and `floor_project_flatten_m` (default `0.08`) to kill
+  Recast-breaking undulations on the projected sheet only. Diagnostics
+  `collision_floor_project_flatten_m`.
+- **SDF-MC unpinned region** — `fast_nav` no longer force-pins a camera box for unpinned
+  `sdf_marching_cubes` (needed for indoor interior MC `collider_mesh`). Missing MC shell is
+  treated as failure even when the projected/`walkable_floors` Recast floor is non-empty;
+  SDF `drop region` recovery clears the pin instead of re-pinning.
+- **SDF-MC Recast floor on roof** — smooth path always uses carved-interior floor project
+  when carve exists (not sky→roof). Hosts force `collision_scene_type: indoor` for SDF-MC;
+  example scenes carry indoor/outdoor tags applied on load.
+
+### Added
+
+- **WASM `fast_nav`** — star export with `algo`: `floor_field` (default), `voxel_collision`,
+  `sdf_marching_cubes`. Capability `fast_nav`. Structured `FastNavResult` / failure reasons.
+- **Early region cull** — `region_min` / `region_max` first-class on all entry points including
+  `fast_nav`; cull before floater prune (progress stage `region_cull`).
+- Host **`runFastNav({ algo })`** dispatches to WASM `fast_nav` then Recast; Vuetify / R3F /
+  Storage demos select technique without floor-only copy.
+- **Empty-region / empty-mesh immunity** — collision recovery ladder inside `fast_nav`; empty pin
+  → all splats when small, or **camera-centered region** when immense (>500k). Optional
+  `camera_position` on MeshSettings. Floor path unclips empty pins before final failure.
+
+### Notes
+
+- WASM **`api_version` stays `2`**. Package **0.6.5**. CDN pin `@splatwalk/core@0.6.5`.
 
 ## [0.6.4] - 2026-07-23
 

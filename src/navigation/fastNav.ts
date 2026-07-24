@@ -2,13 +2,26 @@ import type { Vector3 } from '@babylonjs/core';
 
 import NavWorker from '@/navigation/navmesh.worker?worker';
 import type { Viewer } from '@/scene/Viewer';
+import {
+  buildFastNavCacheSignature,
+  FAST_NAV_FLOOR_PIPELINE,
+} from '@/navigation/fastNavCacheSignature';
 import { buildNavmeshKey, getNavmesh, putNavmesh } from '@/navigation/navmeshCache';
-import { splatwalk, type MeshSettings } from '@/wasm/bridge';
+import {
+  splatwalk,
+  type FastNavAlgo,
+  type MeshSettings,
+} from '@/wasm/bridge';
 import { normalizeSplatToPly } from '@/wasm/normalize';
 import {
+  DEFAULT_CAMERA_SELECT_REGION_OFFSETS,
+  clampPointToAabb,
+  groundAnchoredCameraRegion,
+  regionBoundsFromCameraPose,
   regionBoundsFromCameraSelect,
   type CameraSelectRegionInput,
 } from '@/navigation/cameraSelectRegion';
+import { ensureSdfMcRegionForDenseBudget } from '@/navigation/collisionGridBudget';
 import {
   extractFloorFieldWithRecovery,
   resolveRecovery,
@@ -18,12 +31,16 @@ import {
   type FastNavRecoveryConfig,
   type StrayTrimOptions,
 } from '@/navigation/floor';
+import type { CollisionVoxelBoundarySettings, CollisionVoxelVolume } from '@/wasm/bridge';
 
 // Re-export the framework-agnostic floor logic so existing imports from this
 // module (and the published `src/index.ts` surface) keep working unchanged. The
 // pure floor math now lives in `@/navigation/floor` so binary-only / non-Babylon
 // integrators can consume it without a 3D engine.
 export * from '@/navigation/floor';
+
+/** FastNav compute algorithms (matches WASM `fast_nav` `algo`). */
+export type { FastNavAlgo };
 
 /**
  * Coarse phases of {@link runFastNav}, emitted via {@link FastNavOptions.onPhase}
@@ -41,6 +58,20 @@ export interface FastNavOptions {
   readonly viewer: Viewer;
   /** Raw, already-decompressed splat bytes (see {@link readSplatBytes}). */
   readonly bytes: Uint8Array;
+  /**
+   * WASM FastNav algorithm (default `floor_field`). Voxel/SDF paths call the same
+   * star export via the collision host orchestrators.
+   */
+  readonly algo?: FastNavAlgo;
+  /** When true (voxel/SDF), request packed volume bitmasks from WASM. Default true for those algos. */
+  readonly emitVolume?: boolean;
+  /** When true, request GLB bytes from WASM `fast_nav`. Default false. */
+  readonly emitGlb?: boolean;
+  /**
+   * Collision MeshSettings overrides when `algo` is `voxel_collision` or
+   * `sdf_marching_cubes`. Ignored for `floor_field`.
+   */
+  readonly collisionSettings?: CollisionVoxelBoundarySettings;
   /** Optional progress sink; defaults to the console. */
   readonly onLog?: FastNavLogger;
   /** Optional phase sink for step indicators (prune -> floor -> navmesh -> done). */
@@ -96,6 +127,11 @@ export interface FastNavOptions {
     readonly mergeNearbyIslands?: boolean;
   };
   /**
+   * Active navigation mode for voxel / SDF-MC (Recast / Voxel mesh / dual).
+   * Ignored for `floor_field` (always Recast).
+   */
+  readonly activeNavigationMode?: import('@/navigation/activeNavigation').ActiveNavigationMode;
+  /**
    * When true (Storage Adapter streamed / Church outdoor), pin a seed-centered
    * ~100 m working volume and outdoor field knobs. Default false restores HEAD
    * indoor Fast Nav (yellow box only; suggestRegion for seed) so Bedroom / PurplePad
@@ -129,6 +165,12 @@ export interface PruneFloatersOptions {
 
 /** Result of a successful {@link runFastNav}. */
 export interface FastNavResult {
+  /** Algorithm used for this run. */
+  readonly algo: FastNavAlgo;
+  /** Recast debug overlay indices (oriented space) for NavKit walkable_floors.glb. */
+  readonly debugIndices: Uint32Array;
+  /** Recast debug overlay positions (oriented space) for NavKit walkable_floors.glb. */
+  readonly debugPositions: Float32Array;
   /** The serialized Recast navmesh binary. */
   readonly navMeshData: Uint8Array;
   /** The chosen player spawn point on the navmesh, if any. */
@@ -138,6 +180,8 @@ export interface FastNavResult {
    * callers should not call {@link Viewer.focusOnPlayer}.
    */
   readonly keptCameraSelectView: boolean;
+  /** Dense voxel volume when a collision algo requested `emit_volume`. */
+  readonly volume?: CollisionVoxelVolume;
 }
 
 interface NavReport {
@@ -362,6 +406,14 @@ export async function readSplatBytes(file: File): Promise<Uint8Array> {
   return normalizeSplatToPly(file);
 }
 
+/** True when seed is missing or the placeholder origin used by mesh defaults. */
+const isDefaultOriginCollisionSeed = (seed: readonly number[] | undefined): boolean => {
+  if (!seed || seed.length < 3) {
+    return true;
+  }
+  return seed[0] === 0 && seed[1] === 1 && seed[2] === 0;
+};
+
 /**
  * Conservative base reconstruction settings mirroring the defaults of the main
  * workbench UI, with the current splat orientation baked in.
@@ -450,9 +502,39 @@ export const SEED_CENTERED_SDF_CELL_SIZE_M = 0.4;
 export const SEED_CENTERED_HOLE_FILL_RADIUS = 8;
 
 /** Apply outdoor field knobs that survive later meshSettings / fast-field merges. */
-const applySeedCenteredOutdoorFieldKnobs = (settings: MeshSettings): void => {
+export const applySeedCenteredOutdoorFieldKnobs = (settings: MeshSettings): void => {
   settings.sdf_cell_size = SEED_CENTERED_SDF_CELL_SIZE_M;
   settings.hole_fill_radius = SEED_CENTERED_HOLE_FILL_RADIUS;
+};
+
+/**
+ * Write a seed-centered ~100 m outdoor pin onto `settings` (XZ ±50 m, Y band).
+ * Used by Storage Adapter / outdoor demos so Recast heightfields stay bounded.
+ * @returns Collision seed at floor + half carve height.
+ */
+export const applySeedCenteredOutdoorPin = (params: {
+  readonly settings: MeshSettings;
+  readonly seedX: number;
+  readonly seedZ: number;
+  readonly floorY: number;
+  readonly carveHeight?: number;
+  readonly log?: FastNavLogger;
+}): number[] => {
+  const { settings, seedX, seedZ, floorY } = params;
+  const carveHeight = params.carveHeight ?? settings.collision_carve_height ?? 1.6;
+  const half = SEED_CENTERED_HALF_EXTENT_M;
+  settings.region_min = [seedX - half, floorY - SEED_CENTERED_Y_BELOW_M, seedZ - half];
+  settings.region_max = [seedX + half, floorY + SEED_CENTERED_Y_ABOVE_M, seedZ + half];
+  applySeedCenteredOutdoorFieldKnobs(settings);
+  const seed = [seedX, floorY + carveHeight * 0.5, seedZ];
+  params.log?.(
+    `[INFO] Fast Nav region=seed-centered (100m) ` +
+      `sdf_cell_size=${SEED_CENTERED_SDF_CELL_SIZE_M} hole_fill_radius=${SEED_CENTERED_HOLE_FILL_RADIUS} ` +
+      `seed=[${seedX.toFixed(2)}, ${floorY.toFixed(2)}, ${seedZ.toFixed(2)}] ` +
+      `min=[${settings.region_min.map((v) => v.toFixed(2)).join(', ')}] ` +
+      `max=[${settings.region_max.map((v) => v.toFixed(2)).join(', ')}]`
+  );
+  return seed;
 };
 
 /**
@@ -461,7 +543,7 @@ const applySeedCenteredOutdoorFieldKnobs = (settings: MeshSettings): void => {
  * - Outdoor seed-centered ~100 m pin only when `seedCenteredOutdoor` is true
  *   (streamed Church path). Indoor default matches HEAD: no auto region pin.
  */
-async function pinFastNavRegionIfNeeded(
+export async function pinFastNavRegionIfNeeded(
   viewer: Viewer,
   bytes: Uint8Array,
   base: MeshSettings,
@@ -470,8 +552,8 @@ async function pinFastNavRegionIfNeeded(
 ): Promise<number[] | null> {
   const yellowBox = viewer.getWasmRegionBounds();
   if (yellowBox) {
-    base.region_min = yellowBox.min;
-    base.region_max = yellowBox.max;
+    base.region_min = [...yellowBox.min];
+    base.region_max = [...yellowBox.max];
     log(
       `[INFO] Fast Nav region=yellow-box ` +
         `min=[${yellowBox.min.map((v) => v.toFixed(2)).join(', ')}] ` +
@@ -489,20 +571,14 @@ async function pinFastNavRegionIfNeeded(
   const suggested = await splatwalk.suggestRegion(bytes, base);
   const seedX = (suggested.region_min[0] + suggested.region_max[0]) * 0.5;
   const seedZ = (suggested.region_min[2] + suggested.region_max[2]) * 0.5;
-  const floorY = suggested.floor_y;
-  const half = SEED_CENTERED_HALF_EXTENT_M;
-  base.region_min = [seedX - half, floorY - SEED_CENTERED_Y_BELOW_M, seedZ - half];
-  base.region_max = [seedX + half, floorY + SEED_CENTERED_Y_ABOVE_M, seedZ + half];
-  applySeedCenteredOutdoorFieldKnobs(base);
-  const seed = [seedX, floorY + carveHeight * 0.5, seedZ];
-  log(
-    `[INFO] Fast Nav region=seed-centered (100m) ` +
-      `sdf_cell_size=${SEED_CENTERED_SDF_CELL_SIZE_M} hole_fill_radius=${SEED_CENTERED_HOLE_FILL_RADIUS} ` +
-      `seed=[${seedX.toFixed(2)}, ${floorY.toFixed(2)}, ${seedZ.toFixed(2)}] ` +
-      `min=[${base.region_min.map((v) => v.toFixed(2)).join(', ')}] ` +
-      `max=[${base.region_max.map((v) => v.toFixed(2)).join(', ')}]`
-  );
-  return seed;
+  return applySeedCenteredOutdoorPin({
+    settings: base,
+    seedX,
+    seedZ,
+    floorY: suggested.floor_y,
+    carveHeight,
+    log,
+  });
 }
 
 async function ensureFastCollisionSeed(
@@ -560,7 +636,10 @@ export function triangleArea(positions: Float32Array, i0: number, i1: number, i2
 }
 
 export interface FilterNavmeshIslandOptions {
-  /** Max |centroid.y − seed.y| when merging same-level outdoor islands (m). */
+  /**
+   * Max |centroid.y − refY| for same-level island selection (m).
+   * Outdoor merge uses this vs seed Y when {@link refFloorY} is omitted.
+   */
   readonly floorYBand?: number;
   /** Max horizontal distance (m) from seed when merging outdoor islands. */
   readonly maxSeedDistance?: number;
@@ -569,6 +648,11 @@ export interface FilterNavmeshIslandOptions {
    * Indoor default keeps a single nearest island.
    */
   readonly mergeNearbyIslands?: boolean;
+  /**
+   * Floor-plane Y for indoor same-level checks (seed is carve mid-height).
+   * When set, indoor pick uses this instead of `seed[1]`.
+   */
+  readonly refFloorY?: number;
 }
 
 /** Indoor default: reject islands whose centroid is farther than this from the seed. */
@@ -729,8 +813,28 @@ export function filterNavmeshIslandNearSeed(
       ].filter(Boolean);
     }
   } else {
-    const sorted = [...viable].sort((a, b) => a.distanceToSeed - b.distanceToSeed || b.area - a.area);
-    selectedComponents = [sorted[0] ?? [...components].sort((a, b) => b.area - a.area)[0]];
+    // Indoor: prefer the largest same-level island near the seed. Compare Y to
+    // floor plane (refFloorY), not carve mid-height seed — |floor − seed| ≈ 0.85 m.
+    const refY = options?.refFloorY ?? seed[1];
+    const indoorFloorYBand = Math.max(floorYBand, 0.75);
+    const nearSeedSameLevel = viable.filter(
+      (component) =>
+        component.horizontalDistanceToSeed <= maxSeedDistance &&
+        Math.abs(component.centroid[1] - refY) <= indoorFloorYBand
+    );
+    const nearSeed = viable.filter(
+      (component) => component.horizontalDistanceToSeed <= maxSeedDistance
+    );
+    const pool =
+      nearSeedSameLevel.length > 0
+        ? nearSeedSameLevel
+        : nearSeed.length > 0
+          ? nearSeed
+          : viable;
+    const ranked = [...pool].sort(
+      (a, b) => b.area - a.area || a.distanceToSeed - b.distanceToSeed
+    );
+    selectedComponents = [ranked[0] ?? [...components].sort((a, b) => b.area - a.area)[0]];
   }
 
   const selectedTriangles = selectedComponents.flatMap((component) => component.triangles);
@@ -906,19 +1010,309 @@ export function generateNavmeshInWorker(
 }
 
 /**
- * Run the full one-click FAST NAV pipeline against an already-loaded splat:
- * splat -> walkable ground field -> floor mesh -> Recast navmesh (with a relaxed
- * retry ladder) -> crowd + NPC. Mirrors the workbench "FAST NAV" button.
+ * Run the one-click FAST NAV pipeline against an already-loaded splat.
+ * Compute is WASM {@link splatwalk.fastNav} (`algo`); host runs Recast/crowd.
  */
 export async function runFastNav(options: FastNavOptions): Promise<FastNavResult> {
   const { viewer, bytes } = options;
+  const algo: FastNavAlgo = options.algo ?? 'floor_field';
   const log: FastNavLogger = options.onLog ?? ((message: string): void => console.log(message));
   const phase: FastNavPhaseListener = options.onPhase ?? ((): void => undefined);
   const cameraSelect = options.cameraSelect;
   const keepCameraSelectView =
     cameraSelect !== undefined && options.keepCameraSelectView !== false;
 
-  log('[WAIT] Fast path: splat -> floor field -> navmesh -> NPC...');
+  const caps = await splatwalk.capabilities();
+  if (!caps.includes('fast_nav')) {
+    throw new Error(
+      'WASM capability fast_nav missing — rebuild @splatwalk/core (npm run build:wasm) or upgrade the package.'
+    );
+  }
+  if (algo === 'sdf_marching_cubes' && !caps.includes('sdf_marching_cubes')) {
+    throw new Error(
+      'SDF Marching Cubes requires WASM capability sdf_marching_cubes. Rebuild or upgrade @splatwalk/core.'
+    );
+  }
+
+  // Collision algos: thin host wrappers that call WASM fast_nav internally
+  // (generateCollisionBoundary → splatwalk.fastNav). Dynamic import avoids cycles.
+  if (algo === 'voxel_collision' || algo === 'sdf_marching_cubes') {
+    log(`[WAIT] Fast Nav (${algo}): splat -> WASM fast_nav -> Recast -> NPC...`);
+    const collisionSettings =
+      options.collisionSettings ??
+      ({
+        ...defaultFastMeshSettings(viewer),
+        ...(options.meshSettings ?? {}),
+        mode: 2,
+        collision_mesh_mode: algo === 'sdf_marching_cubes' ? 'smooth' : 'faces',
+        emit_glb: options.emitGlb ?? false,
+        emit_volume: options.emitVolume ?? true,
+      } as CollisionVoxelBoundarySettings);
+    // Always bake at the viewer session scale (callers may omit environment_scale).
+    collisionSettings.environment_scale = viewer.getEnvironmentScale();
+    log(`[INFO] Environment scale for this run: ${collisionSettings.environment_scale}`);
+    // Apply prune before any WASM ingest (suggestRegion / fast_nav) so OFF is honored.
+    if (options.prune) {
+      if (options.prune.enabled !== undefined) {
+        collisionSettings.prune_floaters = options.prune.enabled;
+      }
+      if (options.prune.k !== undefined) {
+        collisionSettings.prune_floaters_k = options.prune.k;
+      }
+      if (options.prune.stdRatio !== undefined) {
+        collisionSettings.prune_floaters_std_ratio = options.prune.stdRatio;
+      }
+    }
+    log(
+      `[INFO] Fast Nav floater prune: ${collisionSettings.prune_floaters === false ? 'off' : 'on'}` +
+        (collisionSettings.prune_floaters === false
+          ? ''
+          : ` (k=${collisionSettings.prune_floaters_k}, std=${collisionSettings.prune_floaters_std_ratio})`) +
+        ` · scene=${collisionSettings.collision_scene_type ?? 'outdoor'}`
+    );
+
+    if (cameraSelect) {
+      const bounds = regionBoundsFromCameraSelect(cameraSelect);
+      viewer.enableRegionSelection({ min: bounds.min, max: bounds.max });
+      collisionSettings.region_min = [...bounds.min];
+      collisionSettings.region_max = [...bounds.max];
+      collisionSettings.camera_position = clampPointToAabb({
+        point: cameraSelect.view.position,
+        regionMax: bounds.max,
+        regionMin: bounds.min,
+      });
+    } else {
+      const yellow = viewer.getRegionBounds();
+      if (yellow && algo === 'sdf_marching_cubes') {
+        const splatDiag = viewer.getSplatBoundsForDiagnostics();
+        const decision = ensureSdfMcRegionForDenseBudget({
+          candidateRegion: yellow,
+          existingRegion: yellow,
+          fillSize: collisionSettings.collision_fill_size,
+          sceneType: collisionSettings.collision_scene_type,
+          splatBounds: splatDiag
+            ? {
+                min: [splatDiag.min.x, splatDiag.min.y, splatDiag.min.z],
+                max: [splatDiag.max.x, splatDiag.max.y, splatDiag.max.z],
+              }
+            : yellow,
+        });
+        const region = decision.region ?? yellow;
+        viewer.enableRegionSelection({ min: region.min, max: region.max });
+        collisionSettings.region_min = [...region.min];
+        collisionSettings.region_max = [...region.max];
+        log(`[INFO] SDF-MC: ${decision.reason}`);
+        const cam = viewer.getScene().activeCamera;
+        if (cam) {
+          collisionSettings.camera_position = clampPointToAabb({
+            point: { x: cam.position.x, y: cam.position.y, z: cam.position.z },
+            regionMax: region.max,
+            regionMin: region.min,
+          });
+        }
+      } else if (yellow) {
+        collisionSettings.region_min = [...yellow.min];
+        collisionSettings.region_max = [...yellow.max];
+        const cam = viewer.getScene().activeCamera;
+        if (cam) {
+          collisionSettings.camera_position = clampPointToAabb({
+            point: { x: cam.position.x, y: cam.position.y, z: cam.position.z },
+            regionMax: yellow.max,
+            regionMin: yellow.min,
+          });
+        }
+      } else if (algo === 'voxel_collision') {
+        // Voxel on unpinned outdoor streams → camera box (not full AABB).
+        const cam = viewer.getScene().activeCamera;
+        if (cam) {
+          const pos = cam.position;
+          const yawRadians =
+            'rotation' in cam && cam.rotation
+              ? (cam.rotation as { y: number }).y
+              : 0;
+          const bounds = regionBoundsFromCameraPose({
+            pose: {
+              position: { x: pos.x, y: pos.y, z: pos.z },
+              yawRadians,
+            },
+            offsets: DEFAULT_CAMERA_SELECT_REGION_OFFSETS,
+          });
+          viewer.enableRegionSelection({ min: bounds.min, max: bounds.max });
+          collisionSettings.region_min = [...bounds.min];
+          collisionSettings.region_max = [...bounds.max];
+          collisionSettings.camera_position = clampPointToAabb({
+            point: { x: pos.x, y: pos.y, z: pos.z },
+            regionMax: bounds.max,
+            regionMin: bounds.min,
+          });
+          log(
+            `[INFO] No selection region — pinned camera-centered box for ${algo}: ` +
+              `${bounds.min.map((v) => v.toFixed(1)).join(', ')} → ` +
+              `${bounds.max.map((v) => v.toFixed(1)).join(', ')}`
+          );
+        }
+      } else if (algo === 'sdf_marching_cubes') {
+        // Budget-aware: full AABB when it fits; else auto-pin a camera/ground box.
+        const carveHeight = collisionSettings.collision_carve_height ?? 1.6;
+        const rotation = viewer.getSplatRotation();
+        const splatBoundsResult = await splatwalk.getSplatBounds(bytes, {
+          ...collisionSettings,
+          mode: 2,
+          prune_floaters: false,
+          flip_y: viewer.isSplatYFlipped(),
+          rotation: [rotation.x, rotation.y, rotation.z],
+          environment_scale: viewer.getEnvironmentScale(),
+        });
+        const splatBounds = {
+          min: splatBoundsResult.oriented_min,
+          max: splatBoundsResult.oriented_max,
+        };
+        const cam = viewer.getScene().activeCamera;
+        const pose = cam
+          ? {
+              position: { x: cam.position.x, y: cam.position.y, z: cam.position.z },
+              yawRadians:
+                'rotation' in cam && cam.rotation
+                  ? (cam.rotation as { y: number }).y
+                  : 0,
+            }
+          : {
+              position: {
+                x: (splatBounds.min[0]! + splatBounds.max[0]!) * 0.5,
+                y: splatBoundsResult.floor_y_percentile_02,
+                z: (splatBounds.min[2]! + splatBounds.max[2]!) * 0.5,
+              },
+              yawRadians: 0,
+            };
+        const candidateRegion = groundAnchoredCameraRegion({
+          carveHeight,
+          floorY: splatBoundsResult.floor_y_percentile_02,
+          offsets: DEFAULT_CAMERA_SELECT_REGION_OFFSETS,
+          pose,
+        });
+        const decision = ensureSdfMcRegionForDenseBudget({
+          candidateRegion,
+          existingRegion: null,
+          fillSize: collisionSettings.collision_fill_size,
+          sceneType: collisionSettings.collision_scene_type,
+          splatBounds,
+        });
+        log(`[INFO] SDF-MC: ${decision.reason}`);
+        if (decision.pinned && decision.region) {
+          viewer.enableRegionSelection({
+            min: decision.region.min,
+            max: decision.region.max,
+          });
+          collisionSettings.region_min = [...decision.region.min];
+          collisionSettings.region_max = [...decision.region.max];
+          collisionSettings.camera_position = clampPointToAabb({
+            point: pose.position,
+            regionMax: decision.region.max,
+            regionMin: decision.region.min,
+          });
+          collisionSettings.collision_seed = [
+            (decision.region.min[0]! + decision.region.max[0]!) * 0.5,
+            decision.region.min[1]! + carveHeight * 0.5,
+            (decision.region.min[2]! + decision.region.max[2]!) * 0.5,
+          ];
+        } else {
+          delete collisionSettings.region_min;
+          delete collisionSettings.region_max;
+          const callerSeed = options.collisionSettings?.collision_seed;
+          const keepCallerSeed =
+            Array.isArray(callerSeed) &&
+            callerSeed.length >= 3 &&
+            !isDefaultOriginCollisionSeed(callerSeed);
+          if (!keepCallerSeed) {
+            const suggested = await splatwalk.suggestRegion(bytes, collisionSettings);
+            collisionSettings.collision_seed = [
+              (suggested.region_min[0] + suggested.region_max[0]) * 0.5,
+              suggested.floor_y + carveHeight * 0.5,
+              (suggested.region_min[2] + suggested.region_max[2]) * 0.5,
+            ];
+            log(
+              `[INFO] SDF-MC seed from suggestRegion: ` +
+                `${collisionSettings.collision_seed.map((v) => v.toFixed(3)).join(', ')}`
+            );
+          }
+          if (cam && !collisionSettings.camera_position) {
+            collisionSettings.camera_position = [
+              cam.position.x,
+              cam.position.y,
+              cam.position.z,
+            ];
+          }
+        }
+      }
+    }
+    if (
+      collisionSettings.region_min &&
+      collisionSettings.region_max &&
+      collisionSettings.collision_seed &&
+      collisionSettings.collision_seed.length >= 3
+    ) {
+      collisionSettings.collision_seed = clampPointToAabb({
+        point: collisionSettings.collision_seed,
+        regionMax: collisionSettings.region_max,
+        regionMin: collisionSettings.region_min,
+      });
+    } else if (
+      collisionSettings.region_min &&
+      collisionSettings.region_max &&
+      isDefaultOriginCollisionSeed(collisionSettings.collision_seed)
+    ) {
+      const carveHeight = collisionSettings.collision_carve_height ?? 1.6;
+      const regionMin = collisionSettings.region_min;
+      const regionMax = collisionSettings.region_max;
+      collisionSettings.collision_seed = [
+        (regionMin[0] + regionMax[0]) * 0.5,
+        regionMin[1] + carveHeight * 0.5,
+        (regionMin[2] + regionMax[2]) * 0.5,
+      ];
+    }
+    if (
+      (collisionSettings.collision_scene_type ?? 'outdoor') === 'outdoor' &&
+      algo === 'sdf_marching_cubes' &&
+      collisionSettings.floor_project_flatten_m === undefined
+    ) {
+      collisionSettings.floor_project_flatten_m = 0.35;
+    }
+    const shared = {
+      activeNavigationMode: options.activeNavigationMode ?? ('recast' as const),
+      bytes,
+      collisionSettings,
+      onLog: log,
+      onPhase: phase,
+      recastAttempts: options.recastAttempts,
+      recastOverrides: options.recastOverrides,
+      showColliderOverlay: true,
+      viewer,
+    };
+    const navResult =
+      algo === 'sdf_marching_cubes'
+        ? await (await import('@/navigation/runNavFromSdfMc')).runNavFromSdfMc(shared)
+        : await (await import('@/navigation/runNavFromVoxelCollider')).runNavFromVoxelCollider(
+            shared
+          );
+    return finalizeFastNavWithCameraSelect(
+      viewer,
+      {
+        algo,
+        debugIndices: navResult.debugIndices,
+        debugPositions: navResult.debugPositions,
+        navMeshData: navResult.navMeshData,
+        playerSpawn: navResult.playerSpawn,
+        keptCameraSelectView: navResult.keptCameraSelectView,
+        volume: navResult.volume,
+      },
+      cameraSelect,
+      keepCameraSelectView,
+      log
+    );
+  }
+
+  // HEAD / prod path: TS ground field → buildFastFloorMesh → Recast (not WASM floor_field).
+  log('[WAIT] Fast Nav (floor_field): splat -> floor field -> navmesh -> NPC...');
 
   const base: MeshSettings = {
     ...defaultFastMeshSettings(viewer),
@@ -939,6 +1333,11 @@ export async function runFastNav(options: FastNavOptions): Promise<FastNavResult
     viewer.enableRegionSelection({ min: bounds.min, max: bounds.max });
     base.region_min = [...bounds.min];
     base.region_max = [...bounds.max];
+    base.camera_position = [
+      cameraSelect.view.position.x,
+      cameraSelect.view.position.y,
+      cameraSelect.view.position.z,
+    ];
     log(
       `[INFO] Camera select region pinned: ` +
         `${bounds.min.map((v) => v.toFixed(2)).join(', ')} → ` +
@@ -946,8 +1345,6 @@ export async function runFastNav(options: FastNavOptions): Promise<FastNavResult
     );
   }
 
-  // HEAD indoor default: yellow box only. Outdoor seed-centered pin is opt-in
-  // (Storage Adapter streamed Church) via options.seedCenteredOutdoor.
   const seedCenteredOutdoor = options.seedCenteredOutdoor === true;
   const precomputedSeed = await pinFastNavRegionIfNeeded(
     viewer,
@@ -956,6 +1353,11 @@ export async function runFastNav(options: FastNavOptions): Promise<FastNavResult
     log,
     seedCenteredOutdoor
   );
+  // Yellow-box pin skips outdoor knobs inside pinFastNavRegionIfNeeded; apply
+  // before cache key so signature `base` matches extract settings.
+  if (seedCenteredOutdoor) {
+    applySeedCenteredOutdoorFieldKnobs(base);
+  }
   const recovery = resolveRecovery(options.recovery);
 
   const baseAttempts = options.recastAttempts ?? FAST_NAV_RECAST_ATTEMPTS;
@@ -966,32 +1368,41 @@ export async function runFastNav(options: FastNavOptions): Promise<FastNavResult
       }))
     : baseAttempts;
 
-  // Cross-visit cache: if this exact splat + settings produced a navmesh before,
-  // restore it and skip parse+prune+field+floor+Recast entirely. The seed and
-  // orientation are deterministic functions of the bytes plus these settings, so
-  // the key omits them (computing the seed is part of the work we want to skip).
-  const cacheKey = buildNavmeshKey(bytes, {
+  const floorMeshOptions: FastFloorMeshOptions = {
+    ...(options.floorMesh ?? {}),
+    seedCenteredOutdoor,
+  };
+  const envScale = base.environment_scale ?? 1;
+  log(`[INFO] Environment scale for this run: ${envScale}`);
+  const cacheSignature = buildFastNavCacheSignature({
+    algo: 'floor_field',
     base,
     recovery,
     strayTrim: options.strayTrim ?? null,
     denseSeed: options.denseSeed ?? null,
-    floorMesh: options.floorMesh ?? null,
+    floorMesh: floorMeshOptions,
+    floorPipeline: FAST_NAV_FLOOR_PIPELINE,
+    seedCenteredOutdoor,
+    islandValidation: options.islandValidation ?? null,
     recastAttempts: attempts,
   });
+  const cacheKey = buildNavmeshKey(bytes, cacheSignature);
   const cached = await getNavmesh(cacheKey);
   if (cached) {
-    log('[INFO] FAST NAV navmesh restored from cache (skipping recompute).');
+    log(
+      `[INFO] FAST NAV navmesh restored from cache (skipping recompute; ` +
+        `environment_scale=${envScale}).`
+    );
     phase('navmesh');
     return finalizeFastNavWithCameraSelect(
       viewer,
-      await finishFastNav(viewer, cached, log),
+      await finishFastNav(viewer, cached, log, 'Fast Nav', null, 'floor_field'),
       cameraSelect,
       keepCameraSelectView,
       log
     );
   }
 
-  // First touch of the splat bytes parses + prunes floaters in the worker.
   phase('prune');
   const fastSeed = await ensureFastCollisionSeed(viewer, bytes, base, log, precomputedSeed);
   const builtField = buildFastFieldSettings(base, fastSeed);
@@ -1002,15 +1413,16 @@ export async function runFastNav(options: FastNavOptions): Promise<FastNavResult
     region_max: base.region_max ?? builtField.region_max,
     region_min: base.region_min ?? builtField.region_min,
   };
-  // buildFastFieldSettings + meshSettings overwrite outdoor knobs — re-apply after merge.
+  if (navSettings.region_min && navSettings.region_max) {
+    navSettings.region_min = [...navSettings.region_min];
+    navSettings.region_max = [...navSettings.region_max];
+  } else {
+    delete navSettings.region_min;
+    delete navSettings.region_max;
+  }
   if (seedCenteredOutdoor) {
     applySeedCenteredOutdoorFieldKnobs(navSettings);
   }
-
-  const floorMeshOptions: FastFloorMeshOptions = {
-    ...(options.floorMesh ?? {}),
-    seedCenteredOutdoor,
-  };
 
   phase('floor');
   const extracted = await extractFloorFieldWithRecovery({
@@ -1050,10 +1462,16 @@ export async function runFastNav(options: FastNavOptions): Promise<FastNavResult
 
   let result: NavWorkerResult | null = null;
   let lastError: unknown = null;
+  phase('navmesh');
   for (const attempt of attempts) {
     log(`[WAIT] Spawning NavMesh worker (${attempt.label})...`);
     try {
-      result = await generateNavmeshInWorker(geometry, attempt.params, 'fast_floor_field', splatBounds);
+      result = await generateNavmeshInWorker(
+        geometry,
+        attempt.params,
+        'fast_floor_field',
+        splatBounds
+      );
       if (attempt.label !== 'strict') {
         log(`[WARN] Fast nav recovered with ${attempt.label} Recast settings.`);
       }
@@ -1078,6 +1496,7 @@ export async function runFastNav(options: FastNavOptions): Promise<FastNavResult
     floorYBand: options.islandValidation?.floorYBand,
     maxSeedDistance: options.islandValidation?.maxSeedDistance,
     mergeNearbyIslands: options.islandValidation?.mergeNearbyIslands,
+    refFloorY: expectedFloorY ?? undefined,
   };
   const safety = filterNavmeshIslandNearSeed(
     result.debugPositions,
@@ -1088,9 +1507,6 @@ export async function runFastNav(options: FastNavOptions): Promise<FastNavResult
   );
   validateFastNavIsland(safety.metadata, effectiveFastSeed, expectedFloorY, log, islandOptions);
 
-  // Persist the validated artifact so an unchanged revisit restores it instead of
-  // recomputing. Best-effort: a storage failure never blocks the pipeline, and we
-  // only cache results that passed validation so we never persist a bad navmesh.
   await putNavmesh(cacheKey, {
     navMeshData: result.navMeshData,
     debugPositions: result.debugPositions,
@@ -1099,7 +1515,7 @@ export async function runFastNav(options: FastNavOptions): Promise<FastNavResult
 
   return finalizeFastNavWithCameraSelect(
     viewer,
-    await finishFastNav(viewer, result, log),
+    await finishFastNav(viewer, result, log, 'Fast Nav', null, 'floor_field'),
     cameraSelect,
     keepCameraSelectView,
     log
@@ -1137,7 +1553,9 @@ export async function finishFastNav(
   artifact: { navMeshData: Uint8Array; debugPositions: Float32Array; debugIndices: Uint32Array },
   log: FastNavLogger,
   pathLabel = 'Fast Nav',
-  seedOriented?: number[] | null
+  seedOriented?: number[] | null,
+  algo: FastNavAlgo = 'floor_field',
+  volume?: CollisionVoxelVolume
 ): Promise<FastNavResult> {
   log('[WAIT] Rendering NavMesh overlay...');
   const spawnWorld = await viewer.displayNavMesh(
@@ -1168,8 +1586,12 @@ export async function finishFastNav(
   log(`[SUCCESS] ${pathLabel} complete: navmesh ready, NPC spawned. Click splats, walls, or ceilings to move.`);
 
   return {
+    algo,
+    debugIndices: artifact.debugIndices,
+    debugPositions: artifact.debugPositions,
     navMeshData: artifact.navMeshData,
     playerSpawn: spawnWorld,
     keptCameraSelectView: false,
+    volume,
   };
 }

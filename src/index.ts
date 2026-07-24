@@ -61,6 +61,8 @@ export * as floor from '@/navigation/floor';
 /** Camera-pose → AABB select region (host toolset; WASM still uses region_min/max). */
 export {
   DEFAULT_CAMERA_SELECT_REGION_OFFSETS,
+  clampPointToAabb,
+  groundAnchoredCameraRegion,
   poseFromCameraSelectView,
   regionBoundsFromCameraPose,
   regionBoundsFromCameraSelect,
@@ -89,3 +91,5 @@ export type {
   WalkableGroundFieldResult,
   ResultContract,
 } from '@/wasm/bridge';
+
+export { sanitizeMeshSettingsForWasm } from '@/wasm/sanitizeMeshSettingsForWasm';

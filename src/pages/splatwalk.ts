@@ -14,7 +14,11 @@ import {
     toCollisionBoundarySettings,
     type CollisionBoundaryArtifact,
 } from '../collision/voxelBoundary';
-import { normalizeSplatToPly, isSupportedSplatFile } from '../wasm/normalize';
+import {
+    isSupportedSplatFile,
+    normalizeSplatToPly,
+    reconcileSplatModelFilename,
+} from '../wasm/normalize';
 import { SliceArchive } from '../wasm/sliceArchive';
 import {
     clampSliceSettingsForScene,
@@ -28,6 +32,7 @@ import { Mesh, VertexData, StandardMaterial, Color3, Tools, Material } from '@ba
 /// <reference types="vite/client" />
 import NavWorker from '../navigation/navmesh.worker?worker';
 import {
+    applySeedCenteredOutdoorFieldKnobs,
     extractFloorFieldWithRecovery,
     resolveRecovery,
     estimateDenseFloorRegion,
@@ -35,10 +40,16 @@ import {
     validateFastNavIsland,
     chooseNpcSpawnPoint,
     FAST_NAV_RECAST_ATTEMPTS,
+    pinFastNavRegionIfNeeded,
     type RecastParams,
     type NavIslandMetadata,
 } from '../navigation/fastNav';
+import {
+    buildFastNavCacheSignature,
+    FAST_NAV_FLOOR_PIPELINE,
+} from '../navigation/fastNavCacheSignature';
 import { buildNavmeshKey, getNavmesh, putNavmesh } from '../navigation/navmeshCache';
+import { requireSdfMcColliderMesh } from '../navigation/sdfMcColliderOverlay';
 import {
     DEFAULT_CAMERA_SELECT_REGION_OFFSETS,
     regionBoundsFromCameraSelect,
@@ -47,16 +58,274 @@ import {
 import {
     buildMinimalNavArtifactBundle,
     downloadNavArtifactZip,
-    parseNavArtifactFiles,
+    rebuildNavArtifactBundleFromLiveMesh,
     type NavArtifactBundle,
 } from '../navigation/navArtifactBundle';
+import { downloadNavKitZip, parseNavKitFile, peekNavKitMeta } from '../navigation/navKitBundle';
+import {
+    emptyNavKitCameraPoseInfo,
+    emptyNavKitPlayerPoseInfo,
+    formatNavKitCameraCopyText,
+    formatNavKitPlayerCopyText,
+    formatPoseEulerLabel,
+    formatPosePositionLabel,
+    type NavKitCameraPoseInfo,
+    type NavKitPlayerPoseInfo,
+} from '../navigation/navKitPoseInfo';
 import { applyNavArtifactsToViewer } from '../navigation/applyNavArtifacts';
+import { applyNavKitMetaToViewer } from '../navigation/applyNavKitMeta';
+import {
+    ACTIVE_NAVIGATION_MODE_OPTIONS,
+    DEFAULT_ACTIVE_NAVIGATION_MODE,
+    activateNavBackend,
+    activeNavigationModeDisabledReason,
+    initialLiveBackendForActiveMode,
+    liveNavBackendLabel,
+    navCapabilitiesFromParts,
+    type ActiveNavigationMode,
+    type LiveNavBackend,
+} from '../navigation/activeNavigation';
+import {
+    DEFAULT_NAV_KIT_CONTROLS_MODE_NEW,
+    NAV_KIT_WASDQE_LEGEND,
+    type NavKitControlsMode,
+} from '../navigation/navKitContract';
+import { resolveActiveNavigationChange } from '../navigation/demoActiveNavigation';
+import {
+    DEFAULT_OUTDOOR_DEMO_NAV_SETTINGS,
+    DEMO_NAV_SLIDER_FIELDS,
+    demoNavSettingsForSceneType,
+    demoNavSettingsToFastNavTuning,
+    type DemoNavSettings,
+} from '../navigation/navSettings';
 import { registerServiceWorker, setupOfflineHandling } from '../pwa/sw-register';
+import type { CollisionVoxelVolume } from '../wasm/bridge';
 
 async function main() {
     const canvas = document.getElementById('renderCanvas') as HTMLCanvasElement;
     const logDiv = document.getElementById('systemLogsContent') as HTMLDivElement;
     const errorDiv = document.getElementById('error') as HTMLDivElement;
+
+    let playgroundLiveBackend: LiveNavBackend = 'none';
+    let playgroundSessionVolume: CollisionVoxelVolume | null = null;
+    let playgroundSessionRecast: Uint8Array | null = null;
+    let playgroundSessionSeed: number[] | null = null;
+    let playgroundSessionSpawn: [number, number, number] | null = null;
+
+    const mountDemoNavSettings = (): void => {
+        const mount = document.getElementById('demoNavSettingsMount');
+        if (!mount || mount.dataset.mounted === '1') {
+            return;
+        }
+        mount.dataset.mounted = '1';
+        let section = '';
+        for (const field of DEMO_NAV_SLIDER_FIELDS) {
+            if (field.section !== section) {
+                section = field.section;
+                const title = document.createElement('div');
+                title.className = 'section-title nav-section-title';
+                title.textContent = section === 'floor' ? 'Floor coverage' : 'Recast agent';
+                mount.appendChild(title);
+            }
+            const row = document.createElement('div');
+            row.className = 'control-row';
+            const label = document.createElement('label');
+            label.title = field.label;
+            label.textContent = `${field.label}:`;
+            const input = document.createElement('input');
+            input.type = 'number';
+            input.id = `demoNav_${field.key}`;
+            input.min = String(field.min);
+            input.max = String(field.max);
+            input.step = String(field.step);
+            input.value = String(
+                DEFAULT_OUTDOOR_DEMO_NAV_SETTINGS[field.key]
+            );
+            row.appendChild(label);
+            row.appendChild(input);
+            mount.appendChild(row);
+        }
+        const pruneRow = document.createElement('div');
+        pruneRow.className = 'control-row';
+        pruneRow.innerHTML =
+            '<label title="WASM floater prune">Prune floaters:</label>' +
+            '<label class="toggle-switch"><input type="checkbox" id="demoNav_pruneFloaters" checked>' +
+            '<span class="slider"></span></label>';
+        mount.prepend(pruneRow);
+    };
+
+    const readDemoNavSettings = (): DemoNavSettings => {
+        const technique =
+            (document.getElementById('paramNavTechnique') as HTMLSelectElement | null)?.value ??
+            'floor_field';
+        // HEAD / prod floor_field uses outdoor-wide bands; indoor/outdoor presets for voxel/SDF-MC.
+        const base =
+            technique === 'floor_field'
+                ? { ...DEFAULT_OUTDOOR_DEMO_NAV_SETTINGS }
+                : demoNavSettingsForSceneType(
+                      (document.getElementById('paramCollisionSceneType') as HTMLSelectElement | null)
+                          ?.value === 'outdoor'
+                          ? 'outdoor'
+                          : 'indoor'
+                  );
+        const readNum = (key: keyof DemoNavSettings, fallback: number): number => {
+            const el = document.getElementById(`demoNav_${key}`) as HTMLInputElement | null;
+            const n = el ? Number(el.value) : NaN;
+            return Number.isFinite(n) ? n : fallback;
+        };
+        const pruneEl = document.getElementById('demoNav_pruneFloaters') as HTMLInputElement | null;
+        return {
+            ...base,
+            sameLevelBelow: readNum('sameLevelBelow', base.sameLevelBelow),
+            sameLevelAbove: readNum('sameLevelAbove', base.sameLevelAbove),
+            holeFillRadius: readNum('holeFillRadius', base.holeFillRadius),
+            sdfCellSize: readNum('sdfCellSize', base.sdfCellSize),
+            sdfDensityThreshold: readNum('sdfDensityThreshold', base.sdfDensityThreshold),
+            maxLocalHeightVariance: readNum('maxLocalHeightVariance', base.maxLocalHeightVariance),
+            walkableSlopeAngle: readNum('walkableSlopeAngle', base.walkableSlopeAngle),
+            walkableRadius: readNum('walkableRadius', base.walkableRadius),
+            walkableClimb: readNum('walkableClimb', base.walkableClimb),
+            minRegionArea: readNum('minRegionArea', base.minRegionArea),
+            maxIslandSeedDistance: readNum('maxIslandSeedDistance', base.maxIslandSeedDistance),
+            cellBandBelow: readNum('cellBandBelow', base.cellBandBelow),
+            cellBandAbove: readNum('cellBandAbove', base.cellBandAbove),
+            pruneFloaters: pruneEl ? pruneEl.checked : base.pruneFloaters,
+        };
+    };
+
+    const applyDemoNavSettingsToInputs = (settings: DemoNavSettings): void => {
+        for (const field of DEMO_NAV_SLIDER_FIELDS) {
+            const el = document.getElementById(`demoNav_${field.key}`) as HTMLInputElement | null;
+            if (el) {
+                el.value = String(settings[field.key]);
+            }
+        }
+        const pruneEl = document.getElementById('demoNav_pruneFloaters') as HTMLInputElement | null;
+        if (pruneEl) {
+            pruneEl.checked = settings.pruneFloaters;
+        }
+        const slope = document.getElementById('paramNavSlope') as HTMLInputElement | null;
+        const radius = document.getElementById('paramNavRadius') as HTMLInputElement | null;
+        const climb = document.getElementById('paramNavClimb') as HTMLInputElement | null;
+        if (slope) {
+            slope.value = String(settings.walkableSlopeAngle);
+        }
+        if (radius) {
+            radius.value = String(settings.walkableRadius);
+        }
+        if (climb) {
+            climb.value = String(settings.walkableClimb);
+        }
+    };
+
+    const updateActiveNavLiveHint = (): void => {
+        const hint = document.getElementById('activeNavLiveHint');
+        if (hint) {
+            hint.textContent = `Live: ${liveNavBackendLabel(playgroundLiveBackend)}`;
+        }
+    };
+
+    mountDemoNavSettings();
+    updateActiveNavLiveHint();
+
+    const sceneTypeSelect = document.getElementById(
+        'paramCollisionSceneType'
+    ) as HTMLSelectElement | null;
+    sceneTypeSelect?.addEventListener('change', () => {
+        const sceneType = sceneTypeSelect.value === 'outdoor' ? 'outdoor' : 'indoor';
+        const technique =
+            (document.getElementById('paramNavTechnique') as HTMLSelectElement | null)?.value ??
+            'floor_field';
+        const pruneEl = document.getElementById('demoNav_pruneFloaters') as HTMLInputElement | null;
+        if (technique === 'floor_field') {
+            console.log(
+                `[INFO] Scene type → ${sceneType} (floor_field keeps outdoor DemoNavSettings like HEAD).`
+            );
+            return;
+        }
+        applyDemoNavSettingsToInputs(
+            demoNavSettingsForSceneType(sceneType, {
+                preservePrune: pruneEl?.checked ?? true,
+            })
+        );
+        console.log(`[INFO] Scene type → ${sceneType}; applied DemoNavSettings preset.`);
+    });
+
+    document.getElementById('resetDemoNavSettingsBtn')?.addEventListener('click', () => {
+        const technique =
+            (document.getElementById('paramNavTechnique') as HTMLSelectElement | null)?.value ??
+            'floor_field';
+        const pruneEl = document.getElementById('demoNav_pruneFloaters') as HTMLInputElement | null;
+        if (technique === 'floor_field') {
+            applyDemoNavSettingsToInputs({
+                ...DEFAULT_OUTDOOR_DEMO_NAV_SETTINGS,
+                pruneFloaters: pruneEl?.checked ?? true,
+            });
+            console.log('[INFO] Navmesh settings reset to outdoor defaults (floor_field / HEAD).');
+            return;
+        }
+        const sceneType = sceneTypeSelect?.value === 'outdoor' ? 'outdoor' : 'indoor';
+        applyDemoNavSettingsToInputs(
+            demoNavSettingsForSceneType(sceneType, {
+                preservePrune: pruneEl?.checked ?? true,
+            })
+        );
+        console.log(`[INFO] Navmesh settings reset to ${sceneType} defaults.`);
+    });
+
+    document.getElementById('paramNavTechnique')?.addEventListener('change', () => {
+        const technique =
+            (document.getElementById('paramNavTechnique') as HTMLSelectElement | null)?.value ??
+            'floor_field';
+        const pruneEl = document.getElementById('demoNav_pruneFloaters') as HTMLInputElement | null;
+        if (technique === 'floor_field') {
+            applyDemoNavSettingsToInputs({
+                ...DEFAULT_OUTDOOR_DEMO_NAV_SETTINGS,
+                pruneFloaters: pruneEl?.checked ?? true,
+            });
+            console.log('[INFO] floor_field: restored outdoor DemoNavSettings (HEAD/prod parity).');
+            return;
+        }
+        const sceneType = sceneTypeSelect?.value === 'outdoor' ? 'outdoor' : 'indoor';
+        applyDemoNavSettingsToInputs(
+            demoNavSettingsForSceneType(sceneType, {
+                preservePrune: pruneEl?.checked ?? true,
+            })
+        );
+        console.log(`[INFO] Applied ${sceneType} DemoNavSettings for ${technique}.`);
+    });
+
+    const activeNavSelect = document.getElementById(
+        'paramActiveNavigationMode'
+    ) as HTMLSelectElement | null;
+    if (activeNavSelect) {
+        activeNavSelect.innerHTML = '';
+        for (const option of ACTIVE_NAVIGATION_MODE_OPTIONS) {
+            const opt = document.createElement('option');
+            opt.value = option.value;
+            opt.textContent = option.title;
+            opt.title = option.subtitle;
+            activeNavSelect.appendChild(opt);
+        }
+        activeNavSelect.value = DEFAULT_ACTIVE_NAVIGATION_MODE;
+    }
+    const controlsModeSelect = document.getElementById(
+        'paramControlsMode'
+    ) as HTMLSelectElement | null;
+    const controlsModeHint = document.getElementById('controlsModeHint');
+    const syncControlsModeUi = (mode: NavKitControlsMode, hasCrowd: boolean): void => {
+        if (controlsModeSelect) {
+            controlsModeSelect.disabled = !hasCrowd;
+            controlsModeSelect.value = mode;
+        }
+        if (controlsModeHint) {
+            controlsModeHint.textContent =
+                mode === 'click_to_move'
+                    ? 'Click the navmesh to move'
+                    : `${NAV_KIT_WASDQE_LEGEND} (when WASDQE or Both)`;
+        }
+    };
+    syncControlsModeUi(DEFAULT_NAV_KIT_CONTROLS_MODE_NEW, false);
 
     // Custom Logger
     const originalLog = console.log;
@@ -258,8 +527,37 @@ async function main() {
     let currentMat: StandardMaterial | null = null;
     let generatedCollisionArtifact: CollisionBoundaryArtifact | null = null;
     let generatedNavArtifactBundle: NavArtifactBundle | null = null;
+    let generatedNavData: Uint8Array | null = null;
+    /** Original model bytes for NavKit download (pre-normalize). */
+    let workbenchModelSourceBytes: Uint8Array | null = null;
+    let workbenchModelFilename = 'model.ply';
     let pendingWorkbenchCameraSelect: CameraSelectRegionInput | null = null;
     let importedColliderGeometry: { positions: Float32Array, indices: Uint32Array } | null = null;
+
+    /** Mirror Vuetify/React hasNavKit: enable toolbar NavKit when pack + model exist. */
+    const syncWorkbenchNavKitDownloadUi = (): void => {
+        const canNavKit = Boolean(
+            generatedNavArtifactBundle &&
+                workbenchModelSourceBytes &&
+                workbenchModelSourceBytes.byteLength > 0
+        );
+        const toolbar = document.getElementById(
+            'downloadNavKitToolbarBtn'
+        ) as HTMLButtonElement | null;
+        if (toolbar) {
+            toolbar.disabled = !canNavKit;
+            toolbar.setAttribute('aria-disabled', canNavKit ? 'false' : 'true');
+            toolbar.title = canNavKit
+                ? 'Download NavKit (navkit.zip — model + baked nav)'
+                : 'Download NavKit (navkit.zip — model + baked nav). Run Fast Nav first.';
+        }
+        const legacyBtn = document.getElementById(
+            'downloadNavArtifactsBtn'
+        ) as HTMLButtonElement | null;
+        if (legacyBtn) {
+            legacyBtn.style.display = generatedNavArtifactBundle ? 'block' : 'none';
+        }
+    };
 
     if (showMeshCheckbox) {
         showMeshCheckbox.addEventListener('change', () => {
@@ -374,6 +672,204 @@ async function main() {
             (window as unknown as { __splatwalkViewer?: Viewer }).__splatwalkViewer = viewer;
         }
 
+        controlsModeSelect?.addEventListener('change', () => {
+            const mode = controlsModeSelect.value as NavKitControlsMode;
+            viewer.setControlsMode(mode);
+            syncControlsModeUi(mode, playgroundLiveBackend !== 'none');
+            console.log(`[INFO] Controls mode: ${mode}.`);
+        });
+
+        const cameraInfoPanel = document.getElementById('cameraInfoPanel') as HTMLDetailsElement | null;
+        const playerInfoPanel = document.getElementById('playerInfoPanel') as HTMLDetailsElement | null;
+        const cameraInfoPositionEl = document.getElementById('cameraInfoPosition');
+        const cameraInfoEulerEl = document.getElementById('cameraInfoEuler');
+        const cameraInfoCopyTextEl = document.getElementById('cameraInfoCopyText');
+        const playerInfoPositionEl = document.getElementById('playerInfoPosition');
+        const playerInfoYawEl = document.getElementById('playerInfoYaw');
+        const playerInfoCopyTextEl = document.getElementById('playerInfoCopyText');
+        const copyCameraPoseBtn = document.getElementById('copyCameraPoseBtn');
+        const copyPlayerPoseBtn = document.getElementById('copyPlayerPoseBtn');
+        const goToPlayerBtn = document.getElementById('goToPlayerBtn') as HTMLButtonElement | null;
+        let poseInfoRafId = 0;
+        let latestCameraInfo: NavKitCameraPoseInfo = emptyNavKitCameraPoseInfo();
+        let latestPlayerInfo: NavKitPlayerPoseInfo = emptyNavKitPlayerPoseInfo();
+
+        const sampleWorkbenchPoseInfoOnce = (): void => {
+            const cam = viewer.getCameraPoseNavKit();
+            if (cam) {
+                latestCameraInfo = {
+                    eulerDegrees: { ...cam.eulerDegrees },
+                    mode: null,
+                    position: { ...cam.position },
+                    target: { ...cam.target },
+                };
+            } else {
+                latestCameraInfo = emptyNavKitCameraPoseInfo();
+            }
+            const player = viewer.getPlayerPoseNavKit();
+            if (player) {
+                latestPlayerInfo = {
+                    available: true,
+                    eulerDegrees: { ...player.eulerDegrees },
+                    position: { ...player.position },
+                };
+            } else {
+                latestPlayerInfo = emptyNavKitPlayerPoseInfo();
+            }
+            if (cameraInfoPositionEl) {
+                cameraInfoPositionEl.textContent = formatPosePositionLabel(latestCameraInfo.position);
+            }
+            if (cameraInfoEulerEl) {
+                cameraInfoEulerEl.textContent = formatPoseEulerLabel(latestCameraInfo.eulerDegrees);
+            }
+            if (cameraInfoCopyTextEl) {
+                cameraInfoCopyTextEl.textContent = formatNavKitCameraCopyText(latestCameraInfo);
+            }
+            if (playerInfoPositionEl) {
+                playerInfoPositionEl.textContent = latestPlayerInfo.available
+                    ? formatPosePositionLabel(latestPlayerInfo.position)
+                    : '—';
+            }
+            if (playerInfoYawEl) {
+                playerInfoYawEl.textContent = latestPlayerInfo.available
+                    ? `${latestPlayerInfo.eulerDegrees.y.toFixed(1)}°`
+                    : '—';
+            }
+            if (playerInfoCopyTextEl) {
+                playerInfoCopyTextEl.textContent = formatNavKitPlayerCopyText(latestPlayerInfo);
+            }
+            if (copyPlayerPoseBtn instanceof HTMLButtonElement) {
+                copyPlayerPoseBtn.disabled = !latestPlayerInfo.available;
+            }
+            if (goToPlayerBtn) {
+                goToPlayerBtn.disabled = !latestPlayerInfo.available;
+            }
+        };
+
+        const tickWorkbenchPoseInfo = (): void => {
+            const camOpen = cameraInfoPanel?.open === true;
+            const playerOpen = playerInfoPanel?.open === true;
+            if (!camOpen && !playerOpen) {
+                poseInfoRafId = 0;
+                return;
+            }
+            sampleWorkbenchPoseInfoOnce();
+            poseInfoRafId = requestAnimationFrame(tickWorkbenchPoseInfo);
+        };
+
+        const syncWorkbenchPoseInfoSampling = (): void => {
+            const camOpen = cameraInfoPanel?.open === true;
+            const playerOpen = playerInfoPanel?.open === true;
+            if (!camOpen && !playerOpen) {
+                if (poseInfoRafId !== 0) {
+                    cancelAnimationFrame(poseInfoRafId);
+                    poseInfoRafId = 0;
+                }
+                return;
+            }
+            if (poseInfoRafId !== 0) {
+                return;
+            }
+            sampleWorkbenchPoseInfoOnce();
+            poseInfoRafId = requestAnimationFrame(tickWorkbenchPoseInfo);
+        };
+
+        cameraInfoPanel?.addEventListener('toggle', syncWorkbenchPoseInfoSampling);
+        playerInfoPanel?.addEventListener('toggle', syncWorkbenchPoseInfoSampling);
+
+        copyCameraPoseBtn?.addEventListener('click', () => {
+            void navigator.clipboard.writeText(formatNavKitCameraCopyText(latestCameraInfo)).then(
+                () => {
+                    console.log('[SUCCESS] Copied camera NavKit pose.');
+                },
+                () => {
+                    console.warn('[WARN] Could not copy camera pose.');
+                }
+            );
+        });
+
+        copyPlayerPoseBtn?.addEventListener('click', () => {
+            if (!latestPlayerInfo.available) {
+                console.warn('[WARN] No player pose to copy.');
+                return;
+            }
+            void navigator.clipboard.writeText(formatNavKitPlayerCopyText(latestPlayerInfo)).then(
+                () => {
+                    console.log('[SUCCESS] Copied player NavKit pose.');
+                },
+                () => {
+                    console.warn('[WARN] Could not copy player pose.');
+                }
+            );
+        });
+
+        goToPlayerBtn?.addEventListener('click', () => {
+            const framing = viewer.focusOnPlayer();
+            if (framing) {
+                console.log(
+                    `[SUCCESS] Go to Player — top-down at ` +
+                        `${framing.player.map((v) => v.toFixed(2)).join(', ')}.`
+                );
+                return;
+            }
+            console.warn('[WARN] Go to Player: no player agent.');
+        });
+
+        activeNavSelect?.addEventListener('change', () => {
+            void (async () => {
+                const mode = (activeNavSelect.value || 'recast') as ActiveNavigationMode;
+                const technique =
+                    (document.getElementById('paramNavGenerationMode') as HTMLSelectElement | null)
+                        ?.value ?? 'floor_field';
+                const previousMode = (activeNavSelect.dataset.prevMode || 'recast') as ActiveNavigationMode;
+                const reason = activeNavigationModeDisabledReason({
+                    algo: technique,
+                    caps: navCapabilitiesFromParts({
+                        recastBin: playgroundSessionRecast,
+                        volume: playgroundSessionVolume,
+                    }),
+                    liveBackend: playgroundLiveBackend,
+                    mode,
+                });
+                if (reason && mode !== 'recast') {
+                    console.warn(`[WARN] ${reason}`);
+                    activeNavSelect.value = previousMode;
+                    return;
+                }
+                const result = await resolveActiveNavigationChange({
+                    caps: navCapabilitiesFromParts({
+                        recastBin: playgroundSessionRecast,
+                        volume: playgroundSessionVolume,
+                    }),
+                    liveBackend: playgroundLiveBackend,
+                    mode,
+                    onLog: (message) => console.log(message),
+                    previousMode,
+                    recastBin: playgroundSessionRecast,
+                    seed: playgroundSessionSeed,
+                    spawnHint: playgroundSessionSpawn,
+                    viewer,
+                    volume: playgroundSessionVolume,
+                });
+                playgroundLiveBackend = result.liveBackend;
+                if (!result.applied) {
+                    activeNavSelect.value = result.revertToMode ?? previousMode;
+                    console.warn(
+                        `[WARN] ${
+                            result.failureMessage ??
+                            'Could not switch Live locomotion — missing volume or Recast assets.'
+                        }`
+                    );
+                } else {
+                    activeNavSelect.dataset.prevMode = mode;
+                }
+                updateActiveNavLiveHint();
+            })();
+        });
+        if (activeNavSelect) {
+            activeNavSelect.dataset.prevMode = activeNavSelect.value || 'recast';
+        }
+
         document.getElementById('downloadFastNavKitBtn')?.addEventListener('click', () => {
             downloadIntegrationKit('babylon-workbench');
         });
@@ -420,9 +916,26 @@ async function main() {
         const colliderGlbInput = document.getElementById('colliderGlbInput') as HTMLInputElement | null;
         const colliderGlbBtn = document.getElementById('colliderGlbBtn') as HTMLButtonElement | null;
         const showColliderCheckbox = document.getElementById('showColliderMesh') as HTMLInputElement | null;
+        const showColliderMeshLabel = document.getElementById('showColliderMeshLabel') as HTMLLabelElement | null;
         const colliderOpacitySlider = document.getElementById('colliderOpacity') as HTMLInputElement | null;
         const showNavMeshCheckbox = document.getElementById('showNavMesh') as HTMLInputElement | null;
         const navMeshOpacitySlider = document.getElementById('navMeshOpacity') as HTMLInputElement | null;
+        const navGenerationModeSelect = document.getElementById(
+            'paramNavGenerationMode'
+        ) as HTMLSelectElement | null;
+
+        const syncShowColliderLabel = (): void => {
+            if (!showColliderMeshLabel) {
+                return;
+            }
+            const isSdfMc = navGenerationModeSelect?.value === 'sdf_marching_cubes';
+            showColliderMeshLabel.textContent = isSdfMc ? 'Show MC shell (cyan):' : 'Show Collider:';
+            showColliderMeshLabel.title = isSdfMc
+                ? 'Cyan interior MC shell from SDF Marching Cubes (generated or imported).'
+                : 'Visible when a collider mesh is generated or imported.';
+        };
+        syncShowColliderLabel();
+        navGenerationModeSelect?.addEventListener('change', syncShowColliderLabel);
 
         const applyNavMeshDisplayState = (): void => {
             if (showNavMeshCheckbox) {
@@ -485,18 +998,262 @@ async function main() {
             viewer.setNavMeshOpacity(Number.parseFloat(navMeshOpacitySlider.value));
         });
 
+        const navMeshEditorEnabled = document.getElementById(
+            'navMeshEditorEnabled'
+        ) as HTMLInputElement | null;
+        const navMeshEditorMode = document.getElementById(
+            'navMeshEditorMode'
+        ) as HTMLSelectElement | null;
+        const navMeshEditorStatus = document.getElementById('navMeshEditorStatus');
+        const navMeshEditorGlobalRow = document.getElementById(
+            'navMeshEditorGlobalRow'
+        );
+        const navMeshEditorFillBtn = document.getElementById(
+            'navMeshEditorFillBtn'
+        ) as HTMLButtonElement | null;
+        const navMeshEditorDeleteBtn = document.getElementById(
+            'navMeshEditorDeleteBtn'
+        ) as HTMLButtonElement | null;
+        const navMeshEditorApplyRow = document.getElementById(
+            'navMeshEditorApplyRow'
+        );
+        const navMeshEditorApplyBtn = document.getElementById(
+            'navMeshEditorApplyBtn'
+        ) as HTMLButtonElement | null;
+        const syncNavMeshEditorUi = (): void => {
+            const st = viewer.getNavMeshEditorStatus();
+            if (!navMeshEditorStatus) {
+                return;
+            }
+            if (!st || !st.enabled) {
+                navMeshEditorStatus.textContent = 'Off';
+                if (navMeshEditorGlobalRow) {
+                    navMeshEditorGlobalRow.style.display = 'none';
+                }
+                if (navMeshEditorApplyRow) {
+                    navMeshEditorApplyRow.style.display = 'none';
+                }
+                if (navMeshEditorFillBtn) {
+                    navMeshEditorFillBtn.disabled = true;
+                }
+                if (navMeshEditorDeleteBtn) {
+                    navMeshEditorDeleteBtn.disabled = true;
+                }
+                return;
+            }
+            if (navMeshEditorMode && navMeshEditorMode.value !== st.mode) {
+                navMeshEditorMode.value = st.mode;
+            }
+            const parts = [
+                st.mode,
+                st.brushFollow ? 'follow' : 'pinned',
+                `${st.selectedCount} sel`,
+                `r=${st.brushRadius.toFixed(2)}`,
+            ];
+            if (st.holeDetected) {
+                parts.push('hole');
+            }
+            if (st.hasPendingLiveApply) {
+                parts.push('pending apply');
+            }
+            if (st.rebaking) {
+                parts.push('applying…');
+            }
+            if (st.message) {
+                parts.push(st.message);
+            }
+            navMeshEditorStatus.textContent = parts.join(' · ');
+            if (navMeshEditorGlobalRow) {
+                navMeshEditorGlobalRow.style.display =
+                    st.mode === 'global' ? 'flex' : 'none';
+            }
+            if (navMeshEditorFillBtn) {
+                navMeshEditorFillBtn.disabled =
+                    st.mode !== 'circle' || !st.holeDetected || st.rebaking;
+                navMeshEditorFillBtn.textContent = 'FILL (F)';
+            }
+            if (navMeshEditorDeleteBtn) {
+                const canDelete =
+                    (st.mode === 'vertex' || st.mode === 'circle') &&
+                    st.selectedCount > 0 &&
+                    !st.rebaking;
+                navMeshEditorDeleteBtn.disabled = !canDelete;
+                navMeshEditorDeleteBtn.textContent = st.rebaking
+                    ? 'DELETING…'
+                    : 'DELETE (X)';
+            }
+            if (navMeshEditorApplyRow) {
+                navMeshEditorApplyRow.style.display = st.hasPendingLiveApply
+                    ? 'flex'
+                    : 'none';
+            }
+            if (navMeshEditorApplyBtn) {
+                navMeshEditorApplyBtn.disabled =
+                    !st.hasPendingLiveApply || st.rebaking;
+            }
+        };
+        viewer.onNavMeshEditorStatus(() => {
+            syncNavMeshEditorUi();
+        });
+        viewer.onEditedNavMeshRebake(async (result) => {
+            generatedNavData = result.navMeshData;
+            playgroundSessionRecast = result.navMeshData;
+            const region = viewer.getWasmRegionBounds();
+            const collisionGlb = generatedCollisionArtifact?.result.glb ?? null;
+            const spawnPos = viewer.getPlayerPoseNavKit()?.position ?? null;
+            generatedNavArtifactBundle = await buildMinimalNavArtifactBundle({
+                collisionGlb,
+                debugIndices: result.debugIndices,
+                debugPositions: result.debugPositions,
+                navMeshData: result.navMeshData,
+                playerSpawn: spawnPos
+                    ? [spawnPos.x, spawnPos.y, spawnPos.z]
+                    : playgroundSessionSpawn,
+                regionMax: region?.max ?? null,
+                regionMin: region?.min ?? null,
+                volume: playgroundSessionVolume,
+            });
+            syncWorkbenchNavKitDownloadUi();
+            console.log(
+                '[INFO] NavMesh Editor rebake synced to workbench NavKit artifacts.'
+            );
+        });
+        navMeshEditorEnabled?.addEventListener('change', () => {
+            viewer.setNavMeshEditorEnabled(!!navMeshEditorEnabled.checked);
+            syncNavMeshEditorUi();
+        });
+        navMeshEditorMode?.addEventListener('change', () => {
+            const mode = navMeshEditorMode.value;
+            if (mode === 'vertex' || mode === 'circle' || mode === 'global') {
+                viewer.setNavMeshEditorMode(mode);
+            }
+            syncNavMeshEditorUi();
+        });
+        document.getElementById('navMeshEditorYUp')?.addEventListener('click', () => {
+            viewer.navMeshEditorGlobalY(1);
+            syncNavMeshEditorUi();
+        });
+        document.getElementById('navMeshEditorYDown')?.addEventListener('click', () => {
+            viewer.navMeshEditorGlobalY(-1);
+            syncNavMeshEditorUi();
+        });
+        navMeshEditorFillBtn?.addEventListener('click', () => {
+            viewer.navMeshEditorFillHole();
+            syncNavMeshEditorUi();
+        });
+        navMeshEditorDeleteBtn?.addEventListener('click', () => {
+            void viewer.navMeshEditorDeleteVertices().then(() => {
+                syncNavMeshEditorUi();
+            });
+        });
+        navMeshEditorApplyBtn?.addEventListener('click', () => {
+            void viewer.applyNavMeshEditorToLive().then(() => {
+                syncNavMeshEditorUi();
+            });
+        });
+
         // Resize handling for Fullscreen
         document.addEventListener('fullscreenchange', () => {
             // Small delay to ensure browser layout is updated
             setTimeout(() => viewer.resize(), 50);
         });
 
+        /** Load a NavKit zip: model + baked nav (no Fast Nav recompute). */
+        const loadWorkbenchNavKit = async (file: File): Promise<void> => {
+            errorDiv.style.display = 'none';
+            document.getElementById('resultSection')!.style.display = 'none';
+            document.getElementById('setupSection')!.style.display = 'block';
+            toggleSettings(true);
+            try {
+                console.log(`[WAIT] Loading NavKit: ${file.name}…`);
+                const kit = await parseNavKitFile(file);
+                console.log(
+                    `[INFO] NavKit meta: technique=${kit.meta.defaultNavTechnique}` +
+                        ` active=${kit.meta.defaultActiveNavigationMode}` +
+                        ` locomotion=${kit.meta.defaultLocomotionMode}.`
+                );
+                const techniqueSelect = document.getElementById(
+                    'paramNavGenerationMode'
+                ) as HTMLSelectElement | null;
+                if (techniqueSelect) {
+                    techniqueSelect.value = kit.meta.defaultNavTechnique;
+                }
+                const activeSelect = document.getElementById(
+                    'paramActiveNavigationMode'
+                ) as HTMLSelectElement | null;
+                if (activeSelect) {
+                    activeSelect.value = kit.meta.defaultActiveNavigationMode;
+                    activeSelect.dataset.prevMode = kit.meta.defaultActiveNavigationMode;
+                }
+                workbenchModelSourceBytes = kit.modelBytes;
+                workbenchModelFilename = kit.meta.model.filename;
+                const ply = await normalizeSplatToPly(kit.modelFile);
+                await viewer.loadGaussianSplat(ply);
+                generatedCollisionArtifact = null;
+                generatedNavArtifactBundle = kit.navParsed.bundle;
+                playgroundSessionRecast = kit.navParsed.bundle.recastNavmeshBin ?? null;
+                playgroundSessionVolume = kit.navParsed.volume;
+                const spawn = kit.navParsed.session.playerSpawn ?? kit.navParsed.session.collisionSeed;
+                playgroundSessionSeed =
+                    spawn && spawn.length >= 3 ? [spawn[0]!, spawn[1]!, spawn[2]!] : null;
+                playgroundSessionSpawn =
+                    kit.navParsed.session.playerSpawn && kit.navParsed.session.playerSpawn.length >= 3
+                        ? [
+                              kit.navParsed.session.playerSpawn[0]!,
+                              kit.navParsed.session.playerSpawn[1]!,
+                              kit.navParsed.session.playerSpawn[2]!,
+                          ]
+                        : null;
+                viewer.clearNavArtifacts();
+                await applyNavArtifactsToViewer({
+                    focusCamera: false,
+                    onLog: (message) => console.log(message),
+                    parsed: kit.navParsed,
+                    viewer,
+                });
+                const metaApplied = applyNavKitMetaToViewer({
+                    meta: kit.meta,
+                    onLog: (message) => console.log(message),
+                    parsed: kit.navParsed,
+                    viewer,
+                });
+                playgroundLiveBackend =
+                    kit.meta.defaultLocomotionMode === 'voxel_walk' ||
+                    kit.navParsed.session.locomotionMode === 'voxel_walk'
+                        ? 'voxel_walk'
+                        : 'recast_crowd';
+                syncControlsModeUi(metaApplied.controlsMode, playgroundLiveBackend !== 'none');
+                syncWorkbenchNavKitDownloadUi();
+                const downloadNavBtn = document.getElementById('downloadNavBtn') as HTMLButtonElement | null;
+                if (downloadNavBtn && playgroundSessionRecast) {
+                    downloadNavBtn.style.display = 'block';
+                }
+                const simulationSection = document.getElementById(
+                    'simulationSection'
+                ) as HTMLDivElement | null;
+                if (simulationSection) {
+                    simulationSection.style.display = 'block';
+                }
+                (document.getElementById('resultSection') as HTMLElement | null)!.style.display =
+                    'block';
+                console.log(`[SUCCESS] NavKit loaded (${kit.meta.slug}).`);
+            } catch (error) {
+                logError(`NavKit load failed: ${error}`);
+            }
+        };
+
         // Helper to load and setup a file (drag or dropdown)
         const handleFileLoad = async (file: File) => {
             console.log(`[INFO] Loading file: ${file.name} (${file.size} bytes)`);
 
+            const kitMeta = await peekNavKitMeta(file);
+            if (kitMeta) {
+                await loadWorkbenchNavKit(file);
+                return;
+            }
+
             if (!isSupportedSplatFile(file.name)) {
-                logError("Only .ply, .spz, and .splat files are supported.");
+                logError('Only .ply, .spz, .splat, or a valid navkit.zip are supported.');
                 return;
             }
 
@@ -508,6 +1265,11 @@ async function main() {
             toggleSettings(true);
 
             console.log("[WAIT] Processing file...");
+            generatedNavArtifactBundle = null;
+            generatedNavData = null;
+            workbenchModelSourceBytes = new Uint8Array(await file.arrayBuffer());
+            workbenchModelFilename = file.name;
+            syncWorkbenchNavKitDownloadUi();
 
             // Normalize any supported splat (.ply/.spz/.splat) to full-fidelity PLY
             // once, then reuse those bytes for both the viewer and the nav pipeline.
@@ -640,7 +1402,6 @@ async function main() {
                 }
             })();
 
-            let generatedNavData: Uint8Array | null = null;
             // Track whether a navmesh has been built and which path produced it, so a manual
             // splat rotation can re-run the same generation and keep the navmesh, spawn point
             // and agents aligned with the re-oriented splat.
@@ -801,14 +1562,52 @@ async function main() {
                 if (downloadNavBtn) downloadNavBtn.style.display = 'block';
 
                 console.log("[WAIT] Initializing NPC Crowd Simulation...");
-                await viewer.initCrowd(artifact.navMeshData, spawnPoint);
+                playgroundSessionRecast = artifact.navMeshData;
+                playgroundSessionVolume = generatedCollisionArtifact?.result.volume ?? null;
+                playgroundSessionSeed = effectiveFastSeed ? [...effectiveFastSeed] : null;
+                playgroundSessionSpawn = spawnPoint
+                    ? [spawnPoint.x, spawnPoint.y, spawnPoint.z]
+                    : null;
+                const activeMode =
+                    ((document.getElementById('paramActiveNavigationMode') as HTMLSelectElement | null)
+                        ?.value as ActiveNavigationMode | undefined) ?? 'recast';
+                const technique =
+                    (document.getElementById('paramNavGenerationMode') as HTMLSelectElement | null)
+                        ?.value ?? 'floor_field';
+                const modeForLive =
+                    technique === 'floor_field' ? 'recast' : activeMode;
+                const wantVoxelLive =
+                    modeForLive !== 'recast' && Boolean(playgroundSessionVolume);
+                if (wantVoxelLive && playgroundSessionVolume && playgroundSessionSeed) {
+                    const activated = await activateNavBackend({
+                        backend: initialLiveBackendForActiveMode(modeForLive),
+                        onLog: (message) => console.log(message),
+                        recastBin: playgroundSessionRecast,
+                        seed: playgroundSessionSeed,
+                        spawnHint: playgroundSessionSpawn,
+                        viewer,
+                        volume: playgroundSessionVolume,
+                    });
+                    playgroundLiveBackend = activated.liveBackend;
+                } else {
+                    await viewer.initCrowd(artifact.navMeshData, spawnPoint);
+                    playgroundLiveBackend = 'recast_crowd';
+                }
+                updateActiveNavLiveHint();
+                syncControlsModeUi(
+                    (controlsModeSelect?.value as NavKitControlsMode | undefined) ??
+                        DEFAULT_NAV_KIT_CONTROLS_MODE_NEW,
+                    playgroundLiveBackend !== 'none'
+                );
                 const simulationSection = document.getElementById('simulationSection') as HTMLDivElement | null;
                 if (simulationSection) simulationSection.style.display = 'block';
 
                 const region = viewer.getWasmRegionBounds();
                 const collisionGlb = generatedCollisionArtifact?.result.glb ?? null;
-                generatedNavArtifactBundle = buildMinimalNavArtifactBundle({
+                generatedNavArtifactBundle = await buildMinimalNavArtifactBundle({
                     collisionGlb,
+                    debugIndices: artifact.debugIndices,
+                    debugPositions: artifact.debugPositions,
                     navMeshData: artifact.navMeshData,
                     playerSpawn: spawnPoint
                         ? [spawnPoint.x, spawnPoint.y, spawnPoint.z]
@@ -816,16 +1615,14 @@ async function main() {
                     regionMax: region?.max ?? null,
                     regionMin: region?.min ?? null,
                     seed: effectiveFastSeed,
+                    volume: playgroundSessionVolume,
                 });
-                const downloadNavArtifactsBtn = document.getElementById(
-                    'downloadNavArtifactsBtn'
-                ) as HTMLButtonElement | null;
-                if (downloadNavArtifactsBtn) {
-                    downloadNavArtifactsBtn.style.display = 'block';
-                }
+                syncWorkbenchNavKitDownloadUi();
 
                 if (autoSpawnNpc) {
-                    viewer.addNPC();
+                    if (playgroundLiveBackend === 'recast_crowd') {
+                        viewer.addNPC();
+                    }
                     if (pendingWorkbenchCameraSelect) {
                         viewer.applyCameraSelectView(pendingWorkbenchCameraSelect.view);
                         console.log('[INFO] Restored camera select view after Fast Nav.');
@@ -855,14 +1652,54 @@ async function main() {
                 // the result (mesh/prune/field params, rotation/flip, region, Recast
                 // ladder) is captured via buildMeshSettings.
                 let navCacheKey: string | null = null;
+                // Outdoor floor_field: seed-centered ~100 m pin (Storage Adapter / prod parity).
+                const seedCenteredOutdoor =
+                    autoSpawnNpc &&
+                    ((document.getElementById('paramCollisionSceneType') as HTMLSelectElement | null)
+                        ?.value === 'outdoor');
                 if (autoSpawnNpc) {
                     try {
-                        const sig: Record<string, unknown> = { ...buildMeshSettings(true) };
-                        delete sig.collision_seed;
-                        navCacheKey = buildNavmeshKey(bytes, { settings: sig, recast: FAST_NAV_RECAST_ATTEMPTS, preset: 'fast-nav-v1' });
+                        const base = buildMeshSettings(true);
+                        const demoTuning = demoNavSettingsToFastNavTuning(readDemoNavSettings());
+                        const envScale = base.environment_scale ?? 1;
+                        console.log(`[INFO] Environment scale for this run: ${envScale}`);
+                        // Pin before cache key so signature matches extract settings (runFastNav order).
+                        await pinFastNavRegionIfNeeded(
+                            viewer,
+                            bytes,
+                            base,
+                            (message: string): void => console.log(message),
+                            seedCenteredOutdoor
+                        );
+                        if (seedCenteredOutdoor) {
+                            applySeedCenteredOutdoorFieldKnobs(base);
+                        }
+                        const recastAttempts = FAST_NAV_RECAST_ATTEMPTS.map((attempt) => ({
+                            label: attempt.label,
+                            params: { ...attempt.params, ...demoTuning.recastOverrides },
+                        }));
+                        navCacheKey = buildNavmeshKey(
+                            bytes,
+                            buildFastNavCacheSignature({
+                                algo: 'floor_field',
+                                base,
+                                recovery: null,
+                                recastAttempts,
+                                floorMesh: {
+                                    ...demoTuning.floorMesh,
+                                    seedCenteredOutdoor,
+                                },
+                                floorPipeline: FAST_NAV_FLOOR_PIPELINE,
+                                seedCenteredOutdoor,
+                                islandValidation: demoTuning.islandValidation,
+                            })
+                        );
                         const cached = await getNavmesh(navCacheKey);
                         if (cached) {
-                            console.log("[SUCCESS] FAST NAV restored from cache — skipping parse/prune/field/Recast.");
+                            console.log(
+                                `[SUCCESS] FAST NAV restored from cache — skipping parse/prune/field/Recast ` +
+                                    `(environment_scale=${envScale}).`
+                            );
                             if (cached.effectiveSeed) viewer.displaySeedMarker(cached.effectiveSeed);
                             await finishFastNavTail(cached, cached.effectiveSeed ?? null, cached.expectedFloorY ?? null, true);
                             return;
@@ -882,6 +1719,21 @@ async function main() {
                     ? buildFastFieldSettings(buildMeshSettings(true), fastSeed)
                     : buildMeshSettings(true);
                 if (autoSpawnNpc) {
+                    // Re-pin on the settings object used for extract (cache path may have returned).
+                    const precomputedSeed = await pinFastNavRegionIfNeeded(
+                        viewer,
+                        bytes,
+                        navSettings,
+                        (message: string): void => console.log(message),
+                        seedCenteredOutdoor
+                    );
+                    if (seedCenteredOutdoor) {
+                        applySeedCenteredOutdoorFieldKnobs(navSettings);
+                    }
+                    if (precomputedSeed) {
+                        fastSeed = precomputedSeed;
+                        navSettings.collision_seed = precomputedSeed;
+                    }
                     console.log(
                         `[INFO] Fast preset: floor-field source, cell=0.14, obstacleEps=0.34, variance=0.14, component=all, ` +
                         `seed=${(navSettings.collision_seed ?? fastSeed)?.map((v) => v.toFixed(3)).join(', ') ?? 'auto'}`
@@ -914,6 +1766,8 @@ async function main() {
                         baseSettings: navSettings,
                         seed: effectiveFastSeed ?? fastSeed ?? [],
                         recovery: resolveRecovery(),
+                        floorMesh: { seedCenteredOutdoor },
+                        seedCenteredOutdoor,
                         log: (message: string): void => console.log(message),
                     });
                     const floorMesh = extracted.floorMesh;
@@ -951,8 +1805,25 @@ async function main() {
                         viewer.setColliderVisible(showColliderCheckbox.checked);
                     }
 
-                    console.log(`[INFO] Using generated collision boundary as Recast input.`);
-                    console.log(`[INFO] Collision boundary: ${boundary.mesh.vertex_count} vertices, ${boundary.mesh.face_count} faces.`);
+                    sourceLabel =
+                        boundary.diagnostics.collision_mesh_mode === 'smooth'
+                            ? 'generated_sdf_mc_floor_project'
+                            : 'generated_voxel_collider';
+                    console.log(
+                        `[INFO] Using generated collision boundary as Recast input` +
+                            ` (mode=${boundary.diagnostics.collision_mesh_mode}, label=${sourceLabel}` +
+                            `${boundary.diagnostics.collision_floor_project_mode
+                              ? `, floor_project=${boundary.diagnostics.collision_floor_project_mode}`
+                              : ''}).`
+                    );
+                    console.log(`[INFO] Collision Recast mesh: ${boundary.mesh.vertex_count} vertices, ${boundary.mesh.face_count} faces.`);
+                    if (boundary.collider_mesh) {
+                        viewer.displayColliderMesh(
+                            boundary.collider_mesh.vertices,
+                            boundary.collider_mesh.indices,
+                            Number.parseFloat(colliderOpacitySlider?.value ?? '0.35') || 0.35
+                        );
+                    }
                     if (boundary.diagnostics.collision_seed_used) {
                         viewer.displaySeedMarker(boundary.diagnostics.collision_seed_used);
                     }
@@ -978,16 +1849,18 @@ async function main() {
                 // inputs. The FAST NAV path uses the single shared source of truth in
                 // fastNav.ts (FAST_NAV_RECAST_ATTEMPTS) so there is exactly one place
                 // that defines the fast-nav Recast tuning.
+                const demoNav = readDemoNavSettings();
+                const demoTuning = demoNavSettingsToFastNavTuning(demoNav);
                 const params: RecastParams = {
                     cs: parseFloat((document.getElementById('paramNavCS') as HTMLInputElement).value),
                     ch: parseFloat((document.getElementById('paramNavCH') as HTMLInputElement).value),
                     walkableHeight: parseFloat((document.getElementById('paramNavHeight') as HTMLInputElement).value),
-                    walkableRadius: parseFloat((document.getElementById('paramNavRadius') as HTMLInputElement).value),
-                    walkableClimb: parseFloat((document.getElementById('paramNavClimb') as HTMLInputElement).value),
-                    walkableSlopeAngle: parseFloat((document.getElementById('paramNavSlope') as HTMLInputElement).value),
+                    walkableRadius: demoTuning.recastOverrides.walkableRadius,
+                    walkableClimb: demoTuning.recastOverrides.walkableClimb,
+                    walkableSlopeAngle: demoTuning.recastOverrides.walkableSlopeAngle,
                     maxEdgeLen: 12,
                     maxSimplificationError: 0.8,
-                    minRegionArea: 2,
+                    minRegionArea: demoTuning.recastOverrides.minRegionArea,
                     mergeRegionArea: 12,
                     maxVertsPerPoly: 6,
                     detailSampleDist: 6,
@@ -997,7 +1870,12 @@ async function main() {
                 };
 
                 const attempts: ReadonlyArray<{ label: string; params: RecastParams }> =
-                    autoSpawnNpc ? FAST_NAV_RECAST_ATTEMPTS : [{ label: 'manual', params }];
+                    autoSpawnNpc
+                        ? FAST_NAV_RECAST_ATTEMPTS.map((attempt) => ({
+                              ...attempt,
+                              params: { ...attempt.params, ...demoTuning.recastOverrides },
+                          }))
+                        : [{ label: 'manual', params }];
 
                 let result: { navMeshData: Uint8Array, debugPositions: Float32Array, debugIndices: Uint32Array, report: any } | null = null;
                 let lastError: unknown = null;
@@ -1106,7 +1984,28 @@ async function main() {
                         errorDiv.style.display = 'none';
                         document.getElementById('resultSection')!.style.display = 'block';
                         toggleSettings(true);
-                        await runNavmeshFromCollider(true);
+                        const technique =
+                            (document.getElementById('paramNavGenerationMode') as HTMLSelectElement | null)
+                                ?.value ?? 'floor_field';
+                        if (technique === 'sdf_marching_cubes') {
+                            const meshMode = document.getElementById(
+                                'paramCollisionMeshMode'
+                            ) as HTMLSelectElement | null;
+                            if (meshMode) {
+                                meshMode.value = 'smooth';
+                            }
+                            await runNavmeshFromCollider(false);
+                        } else if (technique === 'voxel_collision') {
+                            const meshMode = document.getElementById(
+                                'paramCollisionMeshMode'
+                            ) as HTMLSelectElement | null;
+                            if (meshMode && meshMode.value === 'smooth') {
+                                meshMode.value = 'faces';
+                            }
+                            await runNavmeshFromCollider(false);
+                        } else {
+                            await runNavmeshFromCollider(true);
+                        }
                     } catch (error) {
                         logError(`Fast nav path failed: ${error}`);
                     }
@@ -1138,13 +2037,14 @@ async function main() {
             }
             if (globalDownloadNavBtn) {
                 globalDownloadNavBtn.onclick = () => {
-                    if (!generatedNavData) {
+                    const navBin = viewer.getNavMeshData() ?? generatedNavData;
+                    if (!navBin) {
                         console.warn("[WARN] No navmesh binary generated yet.");
                         return;
                     }
                     exportNavmeshBinary({
                         filename: `${file.name.replace(/\.(ply|spz|splat)$/i, "")}.nav`,
-                        navMeshData: generatedNavData,
+                        navMeshData: navBin,
                     });
                     console.log("[Main] NavMesh binary download started.");
                 };
@@ -1209,6 +2109,9 @@ async function main() {
                     collision_carve_height: readNumber('paramCollisionCarveHeight', 1.6),
                     collision_carve_radius: readNumber('paramCollisionCarveRadius', 0.25),
                     collision_mesh_mode: ((document.getElementById('paramCollisionMeshMode') as HTMLSelectElement | null)?.value as MeshSettings['collision_mesh_mode']) ?? 'faces',
+                    sdf_band_voxels: readNumber('paramSdfBandVoxels', 3),
+                    mc_iso_level: readNumber('paramMcIsoLevel', 0),
+                    mc_smooth_iterations: readInteger('paramMcSmoothIterations', 1),
                     min_alpha: readNumber('paramMinAlpha', 0.05),
                     max_scale: readNumber('paramMaxScale', 5.0),
                     prune_floaters: readBool('paramPruneFloaters', true),
@@ -1229,10 +2132,28 @@ async function main() {
                     environment_scale: viewer.getEnvironmentScale(),
                 };
 
+                const demoNav = readDemoNavSettings();
+                const tuning = demoNavSettingsToFastNavTuning(demoNav);
+                settings.sdf_cell_size = tuning.meshSettings.sdf_cell_size;
+                settings.sdf_density_threshold = tuning.meshSettings.sdf_density_threshold;
+                settings.max_local_height_variance = tuning.meshSettings.max_local_height_variance;
+                settings.hole_fill_radius = tuning.meshSettings.hole_fill_radius;
+                settings.prune_floaters = demoNav.pruneFloaters;
+                if (
+                    settings.collision_scene_type === 'outdoor' &&
+                    (settings.collision_mesh_mode === 'smooth' ||
+                        (document.getElementById('paramNavGenerationMode') as HTMLSelectElement | null)
+                            ?.value === 'sdf_marching_cubes')
+                ) {
+                    settings.floor_project_flatten_m = 0.35;
+                }
+
                 if (includeRegion) {
                     const regionBounds = viewer.getRegionBounds();
-                    settings.region_min = regionBounds?.min;
-                    settings.region_max = regionBounds?.max;
+                    if (regionBounds) {
+                        settings.region_min = [...regionBounds.min];
+                        settings.region_max = [...regionBounds.max];
+                    }
                 }
 
                 return settings;
@@ -1247,7 +2168,13 @@ async function main() {
                 generatedCollisionArtifact = artifact;
 
                 const opacity = Number.parseFloat(colliderOpacitySlider?.value ?? '0.35') || 0.35;
-                const mesh = artifact.result.mesh;
+                const isSmooth = settings.collision_mesh_mode === 'smooth';
+                const mesh = isSmooth
+                    ? requireSdfMcColliderMesh({
+                          colliderMesh: artifact.result.collider_mesh,
+                          recastMesh: artifact.result.mesh,
+                      })
+                    : artifact.result.mesh;
                 viewer.displayColliderMesh(
                     new Float32Array(mesh.vertices),
                     new Uint32Array(mesh.indices),
@@ -1615,10 +2542,11 @@ async function main() {
 
                         if (downloadNavBtn) {
                             downloadNavBtn.onclick = () => {
-                                if (!generatedNavData) return;
+                                const navBin = viewer.getNavMeshData() ?? generatedNavData;
+                                if (!navBin) return;
                                 exportNavmeshBinary({
                                     filename: `${file.name.replace(/\.(ply|spz|splat)$/i, "")}.nav`,
-                                    navMeshData: generatedNavData,
+                                    navMeshData: navBin,
                                 });
                                 console.log("[Main] NavMesh binary download started.");
                             };
@@ -1697,9 +2625,6 @@ async function main() {
         // Mobile Local File Upload Logic
         const chooseFileBtn = document.getElementById('chooseFileBtn');
         const localFileInput = document.getElementById('localFileInput') as HTMLInputElement;
-        const uploadNavArtifactsBtn = document.getElementById('uploadNavArtifactsBtn');
-        const uploadNavArtifactsNavBtn = document.getElementById('uploadNavArtifactsNavBtn');
-        const navArtifactsInput = document.getElementById('navArtifactsInput') as HTMLInputElement | null;
         const downloadNavArtifactsBtn = document.getElementById(
             'downloadNavArtifactsBtn'
         ) as HTMLButtonElement | null;
@@ -1721,52 +2646,6 @@ async function main() {
             };
         };
 
-        const openNavArtifactsPicker = (): void => {
-            navArtifactsInput?.click();
-        };
-
-        const runUploadNavArtifacts = async (files: FileList): Promise<void> => {
-            const list = Array.from(files);
-            console.log(
-                `[INFO] Uploading nav artifacts (${list.length} file${list.length === 1 ? '' : 's'}: ` +
-                    `${list.map((f) => f.name).join(', ') || '(none)'})…`
-            );
-            if (!viewer) {
-                console.error('[ERROR] Load a splat before uploading nav artifacts.');
-                return;
-            }
-            try {
-                const parsed = await parseNavArtifactFiles(list);
-                console.log(
-                    `[INFO] Parsed pack: locomotion=${parsed.session.locomotionMode}` +
-                        (parsed.bundle.recastNavmeshBin ? ', recast.navmesh.bin' : '') +
-                        (parsed.volume ? ', volume trio' : '')
-                );
-                viewer.clearNavArtifacts();
-                generatedNavArtifactBundle = parsed.bundle;
-                await applyNavArtifactsToViewer({
-                    onLog: (message) => console.log(message),
-                    parsed,
-                    viewer,
-                });
-                if (downloadNavArtifactsBtn) {
-                    downloadNavArtifactsBtn.style.display = 'block';
-                }
-                const downloadNavBtn = document.getElementById('downloadNavBtn') as HTMLButtonElement | null;
-                if (downloadNavBtn && parsed.bundle.recastNavmeshBin) {
-                    downloadNavBtn.style.display = 'block';
-                }
-                const simulationSection = document.getElementById('simulationSection') as HTMLDivElement | null;
-                if (simulationSection) {
-                    simulationSection.style.display = 'block';
-                }
-                (document.getElementById('resultSection') as HTMLElement | null)!.style.display = 'block';
-                console.log('[SUCCESS] Uploaded nav artifacts.');
-            } catch (error) {
-                logError(`Upload nav artifacts failed: ${error}`);
-            }
-        };
-
         if (chooseFileBtn && localFileInput) {
             chooseFileBtn.addEventListener('click', () => {
                 localFileInput.click();
@@ -1776,7 +2655,9 @@ async function main() {
                 if (localFileInput.files && localFileInput.files.length > 0) {
                     const file = localFileInput.files[0];
                     generatedNavArtifactBundle = null;
+                    workbenchModelSourceBytes = null;
                     pendingWorkbenchCameraSelect = null;
+                    syncWorkbenchNavKitDownloadUi();
                     handleFileLoad(file);
                     // Clear value to allow re-selecting the same file if needed
                     localFileInput.value = '';
@@ -1784,26 +2665,148 @@ async function main() {
             });
         }
 
-        uploadNavArtifactsBtn?.addEventListener('click', openNavArtifactsPicker);
-        uploadNavArtifactsNavBtn?.addEventListener('click', openNavArtifactsPicker);
-        navArtifactsInput?.addEventListener('change', () => {
-            if (navArtifactsInput.files && navArtifactsInput.files.length > 0) {
-                void runUploadNavArtifacts(navArtifactsInput.files);
-                navArtifactsInput.value = '';
-            }
-        });
+        const syncWorkbenchBundleForDownload =
+            async (): Promise<NavArtifactBundle | null> => {
+                if (!generatedNavArtifactBundle) {
+                    return null;
+                }
+                if (viewer.getNavMeshEditorStatus()?.hasPendingLiveApply) {
+                    console.log(
+                        '[INFO] Applying pending NavMesh Editor edits before download…'
+                    );
+                    await viewer.applyNavMeshEditorToLive();
+                }
+                const editedNav = viewer.getNavMeshData();
+                const editedBuffers = viewer.getOrientedNavMeshBuffers();
+                if (!editedNav || !editedBuffers) {
+                    return generatedNavArtifactBundle;
+                }
+                generatedNavData = editedNav;
+                playgroundSessionRecast = editedNav;
+                const region = viewer.getWasmRegionBounds();
+                const spawnPos = viewer.getPlayerPoseNavKit()?.position ?? null;
+                const collisionGlb =
+                    generatedCollisionArtifact?.result.glb ??
+                    generatedNavArtifactBundle.collisionGlb ??
+                    null;
+                generatedNavArtifactBundle = await rebuildNavArtifactBundleFromLiveMesh({
+                    base: {
+                        ...generatedNavArtifactBundle,
+                        collisionGlb: collisionGlb ?? undefined,
+                    },
+                    debugIndices: editedBuffers.indices,
+                    debugPositions: editedBuffers.positions,
+                    navMeshData: editedNav,
+                    playerSpawn: spawnPos
+                        ? [spawnPos.x, spawnPos.y, spawnPos.z]
+                        : playgroundSessionSpawn,
+                    regionMax: region?.max ?? null,
+                    regionMin: region?.min ?? null,
+                    volume: playgroundSessionVolume,
+                });
+                syncWorkbenchNavKitDownloadUi();
+                return generatedNavArtifactBundle;
+            };
 
-        downloadNavArtifactsBtn?.addEventListener('click', () => {
-            if (!generatedNavArtifactBundle) {
-                console.warn('[WARN] No nav artifact pack — run Fast Nav / Generate Navmesh first.');
+        const runDownloadNavKit = async (): Promise<void> => {
+            if (!generatedNavArtifactBundle || !workbenchModelSourceBytes) {
+                console.warn(
+                    '[WARN] No NavKit — run Fast Nav / Generate Navmesh on a loaded splat first.'
+                );
                 return;
             }
-            downloadNavArtifactZip({
-                bundle: generatedNavArtifactBundle,
-                slug: 'workbench',
+            const activeSelect = document.getElementById(
+                'paramActiveNavigationMode'
+            ) as HTMLSelectElement | null;
+            const techniqueSelect = document.getElementById(
+                'paramNavGenerationMode'
+            ) as HTMLSelectElement | null;
+            const activeMode =
+                (activeSelect?.value as ActiveNavigationMode | undefined) ?? 'recast';
+            const controlsMode =
+                (controlsModeSelect?.value as NavKitControlsMode | undefined) ??
+                DEFAULT_NAV_KIT_CONTROLS_MODE_NEW;
+            const technique =
+                (techniqueSelect?.value as
+                    | 'floor_field'
+                    | 'voxel_collision'
+                    | 'sdf_marching_cubes'
+                    | undefined) ?? 'floor_field';
+            workbenchModelFilename = reconcileSplatModelFilename(
+                workbenchModelSourceBytes,
+                workbenchModelFilename
+            );
+            const slug =
+                workbenchModelFilename.replace(/\.(ply|spz|splat)$/i, '') || 'workbench';
+            const navBundle = await syncWorkbenchBundleForDownload();
+            if (!navBundle) {
+                console.warn(
+                    '[WARN] No NavKit — run Fast Nav / Generate Navmesh on a loaded splat first.'
+                );
+                return;
+            }
+            const cam = viewer.getCameraPoseNavKit();
+            const player = viewer.getPlayerPoseNavKit();
+            const regionBounds = viewer.getRegionBounds();
+            downloadNavKitZip({
+                activeNavigationMode: activeMode,
+                camEulerDeg: cam?.eulerDegrees ?? null,
+                camPos: cam?.position ?? null,
+                camTarget: cam?.target ?? null,
+                controlsMode,
+                locomotionMode:
+                    playgroundLiveBackend === 'voxel_walk' ? 'voxel_walk' : 'recast_crowd',
+                modelBytes: workbenchModelSourceBytes,
+                modelFilename: workbenchModelFilename,
+                navBundle,
+                navTechnique: technique,
+                playerEulerDeg: player?.eulerDegrees ?? null,
+                playerPos: player?.position ?? null,
+                region: regionBounds
+                    ? {
+                          min: [
+                              regionBounds.min[0]!,
+                              regionBounds.min[1]!,
+                              regionBounds.min[2]!,
+                          ],
+                          max: [
+                              regionBounds.max[0]!,
+                              regionBounds.max[1]!,
+                              regionBounds.max[2]!,
+                          ],
+                      }
+                    : null,
+                slug,
+                title: slug,
             });
-            console.log('[SUCCESS] Downloaded nav-artifacts-workbench.zip');
+            console.log(`[SUCCESS] Downloaded navkit-${slug}.zip`);
+        };
+
+        document
+            .getElementById('downloadNavKitToolbarBtn')
+            ?.addEventListener('click', () => {
+                void runDownloadNavKit();
+            });
+
+        downloadNavArtifactsBtn?.addEventListener('click', () => {
+            void (async () => {
+                const bundle = await syncWorkbenchBundleForDownload();
+                if (!bundle) {
+                    console.warn('[WARN] No nav artifact pack — run Fast Nav first.');
+                    return;
+                }
+                const slug =
+                    workbenchModelFilename.replace(/\.(ply|spz|splat)$/i, '') ||
+                    'workbench';
+                downloadNavArtifactZip({
+                    bundle,
+                    slug,
+                });
+                console.log(`[SUCCESS] Downloaded nav-artifacts-${slug}.zip`);
+            })();
         });
+
+        syncWorkbenchNavKitDownloadUi();
 
         applyCamSelectRegionBtn?.addEventListener('click', () => {
             if (!viewer) {

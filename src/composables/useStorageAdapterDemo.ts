@@ -43,13 +43,12 @@ import {
   parseNavArtifactFiles,
   type NavArtifactBundle,
 } from '@/navigation/navArtifactBundle';
+import { resolveActiveNavigationChange } from '@/navigation/demoActiveNavigation';
 import {
-  activateNavBackend,
   activeModeFromCapabilities,
-  activeModeUnavailableReason,
+  activeNavigationModeDisabledReason as sharedActiveNavigationModeDisabledReason,
   activeNavigationModeLabel,
   DEFAULT_ACTIVE_NAVIGATION_MODE,
-  isActiveModeAvailable,
   liveNavBackendLabel,
   navCapabilitiesFromBundle,
   volumeFromNavArtifactBundle,
@@ -60,8 +59,19 @@ import {
 import { applyNavArtifactsToViewer } from '@/navigation/applyNavArtifacts';
 import { NAV_ARTIFACT_UPLOAD_HINT } from '@/navigation/navArtifactContract';
 import {
+  emptyNavKitCameraPoseInfo,
+  emptyNavKitPlayerPoseInfo,
+  formatNavKitCameraCopyText,
+  formatNavKitPlayerCopyText,
+  type NavKitCameraPoseInfo,
+  type NavKitPlayerPoseInfo,
+} from '@/navigation/navKitPoseInfo';
+import {
   DEFAULT_STREAMED_NAV_SETTINGS,
+  DEFAULT_OUTDOOR_DEMO_NAV_SETTINGS,
+  demoNavSettingsForSceneType,
   demoNavSettingsToFastNavTuning,
+  type DemoNavSceneType,
   type StreamedNavSettings,
 } from '@/navigation/navSettings';
 import {
@@ -80,6 +90,8 @@ import {
   resolveVoxelCollisionSeed,
   runNavFromVoxelCollider,
 } from '@/navigation/runNavFromVoxelCollider';
+import { runNavFromSdfMc } from '@/navigation/runNavFromSdfMc';
+import { requireSdfMcColliderMesh } from '@/navigation/sdfMcColliderOverlay';
 import {
   DEFAULT_VOXEL_NAV_SETTINGS,
   type NavGenerationMode,
@@ -87,6 +99,10 @@ import {
   type VoxelLocomotionMode,
   voxelNavSettingsToCollisionBase,
 } from '@/navigation/voxelNavSettings';
+
+/** Modes that use the voxel fill/carve volume pipeline (exact faces or SDF-MC). */
+const usesVoxelVolumePipeline = (mode: NavGenerationMode): boolean =>
+  mode === 'voxel_collision' || mode === 'sdf_marching_cubes';
 import type { CollisionVoxelVolume } from '@/wasm/bridge';
 import { Viewer } from '@/scene/Viewer';
 import {
@@ -209,6 +225,8 @@ export interface UseStorageAdapterDemo {
   readonly busy: Ref<boolean>;
   readonly cameraInfo: Ref<StorageDemoCameraInfo>;
   readonly cameraInfoCopyText: Ref<string>;
+  /** NavKit-shaped camera copy (`camPos` / `camEulerDeg`) for meta-nav.json. */
+  readonly cameraNavKitCopyText: Ref<string>;
   readonly cameraType: Ref<StorageDemoCameraType>;
   readonly clear: () => void;
   readonly clearNavArtifacts: () => void;
@@ -221,6 +239,9 @@ export interface UseStorageAdapterDemo {
   readonly generateCollision: () => Promise<void>;
   /** Frame top-down on the live player agent when one exists. */
   readonly goToPlayer: () => void;
+  readonly playerInfo: Ref<NavKitPlayerPoseInfo>;
+  readonly playerInfoCopyText: Ref<string>;
+  readonly setPlayerInfoPanelOpen: (open: boolean) => void;
   readonly hasColliderMesh: Ref<boolean>;
   readonly hasNavArtifactBundle: Ref<boolean>;
   readonly hasNavMesh: Ref<boolean>;
@@ -243,6 +264,8 @@ export interface UseStorageAdapterDemo {
   readonly navPhase: Ref<StorageDemoNavPhase>;
   readonly navSettings: Ref<StreamedNavSettings>;
   readonly resetNavSettings: () => void;
+  /** Apply indoor/outdoor DemoNavSettings preset (preserves prune). */
+  readonly applyNavSettingsForSceneType: (sceneType: DemoNavSceneType) => void;
   readonly resetVoxelNavSettings: () => void;
   readonly resize: () => void;
   readonly restoreStreamVisual: () => void;
@@ -389,6 +412,8 @@ export const useStorageAdapterDemo = (
   const navMode = ref<NavGenerationMode>('floor_field');
   const cameraType = ref<StorageDemoCameraType>('fly');
   const cameraInfo = ref<StorageDemoCameraInfo>(emptyCameraInfo());
+  const cameraNavKitInfo = ref<NavKitCameraPoseInfo>(emptyNavKitCameraPoseInfo());
+  const playerInfo = ref<NavKitPlayerPoseInfo>(emptyNavKitPlayerPoseInfo());
   const cameraInfoCopyText = computed(() => {
     const info = cameraInfo.value;
     const p = info.position;
@@ -404,8 +429,15 @@ export const useStorageAdapterDemo = (
     }
     return text;
   });
+  const cameraNavKitCopyText = computed(() =>
+    formatNavKitCameraCopyText(cameraNavKitInfo.value)
+  );
+  const playerInfoCopyText = computed(() =>
+    formatNavKitPlayerCopyText(playerInfo.value)
+  );
   const navPhase = ref<StorageDemoNavPhase>('idle');
-  const navSettings = ref<StreamedNavSettings>({ ...DEFAULT_STREAMED_NAV_SETTINGS });
+  // HEAD / prod floor_field uses outdoor-wide DemoNavSettings (coverage parity).
+  const navSettings = ref<StreamedNavSettings>({ ...DEFAULT_OUTDOOR_DEMO_NAV_SETTINGS });
   const voxelNavSettings = ref<VoxelCollisionNavSettings>({ ...DEFAULT_VOXEL_NAV_SETTINGS });
   const selectionRegionVisible = ref(false);
   const navArtifactBundle = shallowRef<NavArtifactBundle | null>(null);
@@ -434,6 +466,7 @@ export const useStorageAdapterDemo = (
     ...DEFAULT_CAMERA_SELECT_REGION_OFFSETS,
   });
   let cameraInfoPanelOpen = false;
+  let playerInfoPanelOpen = false;
   let cameraInfoRafId = 0;
   const statusMessage = ref('Ready — load a CDN lod-meta.json URL or a SplatWalk SOD LOD zip.');
   let lastSourceLabel: string | null = null;
@@ -523,26 +556,64 @@ export const useStorageAdapterDemo = (
     };
   };
 
+  const sampleNavKitPoseInfoOnce = (): void => {
+    const cam = viewer?.getCameraPoseNavKit() ?? null;
+    if (cam) {
+      cameraNavKitInfo.value = {
+        eulerDegrees: { ...cam.eulerDegrees },
+        mode: cameraInfo.value.mode,
+        position: { ...cam.position },
+        target: { ...cam.target },
+      };
+    } else {
+      cameraNavKitInfo.value = emptyNavKitCameraPoseInfo();
+    }
+    const player = viewer?.getPlayerPoseNavKit() ?? null;
+    if (player) {
+      playerInfo.value = {
+        available: true,
+        eulerDegrees: { ...player.eulerDegrees },
+        position: { ...player.position },
+      };
+    } else {
+      playerInfo.value = emptyNavKitPlayerPoseInfo();
+    }
+  };
+
+  const samplePoseInfoOnce = (): void => {
+    sampleCameraInfoOnce();
+    sampleNavKitPoseInfoOnce();
+  };
+
   const tickCameraInfoSampling = (): void => {
-    if (!cameraInfoPanelOpen) {
+    if (!cameraInfoPanelOpen && !playerInfoPanelOpen) {
       cameraInfoRafId = 0;
       return;
     }
-    sampleCameraInfoOnce();
+    samplePoseInfoOnce();
     cameraInfoRafId = requestAnimationFrame(tickCameraInfoSampling);
   };
 
-  const setCameraInfoPanelOpen = (open: boolean): void => {
-    cameraInfoPanelOpen = open;
-    if (!open) {
+  const syncPoseInfoSampling = (): void => {
+    if (!cameraInfoPanelOpen && !playerInfoPanelOpen) {
       stopCameraInfoSampling();
       return;
     }
     if (cameraInfoRafId !== 0) {
       return;
     }
-    sampleCameraInfoOnce();
+    samplePoseInfoOnce();
     cameraInfoRafId = requestAnimationFrame(tickCameraInfoSampling);
+  };
+
+  const setCameraInfoPanelOpen = (open: boolean): void => {
+    cameraInfoPanelOpen = open;
+    syncPoseInfoSampling();
+  };
+
+  const setPlayerInfoPanelOpen = (open: boolean): void => {
+    playerInfoPanelOpen = open;
+    syncPoseInfoSampling();
   };
 
   const addLog = (message: string): void => {
@@ -787,7 +858,7 @@ export const useStorageAdapterDemo = (
     };
     setPendingCameraSelect(input);
     let region = regionBoundsFromCameraSelect(input);
-    if (navMode.value === 'voxel_collision') {
+    if (usesVoxelVolumePipeline(navMode.value)) {
       const carveHeight = voxelNavSettings.value.collisionCarveHeight;
       const minStairHeight =
         carveHeight + REGION_STAIR_HEADROOM_METERS + REGION_STAIR_FOOTROOM_METERS;
@@ -1130,7 +1201,10 @@ export const useStorageAdapterDemo = (
 
   const clear = (): void => {
     setCameraInfoPanelOpen(false);
+    setPlayerInfoPanelOpen(false);
     cameraInfo.value = emptyCameraInfo();
+    cameraNavKitInfo.value = emptyNavKitCameraPoseInfo();
+    playerInfo.value = emptyNavKitPlayerPoseInfo();
     disposeViewer();
     clearSceneStreams();
     resetStreamState();
@@ -1196,21 +1270,27 @@ export const useStorageAdapterDemo = (
     return true;
   };
 
-  const activeNavigationModeDisabledReason = (mode: ActiveNavigationMode): string | null => {
-    if (busy.value) {
-      return 'Wait for the current job to finish.';
+  const activeNavigationModeDisabledReason = (mode: ActiveNavigationMode): string | null =>
+    sharedActiveNavigationModeDisabledReason({
+      algo: navMode.value,
+      busy: busy.value,
+      caps: navCapabilities.value,
+      liveBackend: liveBackend.value,
+      mode,
+    });
+
+  const applyNavSettingsForSceneType = (sceneType: DemoNavSceneType): void => {
+    // floor_field matches HEAD/prod outdoor bands; indoor/outdoor presets apply to voxel/SDF-MC.
+    if (navMode.value === 'floor_field') {
+      addLog(
+        `[INFO] Scene type → ${sceneType} (floor_field keeps outdoor DemoNavSettings like HEAD).`
+      );
+      return;
     }
-    if (navMode.value === 'floor_field' && mode !== 'recast') {
-      return 'Floor field generation only produces Recast. Switch Nav generation to voxel collision for Voxel mesh / dual-ready.';
-    }
-    if (liveBackend.value !== 'none' && !isActiveModeAvailable(mode, navCapabilities.value)) {
-      if (mode === 'recast_and_voxel_mesh') {
-        return activeModeUnavailableReason(mode, navCapabilities.value);
-      }
-      // Still selectable as next-run intent under voxel_collision.
-      return null;
-    }
-    return null;
+    navSettings.value = demoNavSettingsForSceneType(sceneType, {
+      preservePrune: navSettings.value.pruneFloaters,
+    });
+    addLog(`[INFO] Applied ${sceneType} DemoNavSettings preset.`);
   };
 
   const setActiveNavigationMode = async (mode: ActiveNavigationMode): Promise<void> => {
@@ -1228,90 +1308,63 @@ export const useStorageAdapterDemo = (
 
     const previous = activeNavigationMode.value;
     activeNavigationMode.value = mode;
-    addLog(
-      `[INFO] Active navigation mode → ${activeNavigationModeLabel(mode)}` +
-        (previous !== mode ? ` (was ${activeNavigationModeLabel(previous)})` : '') +
-        '.'
-    );
 
-    // Desired-only before a live session (no hot-swap target yet).
-    if (!viewer || liveBackend.value === 'none') {
-      addLog('[INFO] Applies on next Run Nav / upload.');
-      return;
-    }
+    const feetWorld = viewer?.getPlayerFeetWorld() ?? null;
+    const seedFromPlayer =
+      feetWorld != null && viewer
+        ? ([
+            viewer.worldNavPointToOriented(feetWorld).x,
+            viewer.worldNavPointToOriented(feetWorld).y,
+            viewer.worldNavPointToOriented(feetWorld).z,
+          ] as [number, number, number])
+        : null;
+    const seed = seedFromPlayer ?? sessionSeed;
+    const spawnHint =
+      sessionSpawn ??
+      (feetWorld
+        ? ([feetWorld.x, feetWorld.y, feetWorld.z] as [number, number, number])
+        : null);
 
-    const caps = navCapabilities.value;
-
-    // Dual-ready confirmation: keep current live backend.
-    if (mode === 'recast_and_voxel_mesh') {
-      if (caps.hasVolume && caps.hasRecast) {
-        addLog(
-          `[INFO] Dual-ready confirmed (live ${liveNavBackendLabel(liveBackend.value)}). ` +
-            'Switch to Recast or Voxel mesh to hot-swap.'
-        );
-        return;
-      }
-      addLog(
-        '[INFO] Dual-ready not in session yet — re-run Nav under voxel collision to bake volume + Recast.'
-      );
-      return;
-    }
-
-    const targetLive: Exclude<LiveNavBackend, 'none'> =
-      mode === 'recast' ? 'recast_crowd' : 'voxel_walk';
-
-    if (liveBackend.value === targetLive) {
-      addLog(`[INFO] Already live on ${liveNavBackendLabel(targetLive)}.`);
-      return;
-    }
-
-    if (targetLive === 'recast_crowd' && !sessionRecastBin) {
-      addLog('[WARN] No Recast bin cached — re-run Nav with Recast (or Recast + voxel mesh).');
-      return;
-    }
-    if (targetLive === 'voxel_walk' && !sessionVolume) {
-      addLog('[WARN] No volume cached — re-run Nav with Voxel mesh (or Recast + voxel mesh).');
-      return;
-    }
-
-    if (navPhase.value !== 'done') {
+    if (viewer && liveBackend.value !== 'none' && navPhase.value !== 'done') {
       addLog('[WARN] Hot-swap ignored — nav session not ready (phase=' + navPhase.value + ').');
+      activeNavigationMode.value = previous;
       return;
     }
 
     busy.value = true;
     try {
-      const feetWorld = viewer.getPlayerFeetWorld();
-      const seedFromPlayer =
-        feetWorld != null
-          ? ([
-              viewer.worldNavPointToOriented(feetWorld).x,
-              viewer.worldNavPointToOriented(feetWorld).y,
-              viewer.worldNavPointToOriented(feetWorld).z,
-            ] as [number, number, number])
-          : null;
-      const seed = seedFromPlayer ?? sessionSeed;
-      const spawnHint =
-        sessionSpawn ??
-        (feetWorld
-          ? ([feetWorld.x, feetWorld.y, feetWorld.z] as [number, number, number])
-          : null);
-
-      statusMessage.value = `Switching Active → ${activeNavigationModeLabel(mode)}…`;
-      const activated = await activateNavBackend({
-        backend: targetLive,
+      if (viewer && liveBackend.value !== 'none') {
+        statusMessage.value = `Switching Active → ${activeNavigationModeLabel(mode)}…`;
+      }
+      const result = await resolveActiveNavigationChange({
+        caps: navCapabilities.value,
+        liveBackend: liveBackend.value,
+        mode,
         onLog: addLog,
+        previousMode: previous,
         recastBin: sessionRecastBin,
         seed,
         spawnHint,
-        viewer,
+        viewer: viewer ?? null,
         volume: sessionVolume,
       });
-      liveBackend.value = activated.liveBackend;
+      liveBackend.value = result.liveBackend;
+      if (!result.applied) {
+        activeNavigationMode.value = result.revertToMode ?? previous;
+        errorMessage.value =
+          result.failureMessage ??
+          'Could not switch Live locomotion — missing volume or Recast assets. ' +
+            'Re-run Nav under Voxel / SDF-MC with volume, then try again.';
+        return;
+      }
+      errorMessage.value = null;
+      if (result.liveBackend === 'none' || !viewer) {
+        return;
+      }
       voxelNavSettings.value = {
         ...voxelNavSettings.value,
         locomotionMode:
-          activated.liveBackend === 'recast_crowd' ? 'recast_crowd' : 'voxel_walk',
+          result.liveBackend === 'recast_crowd' ? 'recast_crowd' : 'voxel_walk',
       };
       hasNavMesh.value = true;
       hasNavSession.value = true;
@@ -1326,11 +1379,12 @@ export const useStorageAdapterDemo = (
         );
       }
       statusMessage.value =
-        activated.liveBackend === 'recast_crowd'
+        result.liveBackend === 'recast_crowd'
           ? 'Live: Recast crowd. Click the green navmesh to move.'
-          : 'Live: Voxel walk. Click splats, walls, or ceilings to move.';
+          : 'Live: Voxel walk. Click surfaces — player walks to nearest floor cell.';
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      activeNavigationMode.value = previous;
       errorMessage.value = message;
       addLog(`[ERROR] Active hot-swap failed: ${message}`);
       throw error;
@@ -1656,7 +1710,7 @@ export const useStorageAdapterDemo = (
   }): Promise<Uint8Array> => {
     const requireRegion =
       options?.requireRegionCoverage === true || requireRegionCoverageForMaterialize;
-    const forVoxelCollision = navMode.value === 'voxel_collision';
+    const forVoxelCollision = usesVoxelVolumePipeline(navMode.value);
     const rawRegion = forVoxelCollision ? resolveRawSogRegionForMaterialize() : null;
     const useRegionCoverage = forVoxelCollision && rawRegion !== null;
     const minSplats = useRegionCoverage
@@ -1958,7 +2012,7 @@ export const useStorageAdapterDemo = (
     activeViewer: Viewer;
     plyBytes: Uint8Array;
   }): Promise<Uint8Array> => {
-    if (navMode.value !== 'voxel_collision') {
+    if (!usesVoxelVolumePipeline(navMode.value)) {
       return plyBytes;
     }
 
@@ -2165,6 +2219,25 @@ export const useStorageAdapterDemo = (
       addLog(`[INFO] Nav generation mode → ${mode}.`);
     }
     navMode.value = mode;
+    if (mode === 'sdf_marching_cubes') {
+      voxelNavSettings.value = {
+        ...voxelNavSettings.value,
+        collisionSceneType: 'indoor',
+      };
+    }
+    if (mode === 'floor_field') {
+      navSettings.value = {
+        ...DEFAULT_OUTDOOR_DEMO_NAV_SETTINGS,
+        pruneFloaters: navSettings.value.pruneFloaters,
+      };
+      addLog('[INFO] floor_field: restored outdoor DemoNavSettings (HEAD/prod parity).');
+    } else {
+      const sceneType =
+        voxelNavSettings.value.collisionSceneType === 'outdoor' ? 'outdoor' : 'indoor';
+      navSettings.value = demoNavSettingsForSceneType(sceneType, {
+        preservePrune: navSettings.value.pruneFloaters,
+      });
+    }
     if (viewer) {
       viewer.disableRegionSelection();
     }
@@ -2197,7 +2270,7 @@ export const useStorageAdapterDemo = (
       cachedPlySplatCount = 0;
       cachedMaterializeKey = null;
       regionMaterializeFellBackToGlobal = false;
-      if (navMode.value === 'voxel_collision') {
+      if (usesVoxelVolumePipeline(navMode.value)) {
         addLog(
           '[WARN] Selection region OFF — full splat AABB may coarsen voxels under the max-voxel ' +
             'cap and break stairs. Re-enable Selection region for indoor fidelity.'
@@ -2233,7 +2306,7 @@ export const useStorageAdapterDemo = (
             `${region.max.map((v) => v.toFixed(2)).join(', ')}`
         );
       }
-      if (navMode.value === 'voxel_collision') {
+      if (usesVoxelVolumePipeline(navMode.value)) {
         const carveHeight = voxelNavSettings.value.collisionCarveHeight;
         const minStairHeight =
           carveHeight + REGION_STAIR_HEADROOM_METERS + REGION_STAIR_FOOTROOM_METERS;
@@ -2268,13 +2341,30 @@ export const useStorageAdapterDemo = (
   };
 
   const resetNavSettings = (): void => {
-    navSettings.value = { ...DEFAULT_STREAMED_NAV_SETTINGS };
+    if (navMode.value === 'floor_field') {
+      navSettings.value = {
+        ...DEFAULT_OUTDOOR_DEMO_NAV_SETTINGS,
+        pruneFloaters: navSettings.value.pruneFloaters,
+      };
+      cachedSelectionRegion = null;
+      if (viewer) {
+        viewer.disableRegionSelection();
+      }
+      selectionRegionVisible.value = false;
+      addLog('[INFO] Navmesh settings reset to outdoor defaults (floor_field / HEAD).');
+      return;
+    }
+    const sceneType =
+      voxelNavSettings.value.collisionSceneType === 'outdoor' ? 'outdoor' : 'indoor';
+    navSettings.value = demoNavSettingsForSceneType(sceneType, {
+      preservePrune: navSettings.value.pruneFloaters,
+    });
     cachedSelectionRegion = null;
     if (viewer) {
       viewer.disableRegionSelection();
     }
     selectionRegionVisible.value = false;
-    addLog('[INFO] Navmesh settings reset to outdoor defaults.');
+    addLog(`[INFO] Navmesh settings reset to ${sceneType} defaults.`);
   };
 
   const resetVoxelNavSettings = (): void => {
@@ -2309,7 +2399,7 @@ export const useStorageAdapterDemo = (
     }
 
     // Fail before WASM carve if the effective AABB still cannot fit the dense budget.
-    if (navMode.value === 'voxel_collision') {
+    if (usesVoxelVolumePipeline(navMode.value)) {
       const fillSize = voxelNavSettings.value.collisionFillSize;
       const sceneType = voxelNavSettings.value.collisionSceneType;
       const maxVoxels =
@@ -2351,7 +2441,7 @@ export const useStorageAdapterDemo = (
     const useVoxelPrune =
       navSettings.value.pruneFloaters && splatEstimate <= VOXEL_PRUNE_MAX_SPLATS;
     if (
-      navMode.value === 'voxel_collision' &&
+      usesVoxelVolumePipeline(navMode.value) &&
       navSettings.value.pruneFloaters &&
       !useVoxelPrune
     ) {
@@ -2361,11 +2451,11 @@ export const useStorageAdapterDemo = (
       );
     }
     const voxelOpacityBoost =
-      navMode.value === 'voxel_collision' && !useVoxelPrune
+      usesVoxelVolumePipeline(navMode.value) && !useVoxelPrune
         ? Math.max(voxelNavSettings.value.collisionOpacityThreshold, 0.12)
         : voxelNavSettings.value.collisionOpacityThreshold;
     const voxelBase =
-      navMode.value === 'voxel_collision'
+      usesVoxelVolumePipeline(navMode.value)
         ? {
             ...voxelNavSettingsToCollisionBase({
               ...voxelNavSettings.value,
@@ -2375,7 +2465,7 @@ export const useStorageAdapterDemo = (
           }
         : { prune_floaters: navSettings.value.pruneFloaters };
     const carveHeight =
-      navMode.value === 'voxel_collision'
+      usesVoxelVolumePipeline(navMode.value)
         ? voxelNavSettings.value.collisionCarveHeight
         : 1.6;
     const meshSettingsBase = {
@@ -2402,13 +2492,15 @@ export const useStorageAdapterDemo = (
     const regionFootprint = paddedRegion ? regionFootprintMeters(paddedRegion) : 0;
     const useFilterCluster = !paddedRegion || regionFootprint <= 25;
 
+    const environmentScale = activeViewer.getEnvironmentScale();
+    addLog(`[INFO] Environment scale for this run: ${environmentScale}`);
     return buildCollisionBoundarySettings({
       base: {
         ...voxelBase,
         collision_filter_cluster: useFilterCluster,
         collision_max_voxels: regionFootprint > 0 && regionFootprint <= 18 ? 2_000_000 : 1_200_000,
         collision_seed: seed,
-        environment_scale: activeViewer.getEnvironmentScale(),
+        environment_scale: environmentScale,
         ...(paddedRegion
           ? { region_min: paddedRegion.min, region_max: paddedRegion.max }
           : {}),
@@ -2430,20 +2522,37 @@ export const useStorageAdapterDemo = (
       statusMessage.value = 'Generating voxel collision boundary…';
       navPhase.value = 'floor';
       const settings = await buildStreamCollisionSettings(activeViewer, plyBytes, { emitGlb: true });
-      if (navMode.value === 'voxel_collision') {
+      if (navMode.value === 'sdf_marching_cubes') {
+        settings.collision_mesh_mode = 'smooth';
+        settings.sdf_band_voxels = voxelNavSettings.value.sdfBandVoxels;
+        settings.mc_iso_level = voxelNavSettings.value.mcIsoLevel;
+        settings.mc_smooth_iterations = voxelNavSettings.value.mcSmoothIterations;
+        if (voxelNavSettings.value.collisionSceneType === 'outdoor') {
+          settings.floor_project_flatten_m = 0.35;
+        }
+      }
+      if (usesVoxelVolumePipeline(navMode.value)) {
         addLog(`[INFO] Collision preview: ${formatVoxelNavSettingsLog(voxelNavSettings.value)}`);
       }
       const artifact = await generateCollisionBoundaryArtifact({ bytes: plyBytes, settings });
+      const isSmooth = navMode.value === 'sdf_marching_cubes';
+      const overlay = isSmooth
+        ? requireSdfMcColliderMesh({
+            colliderMesh: artifact.result.collider_mesh,
+            recastMesh: artifact.result.mesh,
+          })
+        : artifact.result.mesh;
       activeViewer.displayColliderMesh(
-        artifact.result.mesh.vertices,
-        artifact.result.mesh.indices,
+        new Float32Array(overlay.vertices),
+        new Uint32Array(overlay.indices),
         0.35
       );
       activeViewer.setColliderVisible(colliderVisible.value);
       hasColliderMesh.value = true;
-      statusMessage.value = `Collision ready · ${artifact.result.mesh.vertex_count} verts · ${artifact.result.mesh.face_count} faces`;
+      statusMessage.value = `Collision ready · ${overlay.vertex_count} verts · ${overlay.face_count} faces`;
       addLog(
-        `[SUCCESS] Collision boundary: ${artifact.result.mesh.vertex_count} vertices, ${artifact.result.mesh.face_count} faces.`
+        `[SUCCESS] Collision boundary: ${overlay.vertex_count} vertices, ${overlay.face_count} faces` +
+          `${isSmooth ? ' (interior MC shell)' : ''}.`
       );
       navPhase.value = 'done';
     } catch (error) {
@@ -2524,6 +2633,7 @@ export const useStorageAdapterDemo = (
       const cameraSelect = pendingCameraSelect ?? undefined;
       activeNavigationMode.value = 'recast';
       const fastNav = await runFastNav({
+        algo: 'floor_field',
         viewer: activeViewer,
         bytes: plyBytes,
         cameraSelect,
@@ -2539,7 +2649,9 @@ export const useStorageAdapterDemo = (
       const spawnTuple: [number, number, number] | null = fastNav.playerSpawn
         ? [fastNav.playerSpawn.x, fastNav.playerSpawn.y, fastNav.playerSpawn.z]
         : null;
-      const minimal = buildMinimalNavArtifactBundle({
+      const minimal = await buildMinimalNavArtifactBundle({
+        debugIndices: fastNav.debugIndices,
+        debugPositions: fastNav.debugPositions,
         navMeshData: fastNav.navMeshData,
         playerSpawn: spawnTuple,
         seed: spawnTuple,
@@ -2566,6 +2678,8 @@ export const useStorageAdapterDemo = (
   const runVoxelCollisionNavFromStream = async (): Promise<void> => {
     busy.value = true;
     errorMessage.value = null;
+    const mode = navMode.value;
+    const isSdfMc = mode === 'sdf_marching_cubes';
     try {
       const ensured = await ensureViewerWithPly({ trackMaterializePhase: true });
       const plyBytes = await ensureVoxelRegionFitsBudget(ensured);
@@ -2573,9 +2687,11 @@ export const useStorageAdapterDemo = (
       const settings = navSettings.value;
       const voxel = voxelNavSettings.value;
       const activeMode = activeNavigationMode.value;
-      statusMessage.value = 'Running voxel collision nav…';
+      statusMessage.value = isSdfMc
+        ? 'Running SDF Marching Cubes nav…'
+        : 'Running voxel collision nav…';
       navPhase.value = 'floor';
-      addLog('[INFO] Nav generation mode: voxel_collision.');
+      addLog(`[INFO] Nav generation mode: ${mode}.`);
       addLog(
         `[INFO] Active ${activeNavigationModeLabel(activeMode)} — ` +
           `volume → ${
@@ -2602,24 +2718,55 @@ export const useStorageAdapterDemo = (
       const collisionSettings = await buildStreamCollisionSettings(activeViewer, plyBytes, {
         emitGlb: false,
       });
-      const navResult = await runNavFromVoxelCollider({
-        activeNavigationMode: activeMode,
-        bytes: plyBytes,
-        collisionSettings,
-        onLog: addLog,
-        onPhase: (next) => {
-          navPhase.value = next;
-        },
-        recastOverrides: {
-          walkableClimb: tuning.recastOverrides.walkableClimb,
-          walkableSlopeAngle: tuning.recastOverrides.walkableSlopeAngle,
-          minRegionArea: tuning.recastOverrides.minRegionArea,
-        },
-        showColliderOverlay: true,
-        colliderVisible: colliderVisible.value,
-        viewer: activeViewer,
-        voxelSettingsSnapshot: { ...voxel },
-      });
+      if (isSdfMc) {
+        collisionSettings.collision_mesh_mode = 'smooth';
+        collisionSettings.sdf_band_voxels = voxel.sdfBandVoxels;
+        collisionSettings.mc_iso_level = voxel.mcIsoLevel;
+        collisionSettings.mc_smooth_iterations = voxel.mcSmoothIterations;
+        if (voxel.collisionSceneType === 'outdoor') {
+          collisionSettings.floor_project_flatten_m = 0.35;
+        }
+      }
+      const navResult = isSdfMc
+        ? await runNavFromSdfMc({
+            activeNavigationMode: activeMode,
+            bytes: plyBytes,
+            collisionSettings,
+            mcIsoLevel: voxel.mcIsoLevel,
+            mcSmoothIterations: voxel.mcSmoothIterations,
+            onLog: addLog,
+            onPhase: (next) => {
+              navPhase.value = next;
+            },
+            recastOverrides: {
+              walkableClimb: tuning.recastOverrides.walkableClimb,
+              walkableSlopeAngle: tuning.recastOverrides.walkableSlopeAngle,
+              minRegionArea: tuning.recastOverrides.minRegionArea,
+            },
+            sdfBandVoxels: voxel.sdfBandVoxels,
+            showColliderOverlay: true,
+            colliderVisible: colliderVisible.value,
+            viewer: activeViewer,
+            voxelSettingsSnapshot: { ...voxel },
+          })
+        : await runNavFromVoxelCollider({
+            activeNavigationMode: activeMode,
+            bytes: plyBytes,
+            collisionSettings,
+            onLog: addLog,
+            onPhase: (next) => {
+              navPhase.value = next;
+            },
+            recastOverrides: {
+              walkableClimb: tuning.recastOverrides.walkableClimb,
+              walkableSlopeAngle: tuning.recastOverrides.walkableSlopeAngle,
+              minRegionArea: tuning.recastOverrides.minRegionArea,
+            },
+            showColliderOverlay: true,
+            colliderVisible: colliderVisible.value,
+            viewer: activeViewer,
+            voxelSettingsSnapshot: { ...voxel },
+          });
       const live: Exclude<LiveNavBackend, 'none'> =
         activeMode === 'recast' ? 'recast_crowd' : 'voxel_walk';
       const spawnTuple: [number, number, number] | null = navResult.playerSpawn
@@ -2634,9 +2781,10 @@ export const useStorageAdapterDemo = (
       addLog(
         '[INFO] Nav artifact pack ready — Download nav artifacts for volume + GLB + session JSON.'
       );
+      const modeLabel = isSdfMc ? 'SDF Marching Cubes' : 'Voxel collision';
       const successLabel = navResult.carveReachTip
-        ? `Voxel collision nav complete. Tip: ${navResult.carveReachTip}`
-        : 'Voxel collision nav complete.';
+        ? `${modeLabel} nav complete. Tip: ${navResult.carveReachTip}`
+        : `${modeLabel} nav complete.`;
       // Voxel path does not go through runFastNav; finishNavSession restores view.
       finishNavSession(activeViewer, navResult.navMeshData, successLabel, {
         skipFocusOnPlayer: pendingCameraSelect !== null,
@@ -2646,7 +2794,9 @@ export const useStorageAdapterDemo = (
       const message = error instanceof Error ? error.message : String(error);
       errorMessage.value = message;
       navPhase.value = 'error';
-      statusMessage.value = 'Voxel collision nav failed';
+      statusMessage.value = isSdfMc
+        ? 'SDF Marching Cubes nav failed'
+        : 'Voxel collision nav failed';
       addLog(`Error: ${message}`);
       throw error;
     } finally {
@@ -2658,7 +2808,7 @@ export const useStorageAdapterDemo = (
   };
 
   const runNavFromStream = async (): Promise<void> => {
-    if (navMode.value === 'voxel_collision') {
+    if (usesVoxelVolumePipeline(navMode.value)) {
       await runVoxelCollisionNavFromStream();
     } else {
       await runFastNavFromStream();
@@ -2667,6 +2817,7 @@ export const useStorageAdapterDemo = (
 
   onBeforeUnmount(() => {
     setCameraInfoPanelOpen(false);
+    setPlayerInfoPanelOpen(false);
     window.removeEventListener('resize', resize);
     flyCameraDispose?.();
     flyCameraDispose = null;
@@ -2683,6 +2834,7 @@ export const useStorageAdapterDemo = (
     busy,
     cameraInfo,
     cameraInfoCopyText,
+    cameraNavKitCopyText,
     cameraSelectOffsets,
     cameraType,
     clear,
@@ -2713,6 +2865,7 @@ export const useStorageAdapterDemo = (
     navPlyRotationLabel,
     navSettings,
     rendererPreference,
+    applyNavSettingsForSceneType,
     resetNavSettings,
     resetVoxelNavSettings,
     resize,
@@ -2728,6 +2881,9 @@ export const useStorageAdapterDemo = (
     setNavMeshVisible,
     setSelectionRegionVisible,
     setCameraInfoPanelOpen,
+    setPlayerInfoPanelOpen,
+    playerInfo,
+    playerInfoCopyText,
     setCameraType,
     setCameraSelectOffsets,
     setPendingInitialFlyPose,

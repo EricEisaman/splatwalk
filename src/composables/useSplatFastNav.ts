@@ -1,6 +1,14 @@
-import { computed, ref, type ComputedRef, type Ref } from 'vue';
+import {
+  computed,
+  ref,
+  shallowRef,
+  watch,
+  type ComputedRef,
+  type Ref,
+} from 'vue';
 
 import { Tools } from '@babylonjs/core';
+import { FreeCamera } from '@babylonjs/core/Cameras/freeCamera';
 
 import {
   buildCollisionBoundarySettings,
@@ -10,35 +18,83 @@ import {
   seedFromRegionBounds,
   type CollisionBoundaryArtifact,
 } from '@/collision/voxelBoundary';
+import type { UseBabylonViewer } from '@/composables/useBabylonViewer';
+import {
+  DEFAULT_ACTIVE_NAVIGATION_MODE,
+  activeNavigationModeDisabledReason as sharedActiveNavigationModeDisabledReason,
+  initialLiveBackendForActiveMode,
+  liveNavBackendLabel,
+  navCapabilitiesFromParts,
+  shouldKeepVolumeForActiveMode,
+  type ActiveNavigationMode,
+  type LiveNavBackend,
+  type NavCapabilities,
+} from '@/navigation/activeNavigation';
 import { applyNavArtifactsToViewer } from '@/navigation/applyNavArtifacts';
+import { applyNavKitMetaToViewer } from '@/navigation/applyNavKitMeta';
 import {
   DEFAULT_CAMERA_SELECT_REGION_OFFSETS,
   regionBoundsFromCameraSelect,
   type CameraSelectRegionInput,
   type CameraSelectRegionOffsets,
 } from '@/navigation/cameraSelectRegion';
+import { resolveActiveNavigationChange } from '@/navigation/demoActiveNavigation';
+import {
+  collisionSceneTypeForAlgo,
+  type ExampleCollisionSceneType,
+} from '@/navigation/exampleSceneCollision';
 import {
   readSplatBytes,
   runFastNav,
-  type FastNavRecoveryConfig,
-  type StrayTrimOptions,
-  type PruneFloatersOptions,
   type FastNavPhase,
+  type FastNavRecoveryConfig,
+  type PruneFloatersOptions,
+  type StrayTrimOptions,
 } from '@/navigation/fastNav';
 import {
   buildMinimalNavArtifactBundle,
   downloadNavArtifactZip,
   parseNavArtifactFiles,
+  rebuildNavArtifactBundleFromLiveMesh,
   type NavArtifactBundle,
 } from '@/navigation/navArtifactBundle';
 import { NAV_ARTIFACT_UPLOAD_HINT } from '@/navigation/navArtifactContract';
 import {
-  DEFAULT_DEMO_NAV_SETTINGS,
+  DEFAULT_NAV_KIT_CONTROLS_MODE_NEW,
+  NAV_KIT_UPLOAD_HINT,
+  NAV_KIT_WASDQE_LEGEND,
+  type NavKitControlsMode,
+} from '@/navigation/navKitContract';
+import {
+  emptyNavKitCameraPoseInfo,
+  emptyNavKitPlayerPoseInfo,
+  formatNavKitCameraCopyText,
+  formatNavKitPlayerCopyText,
+  type NavKitCameraPoseInfo,
+  type NavKitPlayerPoseInfo,
+} from '@/navigation/navKitPoseInfo';
+import {
+  downloadNavKitZip,
+  parseNavKitFile,
+  peekNavKitMeta,
+} from '@/navigation/navKitBundle';
+import {
+  DEFAULT_OUTDOOR_DEMO_NAV_SETTINGS,
+  demoNavSettingsForSceneType,
   demoNavSettingsToFastNavTuning,
   type DemoNavSettings,
 } from '@/navigation/navSettings';
-import { splatwalk, type MeshSettings } from '@/wasm/bridge';
-import { SUPPORTED_SPLAT_EXTENSIONS } from '@/wasm/normalize';
+import { requireSdfMcColliderMesh } from '@/navigation/sdfMcColliderOverlay';
+import {
+  DEFAULT_VOXEL_NAV_SETTINGS,
+  type NavGenerationMode,
+  voxelNavSettingsToCollisionBase,
+} from '@/navigation/voxelNavSettings';
+import { splatwalk, type CollisionVoxelVolume, type MeshSettings } from '@/wasm/bridge';
+import {
+  reconcileSplatModelFilename,
+  SUPPORTED_SPLAT_EXTENSIONS,
+} from '@/wasm/normalize';
 import { SliceArchive } from '@/wasm/sliceArchive';
 import {
   clampSliceSettingsForScene,
@@ -47,8 +103,8 @@ import {
   maxChunkExtentFromBounds,
   type SliceSettings,
 } from '@/wasm/sogTypes';
-import type { UseBabylonViewer } from '@/composables/useBabylonViewer';
-import { FreeCamera } from '@babylonjs/core/Cameras/freeCamera';
+
+const OUTDOOR_SDF_MC_FLOOR_PROJECT_FLATTEN_M = 0.35;
 
 /** Which SOG export to produce. */
 export type SogExportMode = 'streamed' | 'single';
@@ -123,8 +179,16 @@ export interface UseSplatFastNav {
   readonly maxChunkExtent: Ref<number>;
   /** Validate, load, auto-run FAST NAV, then frame the player top-down. */
   readonly loadAndProcess: (file: File) => Promise<void>;
+  /**
+   * Load a splat model without running Fast Nav (used by NavKit restore).
+   */
+  readonly loadSplatOnly: (file: File) => Promise<void>;
   /** Fetch an example splat from a URL, then run the same pipeline. */
-  readonly loadExample: (url: string, title: string) => Promise<void>;
+  readonly loadExample: (
+    url: string,
+    title: string,
+    collisionSceneType?: ExampleCollisionSceneType
+  ) => Promise<void>;
   /**
    * Export the loaded splat as a SOG bundle: `'streamed'` produces a streamed
    * multi-chunk `lod-meta.json` set; `'single'` produces one SOG `meta.json`.
@@ -136,15 +200,41 @@ export interface UseSplatFastNav {
   readonly exportNavmesh: () => Promise<void>;
   /** Frame top-down on the player agent when a navmesh session exists. */
   readonly goToPlayer: () => void;
-  /** Download nav-artifacts zip (session + Recast bin ± collision GLB). */
-  readonly downloadNavArtifacts: () => void;
-  /** Upload zip or multi-select contract files and restore nav. */
+  /**
+   * True when top-down framing (`focusOnPlayer`) was applied — not merely when
+   * pipeline status is `done` (NavKit cam pose restore skips top-down).
+   */
+  readonly topDownViewApplied: Ref<boolean>;
+  /** Download NavKit zip (meta-nav + original model + nav artifacts). */
+  readonly downloadNavKit: () => Promise<void>;
+  /** Load a NavKit zip: model + baked nav (no Fast Nav recompute). */
+  readonly loadNavKit: (file: File) => Promise<void>;
+  /** Download legacy nav-artifacts zip (session + Recast bin ± collision GLB). */
+  readonly downloadNavArtifacts: () => Promise<void>;
+  /** Upload legacy zip or multi-select contract files and restore nav. */
   readonly uploadNavArtifacts: (files: File[] | FileList) => Promise<void>;
-  readonly hasNavArtifactBundle: ComputedRef<boolean>;
+  readonly hasNavArtifactBundle: Ref<boolean>;
+  /** True when Download NavKit can run (model source + nav pack). */
+  readonly hasNavKit: Ref<boolean>;
+  /** Player input mode: click / WASDQE / both. */
+  readonly controlsMode: Ref<NavKitControlsMode>;
+  readonly setControlsMode: (mode: NavKitControlsMode) => void;
+  readonly controlsWasdLegend: string;
   readonly navArtifactUploadHint: string;
+  readonly navKitUploadHint: string;
   /** Editable camera-select AABB offsets (meters). */
   readonly cameraSelectOffsets: Ref<CameraSelectRegionOffsets>;
   readonly resetCameraSelectOffsets: () => void;
+  /** Live NavKit-shaped camera pose (sampled while Camera Information is open). */
+  readonly cameraInfo: Ref<NavKitCameraPoseInfo>;
+  readonly cameraInfoCopyText: ComputedRef<string>;
+  readonly copyCameraPose: () => Promise<boolean>;
+  readonly setCameraInfoPanelOpen: (open: boolean) => void;
+  /** Live NavKit-shaped player pose (sampled while Player Information is open). */
+  readonly playerInfo: Ref<NavKitPlayerPoseInfo>;
+  readonly playerInfoCopyText: ComputedRef<string>;
+  readonly copyPlayerPose: () => Promise<boolean>;
+  readonly setPlayerInfoPanelOpen: (open: boolean) => void;
   /** Pin yellow box from live FreeCamera + offsets; used on next Fast Nav. */
   readonly applySelectRegionFromCamera: () => Promise<void>;
   /** Generate and show the collision voxel boundary overlay. */
@@ -153,11 +243,26 @@ export interface UseSplatFastNav {
   readonly exportCollisionMesh: () => Promise<Uint8Array>;
   /** Show or hide the collision voxel boundary overlay. */
   readonly setCollisionBoundaryVisible: (visible: boolean) => void;
+  /** True once a cyan MC shell / collision overlay exists this session. */
+  readonly hasCollisionBoundary: Ref<boolean>;
   /** Show or hide the green walkable navmesh overlay (click-to-move target). */
   readonly setNavMeshVisible: (visible: boolean) => void;
+  /** Enable NavMesh Editor tools (suppresses click-to-move while on). */
+  readonly setNavMeshEditorEnabled: (enabled: boolean) => void;
+  readonly setNavMeshEditorMode: (mode: 'vertex' | 'circle' | 'global') => void;
+  readonly navMeshEditorGlobalY: (steps: number) => void;
+  readonly navMeshEditorFillHole: () => boolean;
+  readonly navMeshEditorDeleteVertices: () => Promise<boolean>;
+  readonly applyNavMeshEditorToLive: () => Promise<boolean>;
+  readonly onNavMeshEditorStatus: (
+    listener: (status: import('@/navigation/navmeshEditor').NavMeshEditorStatus) => void
+  ) => () => void;
+  readonly getNavMeshEditorStatus: () => import('@/navigation/navmeshEditor').NavMeshEditorStatus | null;
+  /** Detour binary including post-editor rebakes. */
+  readonly getNavMeshData: () => Uint8Array | null;
   /** Full NM override panel (floor coverage + Recast), shared with Storage Adapter. */
   readonly navSettings: Ref<DemoNavSettings>;
-  /** Reset {@link navSettings} to outdoor defaults. */
+  /** Reset {@link navSettings} to the indoor/outdoor preset for the current scene type. */
   readonly resetNavSettings: () => void;
   /**
    * Whether WASM floater pruning runs on the next Fast Nav.
@@ -172,15 +277,41 @@ export interface UseSplatFastNav {
   readonly selectionRegionVisible: Ref<boolean>;
   /** Show or hide the selection region (pins Fast Nav / collision AABB when shown). */
   readonly setSelectionRegionVisible: (visible: boolean) => Promise<void>;
-  /** Re-run Fast Nav on the loaded splat using current prune / region / scale. */
-  readonly rerunFastNav: () => Promise<void>;
   /**
-   * Apply absolute uniform environment scale to the splat, then re-run FAST NAV
-   * so collision / navmesh bake in the same world meters.
-   * When no splat is loaded yet, only stashes the scale for the next Fast Nav.
+   * Re-run Fast Nav on the loaded splat using current prune / region / session scale.
+   * Pass {@link scaleMultiplier} (UI factor; `1` = no change) to multiply session
+   * scale before the cache key / WASM bake.
    */
-  readonly applyEnvironmentScale: (scale: number) => Promise<void>;
-  /** Stash scale for the next Fast Nav without rebuilding (no-op if invalid). */
+  readonly rerunFastNav: (options?: { readonly scaleMultiplier?: number }) => Promise<void>;
+  /** Nav generation technique (floor field, voxel collision, or WASM SDF-MC). */
+  readonly navGenerationMode: Ref<NavGenerationMode>;
+  /**
+   * Indoor sealed fill vs outdoor floor fill for voxel / SDF-MC Fast Nav.
+   * Example scene buttons seed this; the Scene type dropdown overrides it.
+   */
+  readonly collisionSceneType: Ref<ExampleCollisionSceneType>;
+  /** Apply scene type and matching indoor/outdoor DemoNavSettings preset. */
+  readonly setCollisionSceneType: (sceneType: ExampleCollisionSceneType) => void;
+  /** Active locomotion intent (Recast / Voxel mesh / dual). */
+  readonly activeNavigationMode: Ref<ActiveNavigationMode>;
+  readonly setActiveNavigationMode: (mode: ActiveNavigationMode) => Promise<void>;
+  readonly activeNavigationModeDisabledReason: (mode: ActiveNavigationMode) => string | null;
+  readonly liveBackend: Ref<LiveNavBackend>;
+  readonly navCapabilities: ComputedRef<NavCapabilities>;
+  /**
+   * Multiply session environment scale by {@link scaleMultiplier} (`1` = no-op),
+   * then re-run FAST NAV so collision / navmesh bake in the same world meters.
+   * When no splat is loaded yet, only updates the pending session scale.
+   */
+  readonly applyEnvironmentScale: (scaleMultiplier: number) => Promise<void>;
+  /**
+   * Multiply session scale by {@link scaleMultiplier} (`1` = no-op) without rebuilding.
+   * @returns Absolute session scale after the update
+   */
+  readonly applyScaleMultiplier: (scaleMultiplier: number) => number;
+  /** Absolute session environment scale (splat transform + WASM bake factor). */
+  readonly sessionEnvironmentScale: Ref<number>;
+  /** Stash absolute scale for the next Fast Nav without rebuilding (no-op if invalid). */
   readonly setPendingEnvironmentScale: (scale: number) => void;
   /** Reset back to the idle state, clearing logs and errors. */
   readonly reset: () => void;
@@ -213,9 +344,10 @@ export function useSplatFastNav(
   const splatCount = ref<number | null>(null);
   const maxShDegree = ref(DEFAULT_SLICE_SETTINGS.sh_degree);
   const maxChunkExtent = ref(DEFAULT_SLICE_SETTINGS.chunk_extent);
+  // HEAD / prod floor_field uses outdoor-wide DemoNavSettings (coverage parity).
   const navSettings = ref<DemoNavSettings>({
-    ...DEFAULT_DEMO_NAV_SETTINGS,
-    pruneFloaters: options.prune?.enabled ?? DEFAULT_DEMO_NAV_SETTINGS.pruneFloaters,
+    ...DEFAULT_OUTDOOR_DEMO_NAV_SETTINGS,
+    pruneFloaters: options.prune?.enabled ?? DEFAULT_OUTDOOR_DEMO_NAV_SETTINGS.pruneFloaters,
   });
   const pruneFloaters = computed({
     get: () => navSettings.value.pruneFloaters,
@@ -226,41 +358,309 @@ export function useSplatFastNav(
   const selectionRegionVisible = ref(false);
   const hasLoadedSplat = ref(false);
   const hasNavMesh = ref(false);
+  const hasCollisionBoundary = ref(false);
+  const topDownViewApplied = ref(false);
+  const navGenerationMode = ref<NavGenerationMode>('floor_field');
+  const collisionSceneType = ref<ExampleCollisionSceneType>('indoor');
+  const activeNavigationMode = ref<ActiveNavigationMode>(DEFAULT_ACTIVE_NAVIGATION_MODE);
+  const liveBackend = ref<LiveNavBackend>('none');
+  const controlsMode = ref<NavKitControlsMode>(DEFAULT_NAV_KIT_CONTROLS_MODE_NEW);
   const isBusy = computed(() => status.value === 'loading' || status.value === 'processing');
   const hasLoadedSplatComputed = computed(() => hasLoadedSplat.value);
+  const cameraInfo = ref<NavKitCameraPoseInfo>(emptyNavKitCameraPoseInfo());
+  const playerInfo = ref<NavKitPlayerPoseInfo>(emptyNavKitPlayerPoseInfo());
+  const cameraInfoCopyText = computed(() => formatNavKitCameraCopyText(cameraInfo.value));
+  const playerInfoCopyText = computed(() => formatNavKitPlayerCopyText(playerInfo.value));
+  let cameraInfoPanelOpen = false;
+  let playerInfoPanelOpen = false;
+  let poseInfoRafId = 0;
+
+  const resolveCollisionSceneType = (algo: NavGenerationMode): ExampleCollisionSceneType =>
+    collisionSceneTypeForAlgo({
+      algo,
+      exampleSceneType: collisionSceneType.value,
+    });
 
   let wasmReady = false;
   // Bytes + base name of the loaded scene, retained for SOG export.
   let currentBytes: Uint8Array | null = null;
+  /** Original dropped/uploaded model bytes (pre-normalize) for NavKit packs. */
+  let currentModelSourceBytes: Uint8Array | null = null;
+  let currentModelFilename = 'model.ply';
   let currentName = 'splat';
   let currentCollisionArtifact: CollisionBoundaryArtifact | null = null;
   let currentNavMeshData: Uint8Array | null = null;
   let currentNavArtifactBundle: NavArtifactBundle | null = null;
+  /** Session locomotion artifacts — shallowRef so navCapabilities stays live after Fast Nav. */
+  const sessionVolume = shallowRef<CollisionVoxelVolume | null>(null);
+  const sessionRecastBin = shallowRef<Uint8Array | null>(null);
+  const sessionSeed = shallowRef<number[] | null>(null);
+  const sessionSpawn = shallowRef<[number, number, number] | null>(null);
   let sessionCameraSelect: CameraSelectRegionInput | undefined = options.cameraSelect;
   /** Stashed so Scale Environment set before load applies on first Fast Nav. */
   let pendingEnvironmentScale = 1;
+  /** Absolute session scale (reactive mirror of viewer / pending). */
+  const sessionEnvironmentScale = ref(1);
+
+  const buildDemoCollisionSettings = (params: {
+    readonly algo: NavGenerationMode;
+    readonly emitGlb: boolean;
+    readonly emitVolume?: boolean;
+    readonly flipY: boolean;
+    readonly rotation: [number, number, number];
+    readonly seed?: number[];
+  }) => {
+    const sceneType = resolveCollisionSceneType(params.algo);
+    const keepVolume =
+      params.emitVolume ?? shouldKeepVolumeForActiveMode(activeNavigationMode.value);
+    const environmentScale =
+      babylon.viewer.value?.getEnvironmentScale() ?? pendingEnvironmentScale;
+    return buildCollisionBoundarySettings({
+      base: {
+        ...voxelNavSettingsToCollisionBase({
+          ...DEFAULT_VOXEL_NAV_SETTINGS,
+          collisionSceneType: sceneType,
+        }),
+        prune_floaters: navSettings.value.pruneFloaters,
+        collision_mesh_mode: params.algo === 'sdf_marching_cubes' ? 'smooth' : 'walkable_floors',
+        collision_scene_type: sceneType,
+        environment_scale: environmentScale,
+        ...(params.algo === 'sdf_marching_cubes'
+          ? {
+              sdf_band_voxels: DEFAULT_VOXEL_NAV_SETTINGS.sdfBandVoxels,
+              mc_iso_level: DEFAULT_VOXEL_NAV_SETTINGS.mcIsoLevel,
+              mc_smooth_iterations: DEFAULT_VOXEL_NAV_SETTINGS.mcSmoothIterations,
+              ...(sceneType === 'outdoor'
+                ? { floor_project_flatten_m: OUTDOOR_SDF_MC_FLOOR_PROJECT_FLATTEN_M }
+                : {}),
+            }
+          : {}),
+      },
+      emitGlb: params.emitGlb,
+      emitVolume: keepVolume || params.algo === 'voxel_collision',
+      flipY: params.flipY,
+      rotation: params.rotation,
+      seed: params.seed,
+    });
+  };
   /** Last selection-region AABB so hide→show can restore the user's box. */
   let cachedSelectionRegion: { min: number[]; max: number[] } | null = null;
   const cameraSelectOffsets = ref<CameraSelectRegionOffsets>({
     ...DEFAULT_CAMERA_SELECT_REGION_OFFSETS,
   });
-  const hasNavArtifactBundle = computed(() => currentNavArtifactBundle !== null);
+  // Plain lets are not reactive — mirror readiness into refs (same pattern as sessionVolume).
+  const hasNavArtifactBundle = ref(false);
+  const hasNavKit = ref(false);
+  const syncNavExportReadiness = (): void => {
+    hasNavArtifactBundle.value = currentNavArtifactBundle !== null;
+    hasNavKit.value =
+      currentNavArtifactBundle !== null &&
+      currentModelSourceBytes !== null &&
+      currentModelSourceBytes.byteLength > 0;
+  };
+  const navCapabilities = computed<NavCapabilities>(() =>
+    navCapabilitiesFromParts({
+      recastBin: sessionRecastBin.value,
+      volume: sessionVolume.value,
+    })
+  );
 
-  const storeMinimalNavArtifacts = (
-    navMeshData: Uint8Array,
-    playerSpawn: { x: number; y: number; z: number } | null | undefined
-  ): void => {
+  const storeMinimalNavArtifacts = async (params: {
+    readonly debugIndices?: Uint32Array | null;
+    readonly debugPositions?: Float32Array | null;
+    readonly navMeshData: Uint8Array;
+    readonly playerSpawn: { x: number; y: number; z: number } | null | undefined;
+    readonly volume?: CollisionVoxelVolume | null;
+  }): Promise<void> => {
     const viewer = babylon.viewer.value;
     const region = viewer?.getWasmRegionBounds() ?? null;
-    currentNavArtifactBundle = buildMinimalNavArtifactBundle({
+    currentNavArtifactBundle = await buildMinimalNavArtifactBundle({
       collisionGlb: currentCollisionArtifact?.result.glb ?? null,
-      navMeshData,
-      playerSpawn: playerSpawn
-        ? [playerSpawn.x, playerSpawn.y, playerSpawn.z]
+      debugIndices: params.debugIndices ?? null,
+      debugPositions: params.debugPositions ?? null,
+      navMeshData: params.navMeshData,
+      playerSpawn: params.playerSpawn
+        ? [params.playerSpawn.x, params.playerSpawn.y, params.playerSpawn.z]
         : null,
       regionMax: region?.max ?? null,
       regionMin: region?.min ?? null,
+      volume: params.volume ?? sessionVolume.value,
     });
+    syncNavExportReadiness();
+  };
+
+  /** Keep session Detour bin + NavKit/artifact packs aligned after editor rebake. */
+  const syncSessionFromEditedRebake = async (result: {
+    readonly navMeshData: Uint8Array;
+    readonly debugPositions: Float32Array;
+    readonly debugIndices: Uint32Array;
+  }): Promise<void> => {
+    currentNavMeshData = result.navMeshData;
+    sessionRecastBin.value = result.navMeshData;
+    const spawn = sessionSpawn.value;
+    await storeMinimalNavArtifacts({
+      debugIndices: result.debugIndices,
+      debugPositions: result.debugPositions,
+      navMeshData: result.navMeshData,
+      playerSpawn: spawn
+        ? { x: spawn[0]!, y: spawn[1]!, z: spawn[2]! }
+        : null,
+      volume: sessionVolume.value,
+    });
+    appendLog('[INFO] NavMesh Editor rebake synced to session / NavKit artifacts.');
+  };
+
+  let unsubEditedNavMeshRebake: (() => void) | null = null;
+  watch(
+    () => babylon.viewer.value,
+    (viewer) => {
+      unsubEditedNavMeshRebake?.();
+      unsubEditedNavMeshRebake = null;
+      if (!viewer) {
+        return;
+      }
+      unsubEditedNavMeshRebake = viewer.onEditedNavMeshRebake((result) =>
+        syncSessionFromEditedRebake(result)
+      );
+    },
+    { immediate: true }
+  );
+
+  const syncSessionFromFastNav = (params: {
+    readonly navMeshData: Uint8Array;
+    readonly playerSpawn: { x: number; y: number; z: number } | null | undefined;
+    readonly volume?: CollisionVoxelVolume | null;
+  }): void => {
+    sessionRecastBin.value = params.navMeshData;
+    sessionVolume.value = params.volume ?? null;
+    sessionSpawn.value = params.playerSpawn
+      ? [params.playerSpawn.x, params.playerSpawn.y, params.playerSpawn.z]
+      : null;
+    sessionSeed.value = sessionSpawn.value ? [...sessionSpawn.value] : null;
+    liveBackend.value =
+      navGenerationMode.value === 'floor_field'
+        ? 'recast_crowd'
+        : initialLiveBackendForActiveMode(activeNavigationMode.value);
+    const caps = navCapabilitiesFromParts({
+      recastBin: sessionRecastBin.value,
+      volume: sessionVolume.value,
+    });
+    appendLog(
+      `[INFO] Session nav caps: hasRecast=${caps.hasRecast} hasVolume=${caps.hasVolume}` +
+        ` · live=${liveNavBackendLabel(liveBackend.value)}.`
+    );
+    if (
+      navGenerationMode.value !== 'floor_field' &&
+      !sessionVolume.value &&
+      (activeNavigationMode.value === 'voxel_mesh' ||
+        activeNavigationMode.value === 'recast_and_voxel_mesh')
+    ) {
+      appendLog(
+        '[WARN] No volume in session — Active Voxel / Dual click-to-walk needs a re-run with emit_volume.'
+      );
+    }
+  };
+
+  const setCollisionSceneType = (sceneType: ExampleCollisionSceneType): void => {
+    collisionSceneType.value = sceneType;
+    // floor_field matches HEAD/prod outdoor bands; indoor/outdoor presets apply to voxel/SDF-MC.
+    if (navGenerationMode.value === 'floor_field') {
+      appendLog(
+        `[INFO] Scene type → ${sceneType} (floor_field keeps outdoor DemoNavSettings like HEAD).`
+      );
+      return;
+    }
+    navSettings.value = demoNavSettingsForSceneType(sceneType, {
+      preservePrune: navSettings.value.pruneFloaters,
+    });
+    appendLog(
+      `[INFO] Scene type → ${sceneType}; applied ${sceneType} DemoNavSettings preset.`
+    );
+  };
+
+  watch(navGenerationMode, (mode) => {
+    if (mode === 'floor_field' && activeNavigationMode.value !== 'recast') {
+      activeNavigationMode.value = 'recast';
+      appendLog(
+        '[INFO] Active navigation mode → Recast (floor field cannot produce voxel volume).'
+      );
+    }
+    if (mode === 'floor_field') {
+      navSettings.value = {
+        ...DEFAULT_OUTDOOR_DEMO_NAV_SETTINGS,
+        pruneFloaters: navSettings.value.pruneFloaters,
+      };
+      appendLog('[INFO] floor_field: restored outdoor DemoNavSettings (HEAD/prod parity).');
+    } else {
+      navSettings.value = demoNavSettingsForSceneType(collisionSceneType.value, {
+        preservePrune: navSettings.value.pruneFloaters,
+      });
+      appendLog(
+        `[INFO] Applied ${collisionSceneType.value} DemoNavSettings for ${mode}.`
+      );
+    }
+  });
+
+  const activeNavigationModeDisabledReason = (mode: ActiveNavigationMode): string | null =>
+    sharedActiveNavigationModeDisabledReason({
+      algo: navGenerationMode.value,
+      busy: isBusy.value,
+      caps: navCapabilities.value,
+      liveBackend: liveBackend.value,
+      mode,
+    });
+
+  const setActiveNavigationMode = async (mode: ActiveNavigationMode): Promise<void> => {
+    if (isBusy.value) {
+      appendLog('[WARN] Active navigation mode ignored — busy.');
+      return;
+    }
+    if (navGenerationMode.value === 'floor_field' && mode !== 'recast') {
+      const reason = activeNavigationModeDisabledReason(mode) ?? 'not available';
+      appendLog(`[WARN] Active ${mode} unavailable: ${reason}`);
+      errorMessage.value = reason;
+      return;
+    }
+    const previous = activeNavigationMode.value;
+    activeNavigationMode.value = mode;
+    const viewer = babylon.viewer.value;
+    const result = await resolveActiveNavigationChange({
+      liveBackend: liveBackend.value,
+      mode,
+      onLog: appendLog,
+      previousMode: previous,
+      recastBin: sessionRecastBin.value,
+      seed: sessionSeed.value,
+      spawnHint: sessionSpawn.value,
+      viewer: viewer ?? null,
+      volume: sessionVolume.value,
+    });
+    liveBackend.value = result.liveBackend;
+    if (!result.applied) {
+      activeNavigationMode.value = result.revertToMode ?? previous;
+      errorMessage.value =
+        result.failureMessage ??
+        'Could not switch Live locomotion — missing volume or Recast assets. ' +
+          'Re-run Nav under Voxel / SDF-MC with volume, then try again.';
+      return;
+    }
+    errorMessage.value = null;
+    if (result.liveBackend !== 'none' && viewer) {
+      hasNavMesh.value = true;
+      viewer.setControlsMode(controlsMode.value);
+      const framing = viewer.focusOnPlayer();
+      if (framing) {
+        topDownViewApplied.value = true;
+        appendLog(
+          `[SUCCESS] Top-down view above player at ` +
+            `${framing.player.map((v) => v.toFixed(2)).join(', ')}.`
+        );
+      }
+      statusMessage.value =
+        result.liveBackend === 'recast_crowd'
+          ? 'Live: Recast crowd. Click the green navmesh to move.'
+          : 'Live: Voxel walk. Click surfaces — player walks to nearest floor cell.';
+    }
   };
 
   const resolveFastNavTuning = () => {
@@ -276,6 +676,7 @@ export function useSplatFastNav(
 
   const appendLog = (message: string): void => {
     logs.value.push(parseLog(message));
+    console.log(message);
   };
 
   // Throttled WASM progress (parse/prune/...) flows through the shared bridge.
@@ -284,6 +685,14 @@ export function useSplatFastNav(
   };
 
   const reset = (): void => {
+    cameraInfoPanelOpen = false;
+    playerInfoPanelOpen = false;
+    if (poseInfoRafId !== 0) {
+      cancelAnimationFrame(poseInfoRafId);
+      poseInfoRafId = 0;
+    }
+    cameraInfo.value = emptyNavKitCameraPoseInfo();
+    playerInfo.value = emptyNavKitPlayerPoseInfo();
     status.value = 'idle';
     statusMessage.value = 'Drop a .ply, .spz, or .splat splat to begin.';
     errorMessage.value = null;
@@ -294,31 +703,57 @@ export function useSplatFastNav(
     maxShDegree.value = DEFAULT_SLICE_SETTINGS.sh_degree;
     maxChunkExtent.value = DEFAULT_SLICE_SETTINGS.chunk_extent;
     currentBytes = null;
+    currentModelSourceBytes = null;
+    currentModelFilename = 'model.ply';
     currentCollisionArtifact = null;
     currentName = 'splat';
     currentNavMeshData = null;
+    currentNavArtifactBundle = null;
+    syncNavExportReadiness();
     pendingEnvironmentScale = 1;
+    sessionEnvironmentScale.value = 1;
     cachedSelectionRegion = null;
     hasLoadedSplat.value = false;
     hasNavMesh.value = false;
+    hasCollisionBoundary.value = false;
+    topDownViewApplied.value = false;
+    sessionVolume.value = null;
+    sessionRecastBin.value = null;
+    sessionSeed.value = null;
+    sessionSpawn.value = null;
+    liveBackend.value = 'none';
+    activeNavigationMode.value = DEFAULT_ACTIVE_NAVIGATION_MODE;
     navSettings.value = {
-      ...DEFAULT_DEMO_NAV_SETTINGS,
-      pruneFloaters: options.prune?.enabled ?? DEFAULT_DEMO_NAV_SETTINGS.pruneFloaters,
+      ...DEFAULT_OUTDOOR_DEMO_NAV_SETTINGS,
+      pruneFloaters: options.prune?.enabled ?? DEFAULT_OUTDOOR_DEMO_NAV_SETTINGS.pruneFloaters,
     };
     selectionRegionVisible.value = false;
     babylon.viewer.value?.disableRegionSelection();
+    babylon.viewer.value?.clearColliderMesh();
     babylon.viewer.value?.setEnvironmentScale(1);
   };
 
   const resetNavSettings = (): void => {
-    navSettings.value = {
-      ...DEFAULT_DEMO_NAV_SETTINGS,
-      pruneFloaters: options.prune?.enabled ?? DEFAULT_DEMO_NAV_SETTINGS.pruneFloaters,
-    };
-    appendLog('[INFO] Navmesh settings reset to outdoor defaults.');
+    if (navGenerationMode.value === 'floor_field') {
+      navSettings.value = {
+        ...DEFAULT_OUTDOOR_DEMO_NAV_SETTINGS,
+        pruneFloaters: options.prune?.enabled ?? navSettings.value.pruneFloaters,
+      };
+      appendLog('[INFO] Navmesh settings reset to outdoor defaults (floor_field / HEAD).');
+      return;
+    }
+    navSettings.value = demoNavSettingsForSceneType(collisionSceneType.value, {
+      preservePrune: options.prune?.enabled ?? navSettings.value.pruneFloaters,
+    });
+    appendLog(
+      `[INFO] Navmesh settings reset to ${collisionSceneType.value} defaults.`
+    );
   };
 
-  const processFile = async (file: File): Promise<void> => {
+  const processFile = async (
+    file: File,
+    processOptions?: { readonly skipNav?: boolean }
+  ): Promise<void> => {
     const name = file.name.toLowerCase();
     if (!SUPPORTED_EXTENSIONS.some((ext) => name.endsWith(ext))) {
       errorMessage.value = 'Only .ply, .spz, and .splat splat files are supported.';
@@ -333,6 +768,12 @@ export function useSplatFastNav(
 
       const viewer = await babylon.initViewer();
       viewer.setEnvironmentScale(pendingEnvironmentScale);
+      sessionEnvironmentScale.value = pendingEnvironmentScale;
+      viewer.clearColliderMesh();
+      hasCollisionBoundary.value = false;
+      viewer.disableRegionSelection();
+      selectionRegionVisible.value = false;
+      cachedSelectionRegion = null;
 
       if (!wasmReady) {
         appendLog('[WAIT] Initializing SplatWalk WASM...');
@@ -340,8 +781,9 @@ export function useSplatFastNav(
         wasmReady = true;
       }
 
-      // Normalize to PLY once (WASM is ready above), then reuse the same bytes
-      // for both the viewer and the nav pipeline.
+      // Keep original bytes for NavKit packs; normalize a copy for viewer / nav.
+      currentModelSourceBytes = new Uint8Array(await file.arrayBuffer());
+      currentModelFilename = file.name;
       const bytes = await readSplatBytes(file);
       maxShDegree.value = inferPlyShDegree(bytes);
       await viewer.loadGaussianSplat(bytes);
@@ -352,9 +794,9 @@ export function useSplatFastNav(
       currentCollisionArtifact = null;
       currentName = file.name.replace(/\.(ply|spz|splat)$/i, '');
       currentNavMeshData = null;
+      currentNavArtifactBundle = null;
+      syncNavExportReadiness();
       hasNavMesh.value = false;
-      // Capture the raw splat count for the export UI (cheap: the parse is cached
-      // and reused by the FAST NAV run below).
       try {
         const bounds = await splatwalk.getSplatBounds(bytes, { mode: 2, prune_floaters: false } as MeshSettings);
         splatCount.value = bounds.point_count;
@@ -367,24 +809,77 @@ export function useSplatFastNav(
         maxChunkExtent.value = DEFAULT_SLICE_SETTINGS.chunk_extent;
       }
 
+      if (processOptions?.skipNav) {
+        topDownViewApplied.value = false;
+        phase.value = 'idle';
+        progress.value = null;
+        status.value = 'done';
+        statusMessage.value = 'Splat loaded (nav restore pending).';
+        return;
+      }
+
+      topDownViewApplied.value = false;
       status.value = 'processing';
       statusMessage.value = 'Running FAST NAV...';
       const tuning = resolveFastNavTuning();
+      const mode = navGenerationMode.value;
       appendLog(`[INFO] Floater prune: ${tuning.prune.enabled === false ? 'off' : 'on'}`);
+      appendLog(`[INFO] Collision scene type: ${resolveCollisionSceneType(mode)}`);
+      const rotation = viewer.getSplatRotation();
+      const collisionSettings =
+        mode === 'floor_field'
+          ? undefined
+          : buildDemoCollisionSettings({
+              algo: mode,
+              emitGlb: false,
+              emitVolume: true,
+              flipY: viewer.isSplatYFlipped(),
+              rotation: [rotation.x, rotation.y, rotation.z],
+              seed: seedFromRegionBounds({ regionBounds: viewer.getRegionBounds() }),
+            });
+      const activeMode =
+        mode === 'floor_field' ? 'recast' : activeNavigationMode.value;
+      if (mode === 'floor_field' && activeNavigationMode.value !== 'recast') {
+        activeNavigationMode.value = 'recast';
+      }
+      const sceneTypeForRun = resolveCollisionSceneType(mode);
       const fastNav = await runFastNav({
+        activeNavigationMode: activeMode,
+        algo: mode,
         viewer,
         bytes,
         cameraSelect: sessionCameraSelect ?? options.cameraSelect,
         keepCameraSelectView: options.keepCameraSelectView,
+        collisionSettings,
         onLog: appendLog,
         onPhase: (next) => { phase.value = next; },
         recovery: options.recovery,
         strayTrim: options.strayTrim,
         ...tuning,
+        // Outdoor floor_field: seed-centered ~100 m pin (Storage Adapter / prod parity).
+        seedCenteredOutdoor: mode === 'floor_field' && sceneTypeForRun === 'outdoor',
       });
       currentNavMeshData = fastNav.navMeshData;
       hasNavMesh.value = true;
-      storeMinimalNavArtifacts(fastNav.navMeshData, fastNav.playerSpawn);
+      viewer.setControlsMode(controlsMode.value);
+      if (mode === 'voxel_collision' || mode === 'sdf_marching_cubes') {
+        hasCollisionBoundary.value = true;
+      }
+      if (viewer.getRegionBounds()) {
+        selectionRegionVisible.value = true;
+      }
+      syncSessionFromFastNav({
+        navMeshData: fastNav.navMeshData,
+        playerSpawn: fastNav.playerSpawn,
+        volume: fastNav.volume,
+      });
+      await storeMinimalNavArtifacts({
+        debugIndices: fastNav.debugIndices,
+        debugPositions: fastNav.debugPositions,
+        navMeshData: fastNav.navMeshData,
+        playerSpawn: fastNav.playerSpawn,
+        volume: fastNav.volume,
+      });
       phase.value = 'done';
       progress.value = null;
 
@@ -392,6 +887,7 @@ export function useSplatFastNav(
         statusMessage.value = 'Framing the player (top-down)...';
         const framing = viewer.focusOnPlayer();
         if (framing) {
+          topDownViewApplied.value = true;
           appendLog(
             `[SUCCESS] Top-down view set above player at ` +
               `${framing.player.map((v) => v.toFixed(2)).join(', ')}.`
@@ -408,11 +904,118 @@ export function useSplatFastNav(
       errorMessage.value = detail;
       appendLog(`[ERROR] ${detail}`);
       status.value = 'error';
-      statusMessage.value = 'FAST NAV failed.';
+      statusMessage.value = processOptions?.skipNav ? 'Splat load failed.' : 'FAST NAV failed.';
       // Keep any prior navmesh if recompute failed after a successful run.
       if (!currentNavMeshData) {
         hasNavMesh.value = false;
       }
+    }
+  };
+
+  const loadSplatOnly = async (file: File): Promise<void> => {
+    if (isBusy.value) {
+      return;
+    }
+    errorMessage.value = null;
+    await processFile(file, { skipNav: true });
+  };
+
+  const loadNavKit = async (file: File): Promise<void> => {
+    if (isBusy.value) {
+      return;
+    }
+    errorMessage.value = null;
+    logs.value = [];
+    phase.value = 'idle';
+    progress.value = null;
+    try {
+      status.value = 'loading';
+      statusMessage.value = `Loading NavKit ${file.name}...`;
+      appendLog(`[INFO] Loading NavKit: ${file.name} (${file.size} bytes)`);
+      const kit = await parseNavKitFile(file);
+      appendLog(
+        `[INFO] NavKit meta: technique=${kit.meta.defaultNavTechnique}` +
+          ` active=${kit.meta.defaultActiveNavigationMode}` +
+          ` locomotion=${kit.meta.defaultLocomotionMode}.`
+      );
+      navGenerationMode.value = kit.meta.defaultNavTechnique;
+      activeNavigationMode.value = kit.meta.defaultActiveNavigationMode;
+      await processFile(kit.modelFile, { skipNav: true });
+      if (status.value === 'error') {
+        throw new Error(errorMessage.value ?? 'Failed to load NavKit model.');
+      }
+      const viewer = babylon.viewer.value;
+      if (!viewer) {
+        throw new Error('Viewer not ready after NavKit model load.');
+      }
+      status.value = 'processing';
+      statusMessage.value = 'Restoring NavKit nav artifacts...';
+      viewer.clearNavArtifacts();
+      currentNavArtifactBundle = kit.navParsed.bundle;
+      currentModelSourceBytes = kit.modelBytes;
+      currentModelFilename = kit.meta.model.filename;
+      currentName = kit.meta.slug;
+      syncNavExportReadiness();
+      if (kit.navParsed.bundle.recastNavmeshBin) {
+        currentNavMeshData = kit.navParsed.bundle.recastNavmeshBin;
+        sessionRecastBin.value = kit.navParsed.bundle.recastNavmeshBin;
+      }
+      sessionVolume.value = kit.navParsed.volume;
+      if (
+        kit.navParsed.session.playerSpawn &&
+        kit.navParsed.session.playerSpawn.length >= 3
+      ) {
+        sessionSpawn.value = [
+          kit.navParsed.session.playerSpawn[0]!,
+          kit.navParsed.session.playerSpawn[1]!,
+          kit.navParsed.session.playerSpawn[2]!,
+        ];
+        sessionSeed.value = [...sessionSpawn.value];
+      } else if (
+        kit.navParsed.session.collisionSeed &&
+        kit.navParsed.session.collisionSeed.length >= 3
+      ) {
+        sessionSeed.value = [...kit.navParsed.session.collisionSeed];
+      }
+      await applyNavArtifactsToViewer({
+        focusCamera: false,
+        onLog: appendLog,
+        parsed: kit.navParsed,
+        viewer,
+      });
+      const metaApplied = applyNavKitMetaToViewer({
+        meta: kit.meta,
+        onLog: appendLog,
+        parsed: kit.navParsed,
+        viewer,
+      });
+      topDownViewApplied.value = metaApplied.topDownViewApplied;
+      controlsMode.value = metaApplied.controlsMode;
+      liveBackend.value =
+        kit.meta.defaultLocomotionMode === 'voxel_walk' ||
+        kit.navParsed.session.locomotionMode === 'voxel_walk'
+          ? 'voxel_walk'
+          : 'recast_crowd';
+      hasNavMesh.value = true;
+      if (kit.navParsed.bundle.collisionGlb) {
+        hasCollisionBoundary.value = true;
+      }
+      if (viewer.getRegionBounds()) {
+        selectionRegionVisible.value = true;
+      }
+      phase.value = 'done';
+      progress.value = null;
+      status.value = 'done';
+      statusMessage.value =
+        'NavKit restored. Use Controls (click / WASDQE / both) to move.';
+      appendLog(`[SUCCESS] NavKit loaded. ${NAV_KIT_UPLOAD_HINT}`);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      errorMessage.value = detail;
+      appendLog(`[ERROR] ${detail}`);
+      status.value = 'error';
+      statusMessage.value = 'NavKit load failed.';
+      throw error;
     }
   };
 
@@ -424,10 +1027,19 @@ export function useSplatFastNav(
     logs.value = [];
     phase.value = 'idle';
     progress.value = null;
+    const kitMeta = await peekNavKitMeta(file);
+    if (kitMeta) {
+      await loadNavKit(file);
+      return;
+    }
     await processFile(file);
   };
 
-  const loadExample = async (url: string, title: string): Promise<void> => {
+  const loadExample = async (
+    url: string,
+    title: string,
+    sceneType: ExampleCollisionSceneType = 'indoor'
+  ): Promise<void> => {
     if (isBusy.value) {
       return;
     }
@@ -435,11 +1047,14 @@ export function useSplatFastNav(
     logs.value = [];
     phase.value = 'idle';
     progress.value = null;
+    setCollisionSceneType(sceneType);
 
     try {
       status.value = 'loading';
       statusMessage.value = `Fetching ${title}...`;
-      appendLog(`[WAIT] Fetching example scene: ${title}...`);
+      appendLog(
+        `[WAIT] Fetching example scene: ${title} (collision_scene_type=${sceneType})...`
+      );
 
       // Load via Babylon's XHR-based loader (Tools.LoadFile) rather than fetch():
       // the browser fetch() stream aborts mid-body on some networks, while
@@ -479,12 +1094,16 @@ export function useSplatFastNav(
   };
 
   const exportNavmesh = async (): Promise<void> => {
-    if (!currentNavMeshData) {
+    const data =
+      babylon.viewer.value?.getNavMeshData() ?? currentNavMeshData;
+    if (!data) {
       throw new Error('No navmesh generated to export.');
     }
+    currentNavMeshData = data;
+    sessionRecastBin.value = data;
     exportNavmeshBinary({
       filename: `${currentName}.nav`,
-      navMeshData: currentNavMeshData,
+      navMeshData: data,
     });
   };
 
@@ -495,10 +1114,10 @@ export function useSplatFastNav(
       throw new Error('No loaded splat to generate collision from.');
     }
     const rotation = viewer.getSplatRotation();
-    const settings = buildCollisionBoundarySettings({
-      base: {
-        prune_floaters: navSettings.value.pruneFloaters,
-      },
+    const algo = navGenerationMode.value;
+    const useSmooth = algo === 'sdf_marching_cubes';
+    const settings = buildDemoCollisionSettings({
+      algo,
       emitGlb: true,
       flipY: viewer.isSplatYFlipped(),
       rotation: [rotation.x, rotation.y, rotation.z],
@@ -506,11 +1125,35 @@ export function useSplatFastNav(
     });
     const artifact = await generateCollisionBoundaryArtifact({ bytes, settings });
     currentCollisionArtifact = artifact;
-    viewer.displayColliderMesh(artifact.result.mesh.vertices, artifact.result.mesh.indices, 0.35);
-    viewer.setColliderVisible(true);
-    appendLog(
-      `[SUCCESS] Collision boundary ready: ${artifact.result.mesh.vertex_count} vertices, ${artifact.result.mesh.face_count} faces.`
-    );
+    if (useSmooth) {
+      const mcShell = requireSdfMcColliderMesh({
+        colliderMesh: artifact.result.collider_mesh,
+        recastMesh: artifact.result.mesh,
+      });
+      viewer.displayColliderMesh(
+        new Float32Array(mcShell.vertices),
+        new Uint32Array(mcShell.indices),
+        0.35
+      );
+      viewer.setColliderVisible(true);
+      hasCollisionBoundary.value = true;
+      appendLog(
+        `[SUCCESS] Collision boundary ready: SDF-MC cyan = collider_mesh (interior MC shell): ` +
+          `${mcShell.vertex_count} verts, ${mcShell.face_count} faces.`
+      );
+    } else {
+      const overlay = artifact.result.mesh;
+      viewer.displayColliderMesh(
+        new Float32Array(overlay.vertices),
+        new Uint32Array(overlay.indices),
+        0.35
+      );
+      viewer.setColliderVisible(true);
+      hasCollisionBoundary.value = true;
+      appendLog(
+        `[SUCCESS] Collision boundary ready: ${overlay.vertex_count} vertices, ${overlay.face_count} faces.`
+      );
+    }
     return artifact;
   };
 
@@ -534,6 +1177,7 @@ export function useSplatFastNav(
     }
     const framing = viewer.focusOnPlayer();
     if (framing) {
+      topDownViewApplied.value = true;
       appendLog(
         `[SUCCESS] Go to Player — top-down at ` +
           `${framing.player.map((v) => v.toFixed(2)).join(', ')}.`
@@ -543,9 +1187,129 @@ export function useSplatFastNav(
     appendLog('[WARN] Go to Player: focusOnPlayer returned null.');
   };
 
+  const stopPoseInfoSampling = (): void => {
+    if (poseInfoRafId !== 0) {
+      cancelAnimationFrame(poseInfoRafId);
+      poseInfoRafId = 0;
+    }
+  };
+
+  const samplePoseInfoOnce = (): void => {
+    const viewer = babylon.viewer.value;
+    const cam = viewer?.getCameraPoseNavKit() ?? null;
+    if (cam) {
+      cameraInfo.value = {
+        eulerDegrees: { ...cam.eulerDegrees },
+        mode: null,
+        position: { ...cam.position },
+        target: { ...cam.target },
+      };
+    } else {
+      cameraInfo.value = emptyNavKitCameraPoseInfo();
+    }
+    const player = viewer?.getPlayerPoseNavKit() ?? null;
+    if (player) {
+      playerInfo.value = {
+        available: true,
+        eulerDegrees: { ...player.eulerDegrees },
+        position: { ...player.position },
+      };
+    } else {
+      playerInfo.value = emptyNavKitPlayerPoseInfo();
+    }
+  };
+
+  const tickPoseInfoSampling = (): void => {
+    if (!cameraInfoPanelOpen && !playerInfoPanelOpen) {
+      poseInfoRafId = 0;
+      return;
+    }
+    samplePoseInfoOnce();
+    poseInfoRafId = requestAnimationFrame(tickPoseInfoSampling);
+  };
+
+  const syncPoseInfoSampling = (): void => {
+    if (!cameraInfoPanelOpen && !playerInfoPanelOpen) {
+      stopPoseInfoSampling();
+      return;
+    }
+    if (poseInfoRafId !== 0) {
+      return;
+    }
+    samplePoseInfoOnce();
+    poseInfoRafId = requestAnimationFrame(tickPoseInfoSampling);
+  };
+
+  const setCameraInfoPanelOpen = (open: boolean): void => {
+    cameraInfoPanelOpen = open;
+    syncPoseInfoSampling();
+  };
+
+  const setPlayerInfoPanelOpen = (open: boolean): void => {
+    playerInfoPanelOpen = open;
+    syncPoseInfoSampling();
+  };
+
+  const copyCameraPose = async (): Promise<boolean> => {
+    try {
+      await navigator.clipboard.writeText(cameraInfoCopyText.value);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const copyPlayerPose = async (): Promise<boolean> => {
+    try {
+      await navigator.clipboard.writeText(playerInfoCopyText.value);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
   const setNavMeshVisible = (visible: boolean): void => {
     babylon.viewer.value?.setNavMeshVisible(visible);
   };
+
+  const setNavMeshEditorEnabled = (enabled: boolean): void => {
+    babylon.viewer.value?.setNavMeshEditorEnabled(enabled);
+  };
+  const setNavMeshEditorMode = (mode: 'vertex' | 'circle' | 'global'): void => {
+    babylon.viewer.value?.setNavMeshEditorMode(mode);
+  };
+  const navMeshEditorGlobalY = (steps: number): void => {
+    babylon.viewer.value?.navMeshEditorGlobalY(steps);
+  };
+  const navMeshEditorFillHole = (): boolean =>
+    babylon.viewer.value?.navMeshEditorFillHole() ?? false;
+  const navMeshEditorDeleteVertices = async (): Promise<boolean> => {
+    const viewer = babylon.viewer.value;
+    if (!viewer) {
+      return false;
+    }
+    return viewer.navMeshEditorDeleteVertices();
+  };
+  const applyNavMeshEditorToLive = async (): Promise<boolean> => {
+    const viewer = babylon.viewer.value;
+    if (!viewer) {
+      return false;
+    }
+    return viewer.applyNavMeshEditorToLive();
+  };
+  const onNavMeshEditorStatus = (
+    listener: (status: import('@/navigation/navmeshEditor').NavMeshEditorStatus) => void
+  ): (() => void) => {
+    const viewer = babylon.viewer.value;
+    if (!viewer) {
+      return () => undefined;
+    }
+    return viewer.onNavMeshEditorStatus(listener);
+  };
+  const getNavMeshEditorStatus = () =>
+    babylon.viewer.value?.getNavMeshEditorStatus() ?? null;
+  const getNavMeshData = (): Uint8Array | null =>
+    babylon.viewer.value?.getNavMeshData() ?? null;
 
   const setSelectionRegionVisible = async (visible: boolean): Promise<void> => {
     const viewer = babylon.viewer.value;
@@ -592,7 +1356,7 @@ export function useSplatFastNav(
               `${region.max.map((v) => v.toFixed(2)).join(', ')}`
           );
         } catch (suggestError) {
-          const splatBounds = viewer.getLoadedSplatBounds();
+          const splatBounds = viewer.getSplatBoundsForDiagnostics();
           if (!splatBounds) {
             throw suggestError;
           }
@@ -625,10 +1389,34 @@ export function useSplatFastNav(
       return;
     }
     pendingEnvironmentScale = scale;
+    sessionEnvironmentScale.value = scale;
     babylon.viewer.value?.setEnvironmentScale(scale);
   };
 
-  const rerunFastNav = async (): Promise<void> => {
+  /**
+   * Multiply absolute session scale by {@link scaleMultiplier}. Factor `1` is a no-op.
+   */
+  const applyScaleMultiplier = (scaleMultiplier: number): number => {
+    if (!Number.isFinite(scaleMultiplier) || scaleMultiplier <= 0) {
+      throw new Error('Scale Environment must be a positive number.');
+    }
+    const current =
+      babylon.viewer.value?.getEnvironmentScale() ?? pendingEnvironmentScale;
+    if (scaleMultiplier === 1) {
+      sessionEnvironmentScale.value = current;
+      return current;
+    }
+    const next = current * scaleMultiplier;
+    pendingEnvironmentScale = next;
+    sessionEnvironmentScale.value = next;
+    babylon.viewer.value?.setEnvironmentScale(next);
+    appendLog(`[INFO] Session scale → ${next} (×${scaleMultiplier})`);
+    return next;
+  };
+
+  const rerunFastNav = async (rerunOptions?: {
+    readonly scaleMultiplier?: number;
+  }): Promise<void> => {
     if (isBusy.value) {
       return;
     }
@@ -638,6 +1426,10 @@ export function useSplatFastNav(
     const viewer = babylon.viewer.value;
     if (!viewer) {
       throw new Error('Viewer is not ready.');
+    }
+
+    if (rerunOptions?.scaleMultiplier !== undefined) {
+      applyScaleMultiplier(rerunOptions.scaleMultiplier);
     }
 
     errorMessage.value = null;
@@ -656,21 +1448,50 @@ export function useSplatFastNav(
     hasNavMesh.value = false;
 
     const regionNote = viewer.getRegionBounds() ? ' (pinned region)' : '';
-    appendLog(`[INFO] Re-running FAST NAV${regionNote}…`);
+    const mode = navGenerationMode.value;
+    appendLog(
+      `[INFO] Re-running nav (${mode})${regionNote}… ` +
+        `environment_scale=${viewer.getEnvironmentScale()}`
+    );
 
     try {
+      topDownViewApplied.value = false;
       status.value = 'processing';
-      statusMessage.value = 'Re-running FAST NAV...';
+      statusMessage.value = `Re-running ${mode}…`;
       phase.value = 'idle';
       progress.value = null;
 
       const tuning = resolveFastNavTuning();
       appendLog(`[INFO] Floater prune: ${tuning.prune.enabled === false ? 'off' : 'on'}`);
+      appendLog(`[INFO] Collision scene type: ${resolveCollisionSceneType(mode)}`);
+
+      const rotation = viewer.getSplatRotation();
+      const collisionSettings =
+        mode === 'floor_field'
+          ? undefined
+          : buildDemoCollisionSettings({
+              algo: mode,
+              emitGlb: false,
+              emitVolume: true,
+              flipY: viewer.isSplatYFlipped(),
+              rotation: [rotation.x, rotation.y, rotation.z],
+              seed: seedFromRegionBounds({ regionBounds: viewer.getRegionBounds() }),
+            });
+
+      const activeMode =
+        mode === 'floor_field' ? 'recast' : activeNavigationMode.value;
+      if (mode === 'floor_field' && activeNavigationMode.value !== 'recast') {
+        activeNavigationMode.value = 'recast';
+      }
+      const sceneTypeForRun = resolveCollisionSceneType(mode);
       const fastNav = await runFastNav({
+        activeNavigationMode: activeMode,
+        algo: mode,
         viewer,
         bytes: currentBytes,
         cameraSelect: sessionCameraSelect ?? options.cameraSelect,
         keepCameraSelectView: options.keepCameraSelectView,
+        collisionSettings,
         onLog: appendLog,
         onPhase: (next) => {
           phase.value = next;
@@ -678,10 +1499,30 @@ export function useSplatFastNav(
         recovery: options.recovery,
         strayTrim: options.strayTrim,
         ...tuning,
+        // Outdoor floor_field: seed-centered ~100 m pin (Storage Adapter / prod parity).
+        seedCenteredOutdoor: mode === 'floor_field' && sceneTypeForRun === 'outdoor',
       });
       currentNavMeshData = fastNav.navMeshData;
       hasNavMesh.value = true;
-      storeMinimalNavArtifacts(fastNav.navMeshData, fastNav.playerSpawn);
+      viewer.setControlsMode(controlsMode.value);
+      if (mode === 'voxel_collision' || mode === 'sdf_marching_cubes') {
+        hasCollisionBoundary.value = true;
+      }
+      if (viewer.getRegionBounds()) {
+        selectionRegionVisible.value = true;
+      }
+      syncSessionFromFastNav({
+        navMeshData: fastNav.navMeshData,
+        playerSpawn: fastNav.playerSpawn,
+        volume: fastNav.volume,
+      });
+      await storeMinimalNavArtifacts({
+        debugIndices: fastNav.debugIndices,
+        debugPositions: fastNav.debugPositions,
+        navMeshData: fastNav.navMeshData,
+        playerSpawn: fastNav.playerSpawn,
+        volume: fastNav.volume,
+      });
       phase.value = 'done';
       progress.value = null;
 
@@ -689,6 +1530,7 @@ export function useSplatFastNav(
         statusMessage.value = 'Framing the player (top-down)...';
         const framing = viewer.focusOnPlayer();
         if (framing) {
+          topDownViewApplied.value = true;
           appendLog(
             `[SUCCESS] Top-down view set above player at ` +
               `${framing.player.map((v) => v.toFixed(2)).join(', ')}.`
@@ -697,13 +1539,18 @@ export function useSplatFastNav(
       }
 
       status.value = 'done';
-      statusMessage.value = 'FAST NAV complete. Click the navmesh to move the player.';
+      statusMessage.value =
+        mode === 'sdf_marching_cubes'
+          ? 'SDF Marching Cubes nav complete. Click the navmesh to move.'
+          : mode === 'voxel_collision'
+            ? 'Voxel collision nav complete. Click the navmesh to move.'
+            : 'Fast Nav complete. Click the navmesh to move the player.';
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       errorMessage.value = detail;
       appendLog(`[ERROR] ${detail}`);
       status.value = 'error';
-      statusMessage.value = 'FAST NAV failed.';
+      statusMessage.value = 'Nav generation failed.';
       // Keep any prior navmesh if recompute failed after a successful run.
       if (!currentNavMeshData) {
         hasNavMesh.value = false;
@@ -712,23 +1559,22 @@ export function useSplatFastNav(
     }
   };
 
-  const applyEnvironmentScale = async (scale: number): Promise<void> => {
+  const applyEnvironmentScale = async (scaleMultiplier: number): Promise<void> => {
     if (isBusy.value) {
       return;
     }
-    if (!Number.isFinite(scale) || scale <= 0) {
-      throw new Error('Scale Environment must be a positive number.');
-    }
 
     errorMessage.value = null;
-    setPendingEnvironmentScale(scale);
+    const sessionScale = applyScaleMultiplier(scaleMultiplier);
 
     if (!currentBytes) {
-      appendLog(`[INFO] Environment scale set to ${scale} (applies on next Fast Nav).`);
+      appendLog(
+        `[INFO] Session scale → ${sessionScale} (applies on next Fast Nav).`
+      );
       return;
     }
 
-    appendLog(`[INFO] Environment scale set to ${scale}; re-running FAST NAV...`);
+    appendLog(`[INFO] Session scale → ${sessionScale}; re-running FAST NAV...`);
     await rerunFastNav();
   };
 
@@ -770,12 +1616,108 @@ export function useSplatFastNav(
     );
   };
 
-  const downloadNavArtifacts = (): void => {
+  const setControlsMode = (mode: NavKitControlsMode): void => {
+    controlsMode.value = mode;
+    const viewer = babylon.viewer.value;
+    if (viewer) {
+      viewer.setControlsMode(mode);
+    }
+    appendLog(`[INFO] Controls mode: ${mode}.`);
+  };
+
+  const syncBundleForDownload = async (): Promise<NavArtifactBundle | null> => {
     if (!currentNavArtifactBundle) {
+      return null;
+    }
+    const viewer = babylon.viewer.value;
+    if (viewer?.getNavMeshEditorStatus()?.hasPendingLiveApply) {
+      appendLog('[INFO] Applying pending NavMesh Editor edits before download…');
+      await viewer.applyNavMeshEditorToLive();
+    }
+    const editedNav = viewer?.getNavMeshData();
+    const editedBuffers = viewer?.getOrientedNavMeshBuffers();
+    if (!editedNav || !editedBuffers) {
+      return currentNavArtifactBundle;
+    }
+    currentNavMeshData = editedNav;
+    sessionRecastBin.value = editedNav;
+    const region = viewer?.getWasmRegionBounds() ?? null;
+    const spawn = sessionSpawn.value;
+    currentNavArtifactBundle = await rebuildNavArtifactBundleFromLiveMesh({
+      base: currentNavArtifactBundle,
+      debugIndices: editedBuffers.indices,
+      debugPositions: editedBuffers.positions,
+      navMeshData: editedNav,
+      playerSpawn: spawn,
+      regionMax: region?.max ?? null,
+      regionMin: region?.min ?? null,
+      volume: sessionVolume.value,
+    });
+    syncNavExportReadiness();
+    return currentNavArtifactBundle;
+  };
+
+  const downloadNavKit = async (): Promise<void> => {
+    if (!currentNavArtifactBundle || !currentModelSourceBytes) {
+      appendLog('[WARN] No NavKit — run Fast Nav on a loaded splat first.');
+      return;
+    }
+    const locomotionMode =
+      liveBackend.value === 'voxel_walk' ? 'voxel_walk' : 'recast_crowd';
+    const modelFilename = reconcileSplatModelFilename(
+      currentModelSourceBytes,
+      currentModelFilename
+    );
+    currentModelFilename = modelFilename;
+    const viewer = babylon.viewer.value;
+    const navBundle = await syncBundleForDownload();
+    if (!navBundle) {
+      appendLog('[WARN] No NavKit — run Fast Nav on a loaded splat first.');
+      return;
+    }
+    const regionBounds = viewer?.getRegionBounds() ?? null;
+    const cam = viewer?.getCameraPoseNavKit() ?? null;
+    const player = viewer?.getPlayerPoseNavKit() ?? null;
+    downloadNavKitZip({
+      activeNavigationMode: activeNavigationMode.value,
+      camEulerDeg: cam?.eulerDegrees ?? null,
+      camPos: cam?.position ?? null,
+      camTarget: cam?.target ?? null,
+      controlsMode: controlsMode.value,
+      locomotionMode,
+      modelBytes: currentModelSourceBytes,
+      modelFilename,
+      navBundle,
+      navTechnique: navGenerationMode.value,
+      playerEulerDeg: player?.eulerDegrees ?? null,
+      playerPos: player?.position ?? null,
+      region: regionBounds
+        ? {
+            min: [
+              regionBounds.min[0]!,
+              regionBounds.min[1]!,
+              regionBounds.min[2]!,
+            ],
+            max: [
+              regionBounds.max[0]!,
+              regionBounds.max[1]!,
+              regionBounds.max[2]!,
+            ],
+          }
+        : null,
+      slug: currentName,
+      title: currentName,
+    });
+    appendLog(`[SUCCESS] Downloaded navkit-${currentName}.zip`);
+  };
+
+  const downloadNavArtifacts = async (): Promise<void> => {
+    const bundle = await syncBundleForDownload();
+    if (!bundle) {
       appendLog('[WARN] No nav artifact pack — run Fast Nav first.');
       return;
     }
-    downloadNavArtifactZip({ bundle: currentNavArtifactBundle, slug: currentName });
+    downloadNavArtifactZip({ bundle, slug: currentName });
     appendLog(`[SUCCESS] Downloaded nav-artifacts-${currentName}.zip`);
   };
 
@@ -807,18 +1749,34 @@ export function useSplatFastNav(
       );
       viewer.clearNavArtifacts();
       currentNavArtifactBundle = parsed.bundle;
+      syncNavExportReadiness();
       if (parsed.bundle.recastNavmeshBin) {
         currentNavMeshData = parsed.bundle.recastNavmeshBin;
+        sessionRecastBin.value = parsed.bundle.recastNavmeshBin;
+      }
+      sessionVolume.value = parsed.volume;
+      if (parsed.session.playerSpawn && parsed.session.playerSpawn.length >= 3) {
+        sessionSpawn.value = [
+          parsed.session.playerSpawn[0]!,
+          parsed.session.playerSpawn[1]!,
+          parsed.session.playerSpawn[2]!,
+        ];
+        sessionSeed.value = [...sessionSpawn.value];
       }
       await applyNavArtifactsToViewer({
         onLog: appendLog,
         parsed,
         viewer,
       });
+      // Default focusCamera frames top-down after artifact restore.
+      topDownViewApplied.value = true;
+      liveBackend.value =
+        parsed.session.locomotionMode === 'voxel_walk' ? 'voxel_walk' : 'recast_crowd';
       hasNavMesh.value = true;
+      viewer.setControlsMode(controlsMode.value);
       status.value = 'done';
       statusMessage.value =
-        'Nav artifacts restored. Top-down framed — click the navmesh to move.';
+        'Nav artifacts restored. Use Controls (click / WASDQE / both) to move.';
       appendLog(`[SUCCESS] Uploaded nav artifacts. ${NAV_ARTIFACT_UPLOAD_HINT}`);
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
@@ -842,21 +1800,48 @@ export function useSplatFastNav(
     maxShDegree,
     maxChunkExtent,
     loadAndProcess,
+    loadSplatOnly,
     loadExample,
     exportSog,
     exportNavmesh,
     goToPlayer,
+    topDownViewApplied,
+    downloadNavKit,
+    loadNavKit,
     downloadNavArtifacts,
     uploadNavArtifacts,
     hasNavArtifactBundle,
+    hasNavKit,
+    controlsMode,
+    setControlsMode,
+    controlsWasdLegend: NAV_KIT_WASDQE_LEGEND,
     navArtifactUploadHint: NAV_ARTIFACT_UPLOAD_HINT,
+    navKitUploadHint: NAV_KIT_UPLOAD_HINT,
     cameraSelectOffsets,
     resetCameraSelectOffsets,
+    cameraInfo,
+    cameraInfoCopyText,
+    copyCameraPose,
+    setCameraInfoPanelOpen,
+    playerInfo,
+    playerInfoCopyText,
+    copyPlayerPose,
+    setPlayerInfoPanelOpen,
     applySelectRegionFromCamera,
     generateCollisionBoundary,
     exportCollisionMesh,
     setCollisionBoundaryVisible,
+    hasCollisionBoundary,
     setNavMeshVisible,
+    setNavMeshEditorEnabled,
+    setNavMeshEditorMode,
+    navMeshEditorGlobalY,
+    navMeshEditorFillHole,
+    navMeshEditorDeleteVertices,
+    applyNavMeshEditorToLive,
+    onNavMeshEditorStatus,
+    getNavMeshEditorStatus,
+    getNavMeshData,
     navSettings,
     resetNavSettings,
     hasNavMesh,
@@ -865,6 +1850,16 @@ export function useSplatFastNav(
     selectionRegionVisible,
     setSelectionRegionVisible,
     rerunFastNav,
+    navGenerationMode,
+    collisionSceneType,
+    setCollisionSceneType,
+    activeNavigationMode,
+    setActiveNavigationMode,
+    activeNavigationModeDisabledReason,
+    liveBackend,
+    navCapabilities,
+    applyScaleMultiplier,
+    sessionEnvironmentScale,
     applyEnvironmentScale,
     setPendingEnvironmentScale,
     reset,

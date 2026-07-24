@@ -2,6 +2,8 @@ import {
   splatwalk,
   type CollisionVoxelBoundaryResult,
   type CollisionVoxelBoundarySettings,
+  type FastNavAlgo,
+  type FastNavWasmResult,
   type MeshSettings,
   type ReconstructionDiagnostics,
 } from '@/wasm/bridge';
@@ -143,10 +145,77 @@ export const exportNavmeshBinary = ({
   downloadBytes({ bytes: navMeshData, filename, type: 'application/octet-stream' });
 };
 
+const collisionAlgoFromSettings = (settings: CollisionVoxelBoundarySettings): FastNavAlgo =>
+  settings.collision_mesh_mode === 'smooth' ? 'sdf_marching_cubes' : 'voxel_collision';
+
+const fastNavResultToCollisionBoundary = (
+  result: FastNavWasmResult
+): CollisionVoxelBoundaryResult => ({
+  api_version: result.api_version,
+  basis: result.basis,
+  capabilities: result.capabilities,
+  collider_mesh: result.collider_mesh,
+  diagnostics: result.diagnostics,
+  floor_plane: result.floor_plane,
+  glb: result.glb,
+  mesh: result.mesh,
+  semver: result.semver,
+  space: result.space,
+  volume: result.volume,
+});
+
+/**
+ * Build a collision boundary via the star WASM {@link splatwalk.fastNav} export
+ * when capability `fast_nav` is present; falls back to
+ * {@link splatwalk.buildCollisionVoxelBoundary} on older binaries.
+ */
+const isFastNavEmptyMeshFailure = (error: unknown): boolean => {
+  if (!error || typeof error !== 'object') {
+    return false;
+  }
+  const wasmFailure = (error as { wasmFailure?: { reason?: string } }).wasmFailure;
+  if (
+    wasmFailure?.reason === 'empty_mesh' ||
+    wasmFailure?.reason === 'sdf_mc_empty_mesh'
+  ) {
+    return true;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    message.includes('empty collider mesh') || message.includes('sdf_mc_empty_mesh')
+  );
+};
+
 export const generateCollisionBoundary = async ({
   bytes,
   settings,
 }: CollisionBoundaryGenerationOptions): Promise<CollisionBoundaryArtifact> => {
+  const caps = await splatwalk.capabilities();
+  if (caps.includes('fast_nav')) {
+    const algo = collisionAlgoFromSettings(settings);
+    if (algo === 'sdf_marching_cubes' && !caps.includes('sdf_marching_cubes')) {
+      throw new Error(
+        'SDF Marching Cubes requires WASM capability sdf_marching_cubes. Rebuild or upgrade @splatwalk/core.'
+      );
+    }
+    try {
+      const fast = await splatwalk.fastNav(bytes, {
+        ...settings,
+        algo,
+        emit_glb: settings.emit_glb,
+        emit_volume: settings.emit_volume,
+      });
+      return { result: fastNavResultToCollisionBoundary(fast), settings };
+    } catch (error) {
+      // Soft-empty belt: host recovery (runNavFromVoxelCollider) needs diagnostics,
+      // not a thrown fast_nav failure after the WASM ladder is exhausted.
+      if (!isFastNavEmptyMeshFailure(error)) {
+        throw error;
+      }
+      const result = await splatwalk.buildCollisionVoxelBoundary(bytes, settings);
+      return { result, settings };
+    }
+  }
   const result = await splatwalk.buildCollisionVoxelBoundary(bytes, settings);
   return { result, settings };
 };

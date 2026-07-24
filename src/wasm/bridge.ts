@@ -1,6 +1,9 @@
 /// <reference types="vite/client" />
 import SplatWorker from './splat.worker?worker';
+import { sanitizeMeshSettingsForWasm } from './sanitizeMeshSettingsForWasm';
 import type { SliceSettings, SliceResult } from './sogTypes';
+
+export { sanitizeMeshSettingsForWasm } from './sanitizeMeshSettingsForWasm';
 
 /** Worker payload shape for slice/convert results before Map reconstruction. */
 interface SliceResultRaw {
@@ -139,6 +142,16 @@ export interface ReconstructionDiagnostics {
     collision_mesh_mode: string;
     collision_external_fill_leaked: boolean;
     collision_failure_reason?: string;
+    /** SDF truncation band (voxels) for `smooth` mesh mode; 0 when unused. */
+    collision_sdf_band_voxels?: number;
+    /** Marching Cubes iso level for `smooth` mesh mode. */
+    collision_mc_iso_level?: number;
+    /** Laplacian iterations after Marching Cubes for `smooth` mesh mode. */
+    collision_mc_smooth_iterations?: number;
+    /** `"interior"` | `"open"` when SDF-MC downward floor project ran. */
+    collision_floor_project_mode?: string;
+    /** Applied `floor_project_flatten_m` for SDF-MC Recast floor (0 when unused). */
+    collision_floor_project_flatten_m?: number;
     floor_plane?: FloorPlane;
 }
 
@@ -200,6 +213,8 @@ export interface CollisionVoxelVolume {
 
 export interface CollisionVoxelBoundaryResult extends ResultContract {
     mesh: MeshBuffers;
+    /** Full SDF-MC shell for overlay; Recast uses {@link mesh} (projected floor). */
+    collider_mesh?: MeshBuffers;
     /** GLB bytes of the collision mesh, present only when `emit_glb` was set. */
     glb?: Uint8Array;
     /** Dense solid + nav_region, present only when `emit_volume` was set. */
@@ -246,6 +261,57 @@ export interface CollisionVoxelBoundarySettings extends MeshSettings {
     emit_volume?: boolean;
 }
 
+/** FastNav compute algorithms accepted by WASM {@link SplatWalkBridge.fastNav}. */
+export type FastNavAlgo = 'floor_field' | 'voxel_collision' | 'sdf_marching_cubes';
+
+/** Settings for the star WASM export {@link SplatWalkBridge.fastNav}. */
+export interface FastNavSettings extends MeshSettings {
+    /** Compute path (default `floor_field`). */
+    algo?: FastNavAlgo;
+    /** Minimum accepted floor area (m^2) for floor_field recovery. Default 4.0. */
+    min_room_floor_area?: number;
+    /** When true, also emit GLB bytes in `glb`. Default false. */
+    emit_glb?: boolean;
+    /** When true (voxel/SDF algos), also emit packed volume bitmasks. Default false. */
+    emit_volume?: boolean;
+    /** Optional floor_field recovery ladder; WASM default when omitted. */
+    recovery?: RoomFloorRecoveryStep[];
+}
+
+/** Result of WASM {@link SplatWalkBridge.fastNav}. */
+export interface FastNavWasmResult extends ResultContract {
+    algo: FastNavAlgo | string;
+    mesh: MeshBuffers;
+    /** Full SDF-MC shell for overlay when present; Recast uses {@link mesh}. */
+    collider_mesh?: MeshBuffers;
+    glb?: Uint8Array;
+    volume?: CollisionVoxelVolume;
+    space: CoordinateSpace;
+    basis: FieldBasis;
+    floor_plane: FloorPlane;
+    selected_area: number;
+    component_count: number;
+    selected_cell_count: number;
+    accepted_cell_count: number;
+    obstacle_cell_count: number;
+    rejected_cell_count: number;
+    fallback_used: boolean;
+    step_label: string;
+    diagnostics: ReconstructionDiagnostics;
+}
+
+/** Structured failure thrown by WASM {@link SplatWalkBridge.fastNav}. */
+export interface FastNavWasmFailure {
+    api_version: 2;
+    algo: string;
+    reason: string;
+    message: string;
+    attempted?: string[];
+    selected_area: number;
+    component_count: number;
+    steps: number;
+}
+
 /** Result of {@link SplatWalkBridge.buildRoomFloorMesh}: a triangulated room-floor mesh. */
 export interface RoomFloorMeshResult extends ResultContract {
     mesh: MeshBuffers;
@@ -282,6 +348,20 @@ export interface MeshSettings {
     collision_carve_height?: number;
     collision_carve_radius?: number;
     collision_mesh_mode?: 'faces' | 'obstacle_shell' | 'smooth' | 'walkable_floors';
+    /**
+     * Truncation half-width (voxels) for the 3D SDF used by `collision_mesh_mode: "smooth"`.
+     * Default `3`, clamped to `[1, 16]` in WASM.
+     */
+    sdf_band_voxels?: number;
+    /** Isosurface level for Marching Cubes when `smooth` (default `0`). */
+    mc_iso_level?: number;
+    /** Laplacian smooth iterations after Marching Cubes (default `1`, max `8`). */
+    mc_smooth_iterations?: number;
+    /**
+     * Metres of undulation to flatten on the SDF-MC → Recast floor heightfield only
+     * (never the MC shell). Default `0.08`; `0` disables. Clamped to `[0, 0.5]`.
+     */
+    floor_project_flatten_m?: number;
     /** PlayCanvas `--filter-cluster` on splats before fine voxelize (default true in WASM). */
     collision_filter_cluster?: boolean;
     /** Cap padded voxel grid size; WASM coarsens voxel_size when exceeded. */
@@ -300,8 +380,20 @@ export interface MeshSettings {
     hole_fill_radius?: number;
     agent_radius_erode?: number;
     component_mode?: 'largest' | 'nearest_region_center' | 'all';
-    region_min?: number[];
-    region_max?: number[];
+    /**
+     * Optional AABB minimum `[x,y,z]` in `splatwalk_oriented` space. When both
+     * `region_min` and `region_max` are set, WASM culls out-of-box splats before
+     * floater prune and before every `fast_nav` algo. Both must be set together.
+     */
+    region_min?: [number, number, number] | number[];
+    /** Optional AABB maximum `[x,y,z]` paired with {@link MeshSettings.region_min}. */
+    region_max?: [number, number, number] | number[];
+    /**
+     * Optional camera / viewpoint `[x,y,z]` in `splatwalk_oriented` space.
+     * When a pinned region culls every splat and the cloud is immense, WASM
+     * builds a reasonable AABB around this point instead of using all splats.
+     */
+    camera_position?: [number, number, number] | number[];
     /**
      * Statistical outlier removal ("prune floaters"). When true (the default),
      * stray sparse splats far from the dense surface are removed before any
@@ -398,8 +490,20 @@ export class SplatWalkBridge {
                     const call = this.pending.get(data.id);
                     if (!call) return;
                     this.pending.delete(data.id);
-                    if (data.ok) call.resolve(data.result);
-                    else call.reject(new Error(data.error));
+                    if (data.ok) {
+                        call.resolve(data.result);
+                        return;
+                    }
+                    // Preserve structured WASM failures (fast_nav / room_floor) when posted as objects.
+                    if (data.error && typeof data.error === 'object') {
+                        call.reject(Object.assign(new Error(
+                            typeof (data.error as { message?: unknown }).message === 'string'
+                                ? (data.error as { message: string }).message
+                                : 'WASM call failed'
+                        ), { wasmFailure: data.error }));
+                        return;
+                    }
+                    call.reject(new Error(typeof data.error === 'string' ? data.error : String(data.error)));
                 }
             };
         }
@@ -450,42 +554,90 @@ export class SplatWalkBridge {
 
     public async getSplatBounds(data: Uint8Array, settings: MeshSettings): Promise<SplatBounds> {
         await this.ensureLoaded(data);
-        return this.call<SplatBounds>('getSplatBounds', { settings });
+        return this.call<SplatBounds>('getSplatBounds', {
+            settings: sanitizeMeshSettingsForWasm(settings),
+        });
     }
 
     public async suggestRegion(data: Uint8Array, settings: MeshSettings): Promise<SuggestedRegion> {
         await this.ensureLoaded(data);
-        return this.call<SuggestedRegion>('suggestRegion', { settings });
+        return this.call<SuggestedRegion>('suggestRegion', {
+            settings: sanitizeMeshSettingsForWasm(settings),
+        });
     }
 
     public async convertSplatToMesh(data: Uint8Array, settings: MeshSettings): Promise<ReconstructionResult> {
         await this.ensureLoaded(data);
-        return this.call<ReconstructionResult>('convertSplatToMesh', { settings });
+        return this.call<ReconstructionResult>('convertSplatToMesh', {
+            settings: sanitizeMeshSettingsForWasm(settings),
+        });
     }
 
     public async convertSplatToNavmeshBasis(data: Uint8Array, settings: MeshSettings): Promise<NavmeshBasisResult> {
         await this.ensureLoaded(data);
-        return this.call<NavmeshBasisResult>('convertSplatToNavmeshBasis', { settings });
+        return this.call<NavmeshBasisResult>('convertSplatToNavmeshBasis', {
+            settings: sanitizeMeshSettingsForWasm(settings),
+        });
     }
 
     public async buildCollisionVoxelBoundary(data: Uint8Array, settings: CollisionVoxelBoundarySettings): Promise<CollisionVoxelBoundaryResult> {
         await this.ensureLoaded(data);
-        return this.call<CollisionVoxelBoundaryResult>('buildCollisionVoxelBoundary', { settings });
+        return this.call<CollisionVoxelBoundaryResult>('buildCollisionVoxelBoundary', {
+            settings: sanitizeMeshSettingsForWasm(settings),
+        });
     }
 
     public async buildWalkableGroundField(data: Uint8Array, settings: MeshSettings): Promise<WalkableGroundFieldResult> {
         await this.ensureLoaded(data);
-        return this.call<WalkableGroundFieldResult>('buildWalkableGroundField', { settings });
+        return this.call<WalkableGroundFieldResult>('buildWalkableGroundField', {
+            settings: sanitizeMeshSettingsForWasm(settings),
+        });
     }
 
     /**
      * Extract a triangulated room-floor mesh entirely in WASM (the binary-side
      * equivalent of the TypeScript FAST NAV floor path). Rejects with the failure
      * reason in the message (`no_component` / `too_small` / `empty_mesh`).
+     * Prefer {@link fastNav} with `algo: 'floor_field'` for product FastNav.
      */
     public async buildRoomFloorMesh(data: Uint8Array, settings: RoomFloorSettings): Promise<RoomFloorMeshResult> {
         await this.ensureLoaded(data);
-        return this.call<RoomFloorMeshResult>('buildRoomFloorMesh', { settings });
+        return this.call<RoomFloorMeshResult>('buildRoomFloorMesh', {
+            settings: sanitizeMeshSettingsForWasm(settings),
+        });
+    }
+
+    /**
+     * Star FastNav WASM export: splat bytes → Recast-ready mesh for
+     * `algo: 'floor_field' | 'voxel_collision' | 'sdf_marching_cubes'`.
+     * Hosts run Recast/crowd on the returned mesh.
+     */
+    public async fastNav(
+        data: Uint8Array,
+        settings: Partial<FastNavSettings> = {}
+    ): Promise<FastNavWasmResult> {
+        await this.ensureLoaded(data);
+        return this.call<FastNavWasmResult>('fastNav', {
+            settings: sanitizeMeshSettingsForWasm(settings),
+        });
+    }
+
+    /** Pre-flight capability list from the loaded WASM binary (no splat parse). */
+    public async capabilities(): Promise<string[]> {
+        await this.init();
+        return this.call<string[]>('capabilities', null);
+    }
+
+    /** Pre-flight semantic version of the loaded WASM binary. */
+    public async version(): Promise<string> {
+        await this.init();
+        return this.call<string>('version', null);
+    }
+
+    /** Pre-flight integer `api_version` of the loaded WASM binary. */
+    public async apiVersion(): Promise<number> {
+        await this.init();
+        return this.call<number>('apiVersion', null);
     }
 
     /**

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * Assemble community FastNav / Storage integration kits into public/integration-kits/*.zip
+ * Assemble community FastNav / Storage Component Packs into public/integration-kits/*.zip
+ * (integrator docs + peers — not NavKit scene packs).
  * Uses fflate (already a project dependency). Run via `npm run build:kits`.
  */
 
@@ -172,7 +173,7 @@ const peersVuetify = {
   private: true,
   peerDependencies: {
     '@babylonjs/core': '^9.18.0',
-    '@splatwalk/core': '^0.6.4',
+    '@splatwalk/core': '^0.6.10',
     vue: '^3.5.0',
     vuetify: '^3.0.0 || ^4.0.0',
   },
@@ -185,7 +186,7 @@ const peersR3f = {
     '@mkkellogg/gaussian-splats-3d': '^0.4.7',
     '@react-three/drei': '^9.0.0',
     '@react-three/fiber': '^8.0.0',
-    '@splatwalk/core': '^0.6.4',
+    '@splatwalk/core': '^0.6.10',
     react: '^18.0.0',
     'react-dom': '^18.0.0',
     'recast-navigation': '^0.43.0',
@@ -198,7 +199,7 @@ const peersStorage = {
   private: true,
   peerDependencies: {
     '@babylonjs/core': '^9.18.0',
-    '@splatwalk/core': '^0.6.4',
+    '@splatwalk/core': '^0.6.10',
   },
 };
 
@@ -207,7 +208,7 @@ const peersWorkbench = {
   private: true,
   peerDependencies: {
     '@babylonjs/core': '^9.18.0',
-    '@splatwalk/core': '^0.6.4',
+    '@splatwalk/core': '^0.6.10',
   },
 };
 

@@ -40,6 +40,12 @@ export interface CachedNavmesh {
    */
   readonly effectiveSeed?: number[] | null;
   readonly expectedFloorY?: number | null;
+  /**
+   * SDF-MC interior MC shell for cyan overlay. Required for SDF-MC cache hits;
+   * omit for floor_field / voxel. Never store the projected Recast floor here.
+   */
+  readonly colliderPositions?: Float32Array | null;
+  readonly colliderIndices?: Uint32Array | null;
 }
 
 interface IndexRecord {
@@ -56,6 +62,8 @@ interface DataRecord {
   debugIndices: ArrayBuffer;
   effectiveSeed: number[] | null;
   expectedFloorY: number | null;
+  colliderPositions: ArrayBuffer | null;
+  colliderIndices: ArrayBuffer | null;
 }
 
 const MiB = 1024 * 1024;
@@ -203,6 +211,12 @@ export async function getNavmesh(key: string): Promise<CachedNavmesh | null> {
       debugIndices: new Uint32Array(record.debugIndices),
       effectiveSeed: record.effectiveSeed ?? null,
       expectedFloorY: record.expectedFloorY ?? null,
+      colliderPositions: record.colliderPositions
+        ? new Float32Array(record.colliderPositions)
+        : null,
+      colliderIndices: record.colliderIndices
+        ? new Uint32Array(record.colliderIndices)
+        : null,
     };
     return result;
   } catch {
@@ -240,7 +254,18 @@ export async function putNavmesh(key: string, payload: CachedNavmesh): Promise<v
     const navMeshData = toExactBuffer(payload.navMeshData);
     const debugPositions = toExactBuffer(payload.debugPositions);
     const debugIndices = toExactBuffer(payload.debugIndices);
-    const bytes = navMeshData.byteLength + debugPositions.byteLength + debugIndices.byteLength;
+    const colliderPositions = payload.colliderPositions?.length
+      ? toExactBuffer(payload.colliderPositions)
+      : null;
+    const colliderIndices = payload.colliderIndices?.length
+      ? toExactBuffer(payload.colliderIndices)
+      : null;
+    const bytes =
+      navMeshData.byteLength +
+      debugPositions.byteLength +
+      debugIndices.byteLength +
+      (colliderPositions?.byteLength ?? 0) +
+      (colliderIndices?.byteLength ?? 0);
     const now = Date.now();
 
     const tx = db.transaction([INDEX_STORE, DATA_STORE], 'readwrite');
@@ -251,6 +276,8 @@ export async function putNavmesh(key: string, payload: CachedNavmesh): Promise<v
       debugIndices,
       effectiveSeed: payload.effectiveSeed ?? null,
       expectedFloorY: payload.expectedFloorY ?? null,
+      colliderPositions,
+      colliderIndices,
     } satisfies DataRecord);
     tx.objectStore(INDEX_STORE).put({ key, bytes, lastAccess: now, createdAt: now } satisfies IndexRecord);
     await txDone(tx);
